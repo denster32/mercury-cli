@@ -243,6 +243,11 @@ struct UsageBlock {
     completion_tokens: i64,
     #[allow(dead_code)]
     total_tokens: i64,
+    /// Internal reasoning tokens (counted against max_tokens but not billed
+    /// at completion rate).
+    #[serde(default)]
+    #[allow(dead_code)]
+    reasoning_tokens: i64,
     /// Tokens served from Inception's input cache (10x cheaper).
     #[serde(default)]
     cached_input_tokens: i64,
@@ -774,7 +779,7 @@ impl MercuryEditApi for MercuryEditClient {
     /// `<|update_snippet|>` markup tags as required by the API.
     async fn apply(&self, payload: &EditPayload) -> Result<(String, ApiUsage), ApiError> {
         let content = format!(
-            "<|original_code|>\n{}\n<|original_code|>\n<|update_snippet|>\n{}\n<|update_snippet|>",
+            "<|original_code|>\n{}\n<|/original_code|>\n\n<|update_snippet|>\n{}\n<|/update_snippet|>",
             payload.original_code, payload.update_snippet
         );
         let request = ChatRequest {
@@ -831,29 +836,29 @@ impl MercuryEditApi for MercuryEditClient {
         let mut parts = Vec::new();
         if !payload.recent_snippets.is_empty() {
             parts.push(format!(
-                "<|recently_viewed_code_snippets|>\n{}\n<|recently_viewed_code_snippets|>",
+                "<|recently_viewed_code_snippets|>\n{}\n<|/recently_viewed_code_snippets|>",
                 payload.recent_snippets
             ));
         }
         parts.push(format!(
-            "<|current_file_content|>\n{}\n<|current_file_content|>",
+            "<|current_file_content|>\n{}\n<|/current_file_content|>",
             payload.file_content
         ));
         if !payload.code_to_edit.is_empty() {
             parts.push(format!(
-                "<|code_to_edit|>\n{}\n<|code_to_edit|>",
+                "<|code_to_edit|>\n{}\n<|/code_to_edit|>",
                 payload.code_to_edit
             ));
         }
         if !payload.cursor.is_empty() {
             parts.push(format!(
-                "<|cursor|>\n{}\n<|cursor|>",
+                "<|cursor|>\n{}\n<|/cursor|>",
                 payload.cursor
             ));
         }
         if !payload.edit_history.is_empty() {
             parts.push(format!(
-                "<|edit_diff_history|>\n{}\n<|edit_diff_history|>",
+                "<|edit_diff_history|>\n{}\n<|/edit_diff_history|>",
                 payload.edit_history
             ));
         }
@@ -986,6 +991,7 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 1000,
             total_tokens: 2000,
+            reasoning_tokens: 0,
             cached_input_tokens: 0,
         };
         let cost = Mercury2Client::estimate_cost(&usage);
@@ -997,6 +1003,7 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 1000,
             total_tokens: 2000,
+            reasoning_tokens: 0,
             cached_input_tokens: 500,
         };
         let cost_cached = Mercury2Client::estimate_cost(&usage_cached);

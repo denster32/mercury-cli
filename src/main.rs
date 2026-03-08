@@ -622,7 +622,7 @@ async fn cmd_fix(
 
 const DEFAULT_CONFIG: &str = r#"[api]
 mercury2_endpoint = "https://api.inceptionlabs.ai/v1/chat/completions"
-mercury_edit_endpoint = "https://api.inceptionlabs.ai/v1/edit"
+mercury_edit_endpoint = "https://api.inceptionlabs.ai/v1"
 api_key_env = "MERCURY_API_KEY"
 
 [scheduler]
