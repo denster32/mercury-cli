@@ -203,6 +203,9 @@ enum Commands {
     Ask {
         /// The query to ask.
         query: String,
+        /// Reasoning effort: instant, low, medium, high.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
 
     /// Edit commands (apply, complete, next).
@@ -385,16 +388,24 @@ fn cmd_status(db: &ThermalDb, heatmap: bool, agents: bool, budget: bool) -> Resu
     Ok(())
 }
 
-async fn cmd_ask(config: &MercuryConfig, _db: &ThermalDb, query: &str) -> Result<()> {
+async fn cmd_ask(
+    config: &MercuryConfig,
+    _db: &ThermalDb,
+    query: &str,
+    effort: Option<api::ReasoningEffort>,
+) -> Result<()> {
     let api_key = std::env::var(&config.api.api_key_env)
         .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
 
-    let client = Mercury2Client::new(api_key)
+    let mut client = Mercury2Client::new(api_key)
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
             config.scheduler.backoff_base_ms,
         );
+    if let Some(e) = effort {
+        client = client.with_reasoning_effort(e);
+    }
 
     let repo_context = match repo::build_repo_map(".") {
         Ok(map) => repo::format_repo_map(&map),
@@ -676,9 +687,13 @@ async fn main() -> Result<()> {
             cmd_plan(&config, &db, &goal, output.as_deref()).await?;
         }
 
-        Commands::Ask { query } => {
+        Commands::Ask {
+            query,
+            reasoning_effort,
+        } => {
             let (config, db, _root) = load_project()?;
-            cmd_ask(&config, &db, &query).await?;
+            let effort = reasoning_effort.as_deref().and_then(parse_reasoning_effort);
+            cmd_ask(&config, &db, &query, effort).await?;
         }
 
         Commands::Edit { action } => {
@@ -701,9 +716,12 @@ async fn main() -> Result<()> {
                     dry_run,
                 } => {
                     let content = std::fs::read_to_string(&file)?;
-                    let (patched, usage) = patcher
-                        .patch(&content, &content, &content, &instruction)
-                        .await?;
+                    // For instruction-based edits, we pass the original as both
+                    // original_code and update_snippet — Mercury Edit infers the
+                    // change from context. For precise edits, callers provide
+                    // the actual update snippet.
+                    let (patched, usage) =
+                        patcher.patch(&content, &format!("{content}\n// Instruction: {instruction}")).await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
@@ -719,7 +737,16 @@ async fn main() -> Result<()> {
                 EditAction::Complete { file } => {
                     let (path, line) = parse_file_line(&file);
                     let content = std::fs::read_to_string(&path)?;
-                    let (result, usage) = patcher.complete(&content, line).await?;
+                    // Split at the cursor line for FIM prompt/suffix
+                    let lines: Vec<&str> = content.lines().collect();
+                    let split_at = (line as usize).min(lines.len());
+                    let prompt = lines[..split_at].join("\n");
+                    let suffix = if split_at < lines.len() {
+                        lines[split_at..].join("\n")
+                    } else {
+                        String::new()
+                    };
+                    let (result, usage) = patcher.complete(&prompt, &suffix).await?;
                     println!("{result}");
                     println!(
                         "Tokens: {} | Cost: ${:.4}",
@@ -792,6 +819,17 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a reasoning effort string into the enum.
+fn parse_reasoning_effort(s: &str) -> Option<api::ReasoningEffort> {
+    match s.to_lowercase().as_str() {
+        "instant" => Some(api::ReasoningEffort::Instant),
+        "low" => Some(api::ReasoningEffort::Low),
+        "medium" | "med" => Some(api::ReasoningEffort::Medium),
+        "high" => Some(api::ReasoningEffort::High),
+        _ => None,
+    }
 }
 
 /// Parse "file.rs:42" into (PathBuf, line_number).

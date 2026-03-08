@@ -173,43 +173,42 @@ impl<E: MercuryEditApi> Patcher<E> {
         Self { api }
     }
 
-    /// Apply an edit instruction to a file's content.
+    /// Apply an edit to a file's content using Mercury Edit Apply.
+    ///
+    /// `original_code` is the code before the edit, `update_snippet` is the
+    /// modified version to apply.
     pub async fn patch(
         &self,
         original_code: &str,
-        file_content: &str,
-        code_to_edit: &str,
-        instruction: &str,
+        update_snippet: &str,
     ) -> Result<(String, ApiUsage), EngineError> {
         use crate::api::EditPayload;
         let payload = EditPayload {
             original_code: original_code.to_string(),
-            current_file_content: file_content.to_string(),
-            code_to_edit: code_to_edit.to_string(),
-            cursor_marker: None,
-            edit_history: None,
-            instruction: instruction.to_string(),
+            update_snippet: update_snippet.to_string(),
+            max_tokens: 8192,
         };
         let (result, usage) = self.api.apply(&payload).await?;
         Ok((result, usage))
     }
 
-    /// Autocomplete at a cursor position.
+    /// FIM autocomplete: provide code before and after the cursor.
     pub async fn complete(
         &self,
-        file_content: &str,
-        cursor_line: u32,
+        prompt: &str,
+        suffix: &str,
     ) -> Result<(String, ApiUsage), EngineError> {
         use crate::api::CompletePayload;
         let payload = CompletePayload {
-            file_content: file_content.to_string(),
-            cursor_position: cursor_line as u64,
+            prompt: prompt.to_string(),
+            suffix: suffix.to_string(),
+            max_tokens: 256,
         };
         let (result, usage) = self.api.complete(&payload).await?;
         Ok((result, usage))
     }
 
-    /// Predict the next edit based on history.
+    /// Predict the next edit based on file content and history.
     pub async fn next_edit(
         &self,
         file_content: &str,
@@ -218,6 +217,9 @@ impl<E: MercuryEditApi> Patcher<E> {
         use crate::api::NextEditPayload;
         let payload = NextEditPayload {
             file_content: file_content.to_string(),
+            code_to_edit: String::new(),
+            cursor: String::new(),
+            recent_snippets: String::new(),
             edit_history: edit_history.to_string(),
         };
         let (result, usage) = self.api.next_edit(&payload).await?;

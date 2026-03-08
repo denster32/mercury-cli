@@ -30,11 +30,38 @@ const MERCURY2_MODEL: &str = "mercury-2";
 /// Environment variable expected to hold the Inception Labs API key.
 const API_KEY_ENV: &str = "MERCURY_API_KEY";
 
-/// Approximate cost per 1 000 input tokens (USD) for mercury-coder-small.
-const COST_PER_1K_INPUT: f64 = 0.0003;
+/// Cost per 1 000 input tokens (USD) — Mercury 2 / Mercury Edit.
+const COST_PER_1K_INPUT: f64 = 0.00025;
 
-/// Approximate cost per 1 000 output tokens (USD) for mercury-coder-small.
-const COST_PER_1K_OUTPUT: f64 = 0.0006;
+/// Cost per 1 000 cached input tokens (USD) — 10x cheaper.
+const COST_PER_1K_CACHED_INPUT: f64 = 0.000025;
+
+/// Cost per 1 000 output tokens (USD) — Mercury 2 / Mercury Edit.
+const COST_PER_1K_OUTPUT: f64 = 0.00075;
+
+/// Default model for Mercury Edit endpoints (apply / fim / next-edit).
+const MERCURY_EDIT_MODEL: &str = "mercury-edit";
+
+// ---------------------------------------------------------------------------
+// Reasoning effort
+// ---------------------------------------------------------------------------
+
+/// Controls how much reasoning the model does before responding.
+///
+/// - `Instant` — near-zero latency, 0 reasoning tokens
+/// - `Low` / `Medium` / `High` — increasing quality at the cost of latency
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Near-instant response with no chain-of-thought.
+    Instant,
+    /// Minimal reasoning.
+    Low,
+    /// Balanced reasoning (default).
+    Medium,
+    /// Maximum reasoning depth.
+    High,
+}
 
 /// Constitutional prompt used to request a thermal-analysis JSON response.
 pub const THERMAL_ANALYSIS_PROMPT: &str = r#"You are a code analysis agent in the Mercury CLI swarm.
@@ -120,40 +147,63 @@ pub struct ThermalAssessment {
     pub reasoning: String,
 }
 
-/// Payload sent to the Mercury Edit `/edit/apply` endpoint.
+/// Domain payload for the Mercury Edit Apply endpoint (`/v1/apply/completions`).
+///
+/// The client auto-wraps these fields in `<|original_code|>` and
+/// `<|update_snippet|>` markup tags before sending.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditPayload {
     /// The original source code before any edits.
     pub original_code: String,
-    /// The full file as it currently stands on disk.
-    pub current_file_content: String,
-    /// The specific region the user wants to change.
-    pub code_to_edit: String,
-    /// Optional cursor position marker inside `code_to_edit`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor_marker: Option<String>,
-    /// Optional stringified history of prior edits for context.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub edit_history: Option<String>,
-    /// Natural-language instruction describing the desired change.
-    pub instruction: String,
+    /// The modified code snippet to apply (the "update").
+    pub update_snippet: String,
+    /// Maximum tokens for the response.
+    #[serde(default = "default_edit_max_tokens")]
+    pub max_tokens: u32,
 }
 
-/// Payload sent to the Mercury Edit `/edit/complete` endpoint.
+fn default_edit_max_tokens() -> u32 {
+    8192
+}
+
+/// Domain payload for the Mercury Edit FIM endpoint (`/v1/fim/completions`).
+///
+/// Fill-In-the-Middle: provide the code before and after the cursor and
+/// the model predicts what goes in between.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletePayload {
-    /// The full file content.
-    pub file_content: String,
-    /// Zero-based byte offset of the cursor inside `file_content`.
-    pub cursor_position: u64,
+    /// Code before the cursor / insertion point.
+    pub prompt: String,
+    /// Code after the cursor / insertion point.
+    #[serde(default)]
+    pub suffix: String,
+    /// Maximum tokens for the completion.
+    #[serde(default = "default_fim_max_tokens")]
+    pub max_tokens: u32,
 }
 
-/// Payload sent to the Mercury Edit `/edit/next` endpoint.
+fn default_fim_max_tokens() -> u32 {
+    256
+}
+
+/// Domain payload for the Mercury Edit Next-Edit endpoint (`/v1/edit/completions`).
+///
+/// The client auto-wraps these fields in the required markup tags.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextEditPayload {
     /// The full file content.
     pub file_content: String,
-    /// Stringified history of prior edits for context.
+    /// The specific code region to edit.
+    #[serde(default)]
+    pub code_to_edit: String,
+    /// Optional cursor position within `code_to_edit`.
+    #[serde(default)]
+    pub cursor: String,
+    /// Optional recently-viewed snippets for context.
+    #[serde(default)]
+    pub recent_snippets: String,
+    /// Stringified history of prior edit diffs.
+    #[serde(default)]
     pub edit_history: String,
 }
 
@@ -182,6 +232,8 @@ struct ChatRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Token usage counters embedded in a chat completion response.
@@ -191,6 +243,9 @@ struct UsageBlock {
     completion_tokens: i64,
     #[allow(dead_code)]
     total_tokens: i64,
+    /// Tokens served from Inception's input cache (10x cheaper).
+    #[serde(default)]
+    cached_input_tokens: i64,
 }
 
 /// A single choice inside a chat completion response.
@@ -212,12 +267,27 @@ struct ChatResponse {
     usage: Option<UsageBlock>,
 }
 
-/// Generic edit endpoint response expected from Mercury Edit.
+/// Fill-In-the-Middle request body for `/v1/fim/completions`.
+#[derive(Debug, Serialize)]
+struct FimRequest {
+    model: String,
+    prompt: String,
+    suffix: String,
+    max_tokens: u32,
+    temperature: f64,
+}
+
+/// A single choice in a FIM completion response.
 #[derive(Debug, Deserialize)]
-struct EditResponse {
-    result: String,
-    #[serde(default)]
-    tokens_used: i64,
+struct FimChoice {
+    text: String,
+}
+
+/// Top-level FIM completion response.
+#[derive(Debug, Deserialize)]
+struct FimResponse {
+    choices: Vec<FimChoice>,
+    usage: Option<UsageBlock>,
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +358,8 @@ pub struct Mercury2Client {
     pub backoff_base_ms: u64,
     /// Optional per-session budget ceiling (USD). `None` means unlimited.
     pub budget_limit: Option<f64>,
+    /// Optional reasoning effort level for Mercury 2.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Running total of money spent across calls on this client.
     cumulative_cost: std::sync::atomic::AtomicU64,
 }
@@ -314,6 +386,7 @@ impl Mercury2Client {
             retry_limit: 3,
             backoff_base_ms: 500,
             budget_limit: None,
+            reasoning_effort: None,
             cumulative_cost: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -340,6 +413,12 @@ impl Mercury2Client {
     /// Set a hard budget ceiling in USD.
     pub fn with_budget(mut self, limit_usd: f64) -> Self {
         self.budget_limit = Some(limit_usd);
+        self
+    }
+
+    /// Set the reasoning effort level (instant / low / medium / high).
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
         self
     }
 
@@ -382,11 +461,14 @@ impl Mercury2Client {
         }
     }
 
-    /// Estimate USD cost from a [`UsageBlock`].
+    /// Estimate USD cost from a [`UsageBlock`], accounting for cached input discount.
     fn estimate_cost(usage: &UsageBlock) -> f64 {
-        let input_cost = (usage.prompt_tokens as f64 / 1000.0) * COST_PER_1K_INPUT;
+        let uncached_input = (usage.prompt_tokens - usage.cached_input_tokens).max(0);
+        let cached_cost =
+            (usage.cached_input_tokens as f64 / 1000.0) * COST_PER_1K_CACHED_INPUT;
+        let input_cost = (uncached_input as f64 / 1000.0) * COST_PER_1K_INPUT;
         let output_cost = (usage.completion_tokens as f64 / 1000.0) * COST_PER_1K_OUTPUT;
-        input_cost + output_cost
+        cached_cost + input_cost + output_cost
     }
 
     /// Determine whether an HTTP status warrants a retry.
@@ -422,6 +504,7 @@ impl Mercury2Client {
             } else {
                 None
             },
+            reasoning_effort: self.reasoning_effort,
         };
 
         let mut attempts: u32 = 0;
@@ -505,6 +588,7 @@ impl std::fmt::Debug for Mercury2Client {
             .field("retry_limit", &self.retry_limit)
             .field("backoff_base_ms", &self.backoff_base_ms)
             .field("budget_limit", &self.budget_limit)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish_non_exhaustive()
     }
 }
@@ -579,13 +663,13 @@ impl MercuryEditClient {
         self
     }
 
-    /// Post a JSON body to the given path and return the result string and
-    /// usage counters, with retry logic for transient errors.
-    async fn post_with_retry<T: Serialize + Sync>(
+    /// Post a JSON body to the given path with retry logic for transient errors.
+    /// Returns the raw response body bytes on success.
+    async fn post_with_retry_raw(
         &self,
         path: &str,
-        payload: &T,
-    ) -> Result<(String, ApiUsage), ApiError> {
+        payload: &(impl Serialize + Sync),
+    ) -> Result<Vec<u8>, ApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut attempts: u32 = 0;
 
@@ -624,21 +708,52 @@ impl MercuryEditClient {
                 return Err(ApiError::ApiStatus { status, body });
             }
 
-            let edit_resp: EditResponse = response.json().await?;
-            let usage = ApiUsage {
-                tokens_used: edit_resp.tokens_used,
-                cost_usd: (edit_resp.tokens_used as f64 / 1000.0) * COST_PER_1K_OUTPUT,
-            };
-
-            debug!(
-                tokens = usage.tokens_used,
-                cost_usd = usage.cost_usd,
-                path,
-                "Mercury Edit call completed"
-            );
-
-            return Ok((edit_resp.result, usage));
+            return Ok(response.bytes().await?.to_vec());
         }
+    }
+
+    /// Extract content and usage from a chat completion response.
+    fn parse_chat_response(raw: &[u8]) -> Result<(String, ApiUsage), ApiError> {
+        let resp: ChatResponse = serde_json::from_slice(raw)?;
+        let content = resp
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .unwrap_or_default();
+        let usage = match resp.usage {
+            Some(u) => {
+                let cost = Mercury2Client::estimate_cost(&u);
+                ApiUsage {
+                    tokens_used: u.prompt_tokens + u.completion_tokens,
+                    cost_usd: cost,
+                }
+            }
+            None => ApiUsage::default(),
+        };
+        Ok((content, usage))
+    }
+
+    /// Extract text and usage from a FIM completion response.
+    fn parse_fim_response(raw: &[u8]) -> Result<(String, ApiUsage), ApiError> {
+        let resp: FimResponse = serde_json::from_slice(raw)?;
+        let text = resp
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.text)
+            .unwrap_or_default();
+        let usage = match resp.usage {
+            Some(u) => {
+                let cost = Mercury2Client::estimate_cost(&u);
+                ApiUsage {
+                    tokens_used: u.prompt_tokens + u.completion_tokens,
+                    cost_usd: cost,
+                }
+            }
+            None => ApiUsage::default(),
+        };
+        Ok((text, usage))
     }
 }
 
@@ -653,16 +768,116 @@ impl std::fmt::Debug for MercuryEditClient {
 }
 
 impl MercuryEditApi for MercuryEditClient {
+    /// Apply edit via `/v1/apply/completions`.
+    ///
+    /// Wraps original code and update snippet in `<|original_code|>` and
+    /// `<|update_snippet|>` markup tags as required by the API.
     async fn apply(&self, payload: &EditPayload) -> Result<(String, ApiUsage), ApiError> {
-        self.post_with_retry("/edit/apply", payload).await
+        let content = format!(
+            "<|original_code|>\n{}\n<|original_code|>\n<|update_snippet|>\n{}\n<|update_snippet|>",
+            payload.original_code, payload.update_snippet
+        );
+        let request = ChatRequest {
+            model: MERCURY_EDIT_MODEL.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content,
+            }],
+            max_tokens: payload.max_tokens,
+            response_format: None,
+            reasoning_effort: None,
+        };
+        let raw = self
+            .post_with_retry_raw("/apply/completions", &request)
+            .await?;
+        let (text, usage) = Self::parse_chat_response(&raw)?;
+        debug!(
+            tokens = usage.tokens_used,
+            cost_usd = usage.cost_usd,
+            "Mercury Edit apply completed"
+        );
+        Ok((text, usage))
     }
 
+    /// FIM autocomplete via `/v1/fim/completions`.
+    ///
+    /// Uses the Fill-In-the-Middle format with `prompt` and `suffix`.
     async fn complete(&self, payload: &CompletePayload) -> Result<(String, ApiUsage), ApiError> {
-        self.post_with_retry("/edit/complete", payload).await
+        let request = FimRequest {
+            model: MERCURY_EDIT_MODEL.to_string(),
+            prompt: payload.prompt.clone(),
+            suffix: payload.suffix.clone(),
+            max_tokens: payload.max_tokens,
+            temperature: 0.0,
+        };
+        let raw = self
+            .post_with_retry_raw("/fim/completions", &request)
+            .await?;
+        let (text, usage) = Self::parse_fim_response(&raw)?;
+        debug!(
+            tokens = usage.tokens_used,
+            cost_usd = usage.cost_usd,
+            "Mercury Edit FIM completed"
+        );
+        Ok((text, usage))
     }
 
+    /// Next edit suggestion via `/v1/edit/completions`.
+    ///
+    /// Wraps fields in the required markup tags:
+    /// `<|recently_viewed_code_snippets|>`, `<|current_file_content|>`,
+    /// `<|code_to_edit|>`, `<|cursor|>`, `<|edit_diff_history|>`.
     async fn next_edit(&self, payload: &NextEditPayload) -> Result<(String, ApiUsage), ApiError> {
-        self.post_with_retry("/edit/next", payload).await
+        let mut parts = Vec::new();
+        if !payload.recent_snippets.is_empty() {
+            parts.push(format!(
+                "<|recently_viewed_code_snippets|>\n{}\n<|recently_viewed_code_snippets|>",
+                payload.recent_snippets
+            ));
+        }
+        parts.push(format!(
+            "<|current_file_content|>\n{}\n<|current_file_content|>",
+            payload.file_content
+        ));
+        if !payload.code_to_edit.is_empty() {
+            parts.push(format!(
+                "<|code_to_edit|>\n{}\n<|code_to_edit|>",
+                payload.code_to_edit
+            ));
+        }
+        if !payload.cursor.is_empty() {
+            parts.push(format!(
+                "<|cursor|>\n{}\n<|cursor|>",
+                payload.cursor
+            ));
+        }
+        if !payload.edit_history.is_empty() {
+            parts.push(format!(
+                "<|edit_diff_history|>\n{}\n<|edit_diff_history|>",
+                payload.edit_history
+            ));
+        }
+        let content = parts.join("\n");
+        let request = ChatRequest {
+            model: MERCURY_EDIT_MODEL.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content,
+            }],
+            max_tokens: 4096,
+            response_format: None,
+            reasoning_effort: None,
+        };
+        let raw = self
+            .post_with_retry_raw("/edit/completions", &request)
+            .await?;
+        let (text, usage) = Self::parse_chat_response(&raw)?;
+        debug!(
+            tokens = usage.tokens_used,
+            cost_usd = usage.cost_usd,
+            "Mercury Edit next-edit completed"
+        );
+        Ok((text, usage))
     }
 }
 
@@ -724,35 +939,24 @@ mod tests {
     }
 
     #[test]
-    fn edit_payload_serializes_without_optional_fields() {
+    fn edit_payload_serializes() {
         let payload = EditPayload {
             original_code: "fn main() {}".into(),
-            current_file_content: "fn main() { println!(\"hi\"); }".into(),
-            code_to_edit: "fn main() {}".into(),
-            cursor_marker: None,
-            edit_history: None,
-            instruction: "add logging".into(),
+            update_snippet: "fn main() { println!(\"hi\"); }".into(),
+            max_tokens: 4096,
         };
         let json = serde_json::to_string(&payload).expect("serialization should succeed in test");
-        assert!(!json.contains("cursor_marker"));
-        assert!(!json.contains("edit_history"));
-        assert!(json.contains("add logging"));
+        assert!(json.contains("original_code"));
+        assert!(json.contains("update_snippet"));
+        assert!(json.contains("4096"));
     }
 
     #[test]
-    fn edit_payload_serializes_with_optional_fields() {
-        let payload = EditPayload {
-            original_code: "fn main() {}".into(),
-            current_file_content: "fn main() {}".into(),
-            code_to_edit: "fn main() {}".into(),
-            cursor_marker: Some("<|cursor|>".into()),
-            edit_history: Some("removed unused import".into()),
-            instruction: "add error handling".into(),
-        };
-        let json = serde_json::to_string(&payload).expect("serialization should succeed in test");
-        assert!(json.contains("cursor_marker"));
-        assert!(json.contains("<|cursor|>"));
-        assert!(json.contains("edit_history"));
+    fn edit_payload_default_max_tokens() {
+        let json = r#"{"original_code":"fn main() {}","update_snippet":"fn main() { }"}"#;
+        let payload: EditPayload =
+            serde_json::from_str(json).expect("deserialization should succeed in test");
+        assert_eq!(payload.max_tokens, 8192);
     }
 
     #[test]
@@ -782,10 +986,21 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 1000,
             total_tokens: 2000,
+            cached_input_tokens: 0,
         };
         let cost = Mercury2Client::estimate_cost(&usage);
         let expected = COST_PER_1K_INPUT + COST_PER_1K_OUTPUT;
         assert!((cost - expected).abs() < 1e-10);
+
+        // With cached tokens: 500 cached, 500 uncached
+        let usage_cached = UsageBlock {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+            total_tokens: 2000,
+            cached_input_tokens: 500,
+        };
+        let cost_cached = Mercury2Client::estimate_cost(&usage_cached);
+        assert!(cost_cached < cost, "cached inputs should reduce cost");
     }
 
     #[test]
@@ -870,24 +1085,39 @@ mod tests {
     #[test]
     fn complete_payload_round_trips() {
         let payload = CompletePayload {
-            file_content: "fn foo() {\n    \n}".into(),
-            cursor_position: 15,
+            prompt: "fn foo() {\n    ".into(),
+            suffix: "\n}".into(),
+            max_tokens: 128,
         };
         let json = serde_json::to_string(&payload).expect("serialization should succeed in test");
         let back: CompletePayload =
             serde_json::from_str(&json).expect("deserialization should succeed in test");
-        assert_eq!(back.cursor_position, 15);
+        assert_eq!(back.suffix, "\n}");
+        assert_eq!(back.max_tokens, 128);
     }
 
     #[test]
     fn next_edit_payload_round_trips() {
         let payload = NextEditPayload {
             file_content: "struct Foo;".into(),
+            code_to_edit: "struct Foo;".into(),
+            cursor: String::new(),
+            recent_snippets: String::new(),
             edit_history: "added struct Foo".into(),
         };
         let json = serde_json::to_string(&payload).expect("serialization should succeed in test");
         let back: NextEditPayload =
             serde_json::from_str(&json).expect("deserialization should succeed in test");
         assert_eq!(back.edit_history, "added struct Foo");
+    }
+
+    #[test]
+    fn reasoning_effort_serializes() {
+        let json = serde_json::to_string(&ReasoningEffort::Instant)
+            .expect("serialization should succeed in test");
+        assert_eq!(json, "\"instant\"");
+        let json = serde_json::to_string(&ReasoningEffort::High)
+            .expect("serialization should succeed in test");
+        assert_eq!(json, "\"high\"");
     }
 }
