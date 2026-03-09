@@ -62,6 +62,8 @@ pub struct MercuryConfig {
     pub annealing: AnnealingConfig,
     pub verification: VerificationConfig,
     pub constitutional: ConstitutionalConfig,
+    #[serde(default)]
+    pub repo: RepoConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +117,50 @@ pub struct ConstitutionalConfig {
     pub naming_conventions: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RepoConfig {
+    #[serde(default)]
+    pub languages: RepoLanguagesConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepoLanguagesConfig {
+    #[serde(default = "default_true")]
+    pub rust: bool,
+    #[serde(default)]
+    pub python: bool,
+    #[serde(default)]
+    pub typescript: bool,
+    #[serde(default)]
+    pub go: bool,
+    #[serde(default)]
+    pub java: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            languages: RepoLanguagesConfig::default(),
+        }
+    }
+}
+
+impl Default for RepoLanguagesConfig {
+    fn default() -> Self {
+        Self {
+            rust: true,
+            python: false,
+            typescript: false,
+            go: false,
+            java: false,
+        }
+    }
+}
+
 impl MercuryConfig {
     /// Load configuration from a TOML file.
     fn load(path: &Path) -> Result<Self> {
@@ -144,6 +190,16 @@ impl MercuryConfig {
             ));
         }
         parts.join("\n")
+    }
+
+    fn repo_languages(&self) -> repo::RepoLanguages {
+        repo::RepoLanguages {
+            rust: self.repo.languages.rust,
+            python: self.repo.languages.python,
+            typescript: self.repo.languages.typescript,
+            go: self.repo.languages.go,
+            java: self.repo.languages.java,
+        }
     }
 
     /// Convert to engine SchedulerConfig.
@@ -407,7 +463,8 @@ async fn cmd_ask(
         client = client.with_reasoning_effort(e);
     }
 
-    let repo_context = match repo::build_repo_map(".") {
+    let repo_languages = config.repo_languages();
+    let repo_context = match repo::build_repo_map_with_languages(".", &repo_languages) {
         Ok(map) => repo::format_repo_map(&map),
         Err(_) => "No repo map available.".to_string(),
     };
@@ -442,7 +499,8 @@ async fn cmd_plan(
 
     // Build repo map
     println!("Indexing repository...");
-    let repo_map = repo::build_repo_map(".")?;
+    let repo_languages = config.repo_languages();
+    let repo_map = repo::build_repo_map_with_languages(".", &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
     let client = Mercury2Client::new(api_key)
@@ -535,7 +593,9 @@ async fn cmd_fix(
 
     // Step 2: Index
     println!("[1/7] Indexing repository...");
-    let repo_map = repo::build_repo_map(&project_root.to_string_lossy())?;
+    let repo_languages = config.repo_languages();
+    let repo_map =
+        repo::build_repo_map_with_languages(&project_root.to_string_lossy(), &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
     // Step 3: Plan
@@ -654,6 +714,13 @@ mercury2_critique_on_failure = true
 test_command = "cargo test"
 lint_command = "cargo clippy"
 
+[repo.languages]
+rust = true
+python = false
+typescript = false
+go = false
+java = false
+
 [constitutional]
 style_guide = ""
 architecture_rules = ""
@@ -720,8 +787,12 @@ async fn main() -> Result<()> {
                     // original_code and update_snippet — Mercury Edit infers the
                     // change from context. For precise edits, callers provide
                     // the actual update snippet.
-                    let (patched, usage) =
-                        patcher.patch(&content, &format!("{content}\n// Instruction: {instruction}")).await?;
+                    let (patched, usage) = patcher
+                        .patch(
+                            &content,
+                            &format!("{content}\n// Instruction: {instruction}"),
+                        )
+                        .await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");

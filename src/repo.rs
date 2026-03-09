@@ -113,10 +113,92 @@ pub struct RepoMap {
     pub symbols: Vec<Symbol>,
     /// Per-file git churn scores.
     pub churn_scores: Vec<ChurnScore>,
-    /// Number of `.rs` files discovered.
-    pub file_count: usize,
-    /// Total line count across all `.rs` files.
+    /// Total number of indexed source files across enabled languages.
+    pub indexed_file_count: usize,
+    /// Per-language indexed file counts.
+    pub language_file_counts: HashMap<String, usize>,
+    /// Total line count across all indexed source files.
     pub total_lines: usize,
+}
+
+/// Supported languages for repository walking/indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Language {
+    Rust,
+    Python,
+    TypeScript,
+    Go,
+    Java,
+}
+
+impl Language {
+    fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "rs" => Some(Self::Rust),
+            "py" => Some(Self::Python),
+            "ts" => Some(Self::TypeScript),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::TypeScript => "typescript",
+            Self::Go => "go",
+            Self::Java => "java",
+        }
+    }
+}
+
+fn parser_for_language(language: Language) -> Option<Parser> {
+    match language {
+        Language::Rust => {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .ok()?;
+            Some(parser)
+        }
+        Language::Python | Language::TypeScript | Language::Go | Language::Java => None,
+    }
+}
+
+/// Language controls for repository indexing.
+#[derive(Debug, Clone)]
+pub struct RepoLanguages {
+    pub rust: bool,
+    pub python: bool,
+    pub typescript: bool,
+    pub go: bool,
+    pub java: bool,
+}
+
+impl Default for RepoLanguages {
+    fn default() -> Self {
+        Self {
+            rust: true,
+            python: false,
+            typescript: false,
+            go: false,
+            java: false,
+        }
+    }
+}
+
+impl RepoLanguages {
+    fn is_enabled(&self, lang: Language) -> bool {
+        match lang {
+            Language::Rust => self.rust,
+            Language::Python => self.python,
+            Language::TypeScript => self.typescript,
+            Language::Go => self.go,
+            Language::Java => self.java,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,10 +210,8 @@ pub struct RepoMap {
 /// `path` is recorded verbatim in each [`Symbol::file_path`] field; it does
 /// not need to point to a real file on disk.
 pub fn parse_file(path: &str, source: &str) -> Result<Vec<Symbol>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|_| RepoError::ParseFailed(path.to_string()))?;
+    let mut parser = parser_for_language(Language::Rust)
+        .ok_or_else(|| RepoError::ParseFailed(path.to_string()))?;
 
     let tree = parser
         .parse(source, None)
@@ -224,10 +304,22 @@ pub fn parse_file(path: &str, source: &str) -> Result<Vec<Symbol>> {
     Ok(symbols)
 }
 
-/// Recursively walk `dir_path`, parse every `.rs` file, and return all symbols.
+/// Recursively walk `dir_path`, parse enabled language files, and return all symbols.
 pub fn parse_directory(dir_path: &str) -> Result<Vec<Symbol>> {
+    parse_directory_with_languages(dir_path, &RepoLanguages::default())
+}
+
+/// Recursively walk `dir_path`, parse source files for enabled languages,
+/// and return extracted symbols.
+pub fn parse_directory_with_languages(
+    dir_path: &str,
+    languages: &RepoLanguages,
+) -> Result<Vec<Symbol>> {
     let mut all_symbols = Vec::new();
-    walk_rs_files(Path::new(dir_path), &mut |path| {
+    walk_source_files(Path::new(dir_path), languages, &mut |path, language| {
+        if parser_for_language(language).is_none() {
+            return Ok(());
+        }
         let source = fs::read_to_string(path)?;
         let path_str = path.to_string_lossy().to_string();
         let syms = parse_file(&path_str, &source)?;
@@ -237,8 +329,20 @@ pub fn parse_directory(dir_path: &str) -> Result<Vec<Symbol>> {
     Ok(all_symbols)
 }
 
-/// Internal helper that recursively visits every `.rs` file under `dir`.
-fn walk_rs_files(dir: &Path, visitor: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
+fn should_skip_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some(".git") | Some("target") | Some(".mercury")
+    )
+}
+
+/// Internal helper that recursively visits source files under `dir` keyed by
+/// extension and language enablement.
+fn walk_source_files(
+    dir: &Path,
+    languages: &RepoLanguages,
+    visitor: &mut dyn FnMut(&Path, Language) -> Result<()>,
+) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -246,9 +350,16 @@ fn walk_rs_files(dir: &Path, visitor: &mut dyn FnMut(&Path) -> Result<()>) -> Re
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            walk_rs_files(&path, visitor)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            visitor(&path)?;
+            if should_skip_directory(&path) {
+                continue;
+            }
+            walk_source_files(&path, languages, visitor)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if let Some(language) = Language::from_extension(ext) {
+                if languages.is_enabled(language) {
+                    visitor(&path, language)?;
+                }
+            }
         }
     }
     Ok(())
@@ -359,13 +470,21 @@ pub fn git_churn_scores(repo_path: &str) -> Result<Vec<ChurnScore>> {
 /// inside a git repository the churn scores will be empty rather than
 /// returning an error.
 pub fn build_repo_map(dir_path: &str) -> Result<RepoMap> {
-    let symbols = parse_directory(dir_path)?;
+    build_repo_map_with_languages(dir_path, &RepoLanguages::default())
+}
+
+pub fn build_repo_map_with_languages(dir_path: &str, languages: &RepoLanguages) -> Result<RepoMap> {
+    let symbols = parse_directory_with_languages(dir_path, languages)?;
 
     // Count files and total lines.
-    let mut file_count: usize = 0;
+    let mut indexed_file_count: usize = 0;
+    let mut language_file_counts: HashMap<String, usize> = HashMap::new();
     let mut total_lines: usize = 0;
-    walk_rs_files(Path::new(dir_path), &mut |path| {
-        file_count += 1;
+    walk_source_files(Path::new(dir_path), languages, &mut |path, language| {
+        indexed_file_count += 1;
+        *language_file_counts
+            .entry(language.as_str().to_string())
+            .or_insert(0) += 1;
         let content = fs::read_to_string(path)?;
         total_lines += content.lines().count();
         Ok(())
@@ -377,7 +496,8 @@ pub fn build_repo_map(dir_path: &str) -> Result<RepoMap> {
     Ok(RepoMap {
         symbols,
         churn_scores,
-        file_count,
+        indexed_file_count,
+        language_file_counts,
         total_lines,
     })
 }
@@ -398,8 +518,19 @@ pub fn format_repo_map(map: &RepoMap) -> String {
     let _ = writeln!(
         out,
         "=== Repository Map ({} files, {} lines) ===\n",
-        map.file_count, map.total_lines,
+        map.indexed_file_count, map.total_lines,
     );
+
+    if !map.language_file_counts.is_empty() {
+        let mut language_keys: Vec<&String> = map.language_file_counts.keys().collect();
+        language_keys.sort();
+        let stats = language_keys
+            .into_iter()
+            .map(|k| format!("{}={}", k, map.language_file_counts[k]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "Languages indexed: {stats}\n");
+    }
 
     // Group symbols by file.
     let mut by_file: HashMap<&str, Vec<&Symbol>> = HashMap::new();
@@ -447,6 +578,7 @@ pub fn format_repo_map(map: &RepoMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     /// A small Rust source snippet used by multiple tests.
     const SAMPLE_SOURCE: &str = r#"
@@ -599,7 +731,8 @@ impl Point {
                 lines_changed: 80,
                 normalized_score: 1.0,
             }],
-            file_count: 2,
+            indexed_file_count: 2,
+            language_file_counts: HashMap::from([("rust".to_string(), 2)]),
             total_lines: 150,
         };
 
@@ -628,7 +761,8 @@ impl Point {
         let map = RepoMap {
             symbols: vec![],
             churn_scores: vec![],
-            file_count: 0,
+            indexed_file_count: 0,
+            language_file_counts: HashMap::new(),
             total_lines: 0,
         };
 
@@ -650,5 +784,95 @@ impl Point {
         assert_eq!(cs.commit_count, 5);
         assert_eq!(cs.lines_changed, 42);
         assert!((cs.normalized_score - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_directory_skips_unsupported_language_files_gracefully() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rust_file = dir.path().join("lib.rs");
+        let python_file = dir.path().join("tool.py");
+
+        fs::write(&rust_file, "fn hello() {}\n").expect("write rust");
+        fs::write(&python_file, "def hello():\n    return 1\n").expect("write py");
+
+        let mut languages = RepoLanguages::default();
+        languages.python = true;
+
+        let symbols = parse_directory_with_languages(&dir.path().to_string_lossy(), &languages)
+            .expect("parse directory");
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "hello" && s.file_path.ends_with("lib.rs")));
+        assert!(
+            !symbols.iter().any(|s| s.file_path.ends_with("tool.py")),
+            "python files should be skipped because parser is unsupported"
+        );
+    }
+
+    #[test]
+    fn test_build_repo_map_language_counts_follow_enablement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
+        fs::write(dir.path().join("b.py"), "print('hi')\n").expect("write b.py");
+        fs::write(dir.path().join("c.ts"), "export const x = 1;\n").expect("write c.ts");
+
+        let mut languages = RepoLanguages::default();
+        languages.python = true;
+
+        let map = build_repo_map_with_languages(&dir.path().to_string_lossy(), &languages)
+            .expect("build repo map");
+
+        assert_eq!(map.indexed_file_count, 2);
+        assert_eq!(map.language_file_counts.get("rust"), Some(&1));
+        assert_eq!(map.language_file_counts.get("python"), Some(&1));
+        assert!(map.language_file_counts.get("typescript").is_none());
+    }
+
+    #[test]
+    fn test_walk_source_files_skips_common_large_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("target")).expect("mkdir target");
+        fs::write(
+            dir.path().join("target").join("ignored.rs"),
+            "fn ignored() {}\n",
+        )
+        .expect("write ignored");
+        fs::write(dir.path().join("kept.rs"), "fn kept() {}\n").expect("write kept");
+
+        let languages = RepoLanguages::default();
+        let mut visited = Vec::new();
+        walk_source_files(dir.path(), &languages, &mut |path, _language| {
+            visited.push(path.file_name().unwrap().to_string_lossy().to_string());
+            Ok(())
+        })
+        .expect("walk files");
+
+        assert_eq!(visited, vec!["kept.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_walk_source_files_visits_only_enabled_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("nested")).expect("mkdir");
+        fs::write(dir.path().join("nested").join("x.rs"), "fn x() {}\n").expect("write rs");
+        fs::write(dir.path().join("nested").join("y.go"), "package main\n").expect("write go");
+
+        let languages = RepoLanguages {
+            rust: true,
+            python: false,
+            typescript: false,
+            go: false,
+            java: false,
+        };
+
+        let mut visited = Vec::new();
+        walk_source_files(dir.path(), &languages, &mut |path, _language| {
+            visited.push(path.file_name().unwrap().to_string_lossy().to_string());
+            Ok(())
+        })
+        .expect("walk files");
+
+        assert_eq!(visited, vec!["x.rs".to_string()]);
     }
 }
