@@ -795,8 +795,10 @@ impl Point {
         fs::write(&rust_file, "fn hello() {}\n").expect("write rust");
         fs::write(&python_file, "def hello():\n    return 1\n").expect("write py");
 
-        let mut languages = RepoLanguages::default();
-        languages.python = true;
+        let languages = RepoLanguages {
+            python: true,
+            ..Default::default()
+        };
 
         let symbols = parse_directory_with_languages(&dir.path().to_string_lossy(), &languages)
             .expect("parse directory");
@@ -817,8 +819,10 @@ impl Point {
         fs::write(dir.path().join("b.py"), "print('hi')\n").expect("write b.py");
         fs::write(dir.path().join("c.ts"), "export const x = 1;\n").expect("write c.ts");
 
-        let mut languages = RepoLanguages::default();
-        languages.python = true;
+        let languages = RepoLanguages {
+            python: true,
+            ..Default::default()
+        };
 
         let map = build_repo_map_with_languages(&dir.path().to_string_lossy(), &languages)
             .expect("build repo map");
@@ -826,7 +830,7 @@ impl Point {
         assert_eq!(map.indexed_file_count, 2);
         assert_eq!(map.language_file_counts.get("rust"), Some(&1));
         assert_eq!(map.language_file_counts.get("python"), Some(&1));
-        assert!(map.language_file_counts.get("typescript").is_none());
+        assert!(!map.language_file_counts.contains_key("typescript"));
     }
 
     #[test]

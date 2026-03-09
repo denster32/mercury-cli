@@ -1079,6 +1079,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn thermal_analysis_prompt_is_non_empty() {
         assert!(!THERMAL_ANALYSIS_PROMPT.is_empty());
         assert!(THERMAL_ANALYSIS_PROMPT.contains("complexity_score"));

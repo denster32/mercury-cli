@@ -119,7 +119,7 @@ pub struct ConstitutionalConfig {
     pub naming_conventions: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct RepoConfig {
     #[serde(default)]
     pub languages: RepoLanguagesConfig,
@@ -141,14 +141,6 @@ pub struct RepoLanguagesConfig {
 
 fn default_true() -> bool {
     true
-}
-
-impl Default for RepoConfig {
-    fn default() -> Self {
-        Self {
-            languages: RepoLanguagesConfig::default(),
-        }
-    }
 }
 
 impl Default for RepoLanguagesConfig {

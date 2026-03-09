@@ -305,6 +305,7 @@ fn test_budget_enforcement() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[allow(clippy::manual_async_fn)]
 async fn test_fix_executes_verification_gate() {
     use mercury_cli::api::{ApiError, ApiUsage, CompletePayload, EditPayload, NextEditPayload};
     use mercury_cli::engine::{
