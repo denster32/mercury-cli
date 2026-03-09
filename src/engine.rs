@@ -72,6 +72,9 @@ pub struct ExecutionPlan {
     pub constitutional_prompt: String,
     /// Total estimated cost.
     pub estimated_cost: f64,
+    /// Total estimated tokens consumed while generating this plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<i64>,
 }
 
 /// A single step in an execution plan.
@@ -104,6 +107,8 @@ impl<A: Mercury2Api> Planner<A> {
         goal: &str,
         repo_map: &str,
     ) -> Result<(ExecutionPlan, Vec<ThermalAssessment>), EngineError> {
+        let mut total_usage = ApiUsage::default();
+
         let system_prompt = format!(
             "{}\n\n{}\n\nAdditionally, generate an execution plan as JSON with this schema:\n\
              {{\"steps\": [{{\"file_path\": \"...\", \"instruction\": \"...\", \"priority\": 0.0-1.0, \"estimated_tokens\": N}}],\n\
@@ -113,7 +118,9 @@ impl<A: Mercury2Api> Planner<A> {
 
         let user_msg = format!("Goal: {}\n\nRepository Map:\n{}", goal, repo_map);
 
-        let (response, _usage) = self.api.chat(&system_prompt, &user_msg, 4096).await?;
+        let (response, usage) = self.api.chat(&system_prompt, &user_msg, 4096).await?;
+        total_usage.tokens_used += usage.tokens_used;
+        total_usage.cost_usd += usage.cost_usd;
 
         // Mercury 2 may wrap JSON in markdown fences — extract the JSON body.
         let json_str = extract_json(&response);
@@ -124,7 +131,8 @@ impl<A: Mercury2Api> Planner<A> {
         let plan = ExecutionPlan {
             steps: parsed.steps,
             constitutional_prompt: self.constitutional_prompt.clone(),
-            estimated_cost: 0.0,
+            estimated_cost: total_usage.cost_usd,
+            estimated_tokens: Some(total_usage.tokens_used),
         };
 
         Ok((plan, parsed.assessments))
@@ -682,6 +690,50 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ApiUsage;
+
+    struct MockPlannerApi {
+        response: String,
+        usage: ApiUsage,
+    }
+
+    impl crate::api::Mercury2Api for MockPlannerApi {
+        async fn chat(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> Result<(String, ApiUsage), ApiError> {
+            Ok((self.response.clone(), self.usage))
+        }
+
+        async fn chat_json(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> Result<(ThermalAssessment, ApiUsage), ApiError> {
+            unreachable!("planner tests only use chat")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_planner_sets_estimated_cost_from_usage() {
+        let api = MockPlannerApi {
+            response: r#"{"steps":[{"file_path":"src/main.rs","instruction":"Do thing","priority":0.9,"estimated_tokens":150}],"assessments":[]}"#.to_string(),
+            usage: ApiUsage {
+                tokens_used: 321,
+                cost_usd: 0.0123,
+            },
+        };
+        let planner = Planner::new(api, "constitution".to_string());
+
+        let (plan, _assessments) = planner.plan("goal", "repo").await.unwrap();
+
+        assert!(plan.estimated_cost > 0.0);
+        assert_eq!(plan.estimated_cost, 0.0123);
+        assert_eq!(plan.estimated_tokens, Some(321));
+    }
 
     #[test]
     fn test_scheduler_budget_tracking() {
