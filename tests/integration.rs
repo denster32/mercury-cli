@@ -149,6 +149,49 @@ fn test_thermal_crud_roundtrip() {
 }
 
 #[test]
+fn test_planning_persists_all_four_metric_types() {
+    use std::collections::BTreeSet;
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let file_path = "src/main.rs";
+
+    db.upsert_thermal_score(file_path, 1, 1000, 0.81, "complexity", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.64, "dependency", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.72, "risk", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.49, "churn", "plan", "planner")
+        .unwrap();
+
+    let scheduler = mercury_cli::engine::Scheduler::new(Default::default());
+    scheduler.run_merge_cycle(&db, 1.0).unwrap();
+
+    let score_types: BTreeSet<String> = db
+        .get_scores_for_file(file_path)
+        .unwrap()
+        .into_iter()
+        .map(|score| score.score_type)
+        .collect();
+
+    assert_eq!(
+        score_types,
+        BTreeSet::from([
+            "churn".to_string(),
+            "complexity".to_string(),
+            "dependency".to_string(),
+            "risk".to_string(),
+        ])
+    );
+
+    let aggregate = db.get_aggregate(file_path).unwrap();
+    assert!(
+        aggregate.is_some(),
+        "merge cycle should aggregate four-factor scores"
+    );
+}
+
+#[test]
 fn test_cool_zone_locking() {
     let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
 
@@ -255,4 +298,145 @@ fn test_budget_enforcement() {
     // Should fail — exceeds budget
     let result = scheduler.record_cost(0.05);
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Fix orchestration verification gate coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[allow(clippy::manual_async_fn)]
+async fn test_fix_executes_verification_gate() {
+    use mercury_cli::api::{ApiError, ApiUsage, CompletePayload, EditPayload, NextEditPayload};
+    use mercury_cli::engine::{
+        execute_plan_steps, ExecutionPlan, Patcher, PlanStep, Scheduler, SchedulerConfig, Verifier,
+        VerifyConfig,
+    };
+    use mercury_cli::{api::Mercury2Api, api::MercuryEditApi};
+    use std::future::Future;
+    use std::path::Path;
+
+    struct TestEditApi;
+
+    impl MercuryEditApi for TestEditApi {
+        fn apply(
+            &self,
+            payload: &EditPayload,
+        ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
+            let out = if payload.update_snippet.contains("PASS") {
+                payload.update_snippet.clone()
+            } else {
+                payload.original_code.clone() + payload.update_snippet.as_str()
+            };
+            async move { Ok((out, ApiUsage::default())) }
+        }
+
+        fn complete(
+            &self,
+            _payload: &CompletePayload,
+        ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
+            async { Ok((String::new(), ApiUsage::default())) }
+        }
+
+        fn next_edit(
+            &self,
+            _payload: &NextEditPayload,
+        ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
+            async { Ok((String::new(), ApiUsage::default())) }
+        }
+    }
+
+    struct NoopMercury2;
+
+    impl Mercury2Api for NoopMercury2 {
+        fn chat(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
+            async { Err(ApiError::MaxRetries(0)) }
+        }
+
+        fn chat_json(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> impl Future<Output = Result<(mercury_cli::api::ThermalAssessment, ApiUsage), ApiError>> + Send
+        {
+            async { Err(ApiError::MaxRetries(0)) }
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = project_root.join("sample.rs");
+    std::fs::write(
+        &target_file,
+        "fn hello() {}
+",
+    )
+    .unwrap();
+
+    let plan = ExecutionPlan {
+        steps: vec![
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "fn bad( {".to_string(),
+                priority: 1.0,
+                estimated_tokens: 64,
+            },
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "
+fn hello() {} // PASS"
+                    .to_string(),
+                priority: 0.5,
+                estimated_tokens: 64,
+            },
+        ],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let scheduler = Scheduler::new(SchedulerConfig {
+        max_cost_per_command: 1.0,
+        ..Default::default()
+    });
+
+    let patcher = Patcher::new(TestEditApi);
+    let verifier = Verifier::new(
+        VerifyConfig {
+            parse_before_write: true,
+            test_after_write: false,
+            lint_after_write: false,
+            mercury2_critique_on_failure: false,
+            test_command: "true".into(),
+            lint_command: "true".into(),
+        },
+        None::<NoopMercury2>,
+    );
+
+    let summary = execute_plan_steps(
+        &plan,
+        &patcher,
+        &verifier,
+        &scheduler,
+        &db,
+        Path::new(project_root),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.accepted, 1);
+    assert_eq!(summary.rejected, 1);
+    assert_eq!(summary.verification_failures, 1);
+
+    let logs = db.get_agent_logs().unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| log.status == "failed"));
+    assert!(logs.iter().any(|log| log.status == "success"));
 }

@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use mercury_cli::api::{self, Mercury2Client, MercuryEditClient};
 use mercury_cli::db::{self, ThermalDb};
-use mercury_cli::engine::{self, Scheduler, SchedulerConfig, Verifier, VerifyConfig};
+use mercury_cli::engine::{
+    self, Scheduler, SchedulerConfig, StepExecutionSummary, Verifier, VerifyConfig,
+};
 use mercury_cli::repo;
 use mercury_cli::swarm;
 use mercury_cli::thermal::{self, render_heatmap_to_string};
@@ -62,6 +64,8 @@ pub struct MercuryConfig {
     pub annealing: AnnealingConfig,
     pub verification: VerificationConfig,
     pub constitutional: ConstitutionalConfig,
+    #[serde(default)]
+    pub repo: RepoConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,6 +119,42 @@ pub struct ConstitutionalConfig {
     pub naming_conventions: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoConfig {
+    #[serde(default)]
+    pub languages: RepoLanguagesConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepoLanguagesConfig {
+    #[serde(default = "default_true")]
+    pub rust: bool,
+    #[serde(default)]
+    pub python: bool,
+    #[serde(default)]
+    pub typescript: bool,
+    #[serde(default)]
+    pub go: bool,
+    #[serde(default)]
+    pub java: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for RepoLanguagesConfig {
+    fn default() -> Self {
+        Self {
+            rust: true,
+            python: false,
+            typescript: false,
+            go: false,
+            java: false,
+        }
+    }
+}
+
 impl MercuryConfig {
     /// Load configuration from a TOML file.
     fn load(path: &Path) -> Result<Self> {
@@ -144,6 +184,16 @@ impl MercuryConfig {
             ));
         }
         parts.join("\n")
+    }
+
+    fn repo_languages(&self) -> repo::RepoLanguages {
+        repo::RepoLanguages {
+            rust: self.repo.languages.rust,
+            python: self.repo.languages.python,
+            typescript: self.repo.languages.typescript,
+            go: self.repo.languages.go,
+            java: self.repo.languages.java,
+        }
     }
 
     /// Convert to engine SchedulerConfig.
@@ -410,7 +460,8 @@ async fn cmd_ask(
         client = client.with_reasoning_effort(e);
     }
 
-    let repo_context = match repo::build_repo_map(".") {
+    let repo_languages = config.repo_languages();
+    let repo_context = match repo::build_repo_map_with_languages(".", &repo_languages) {
         Ok(map) => repo::format_repo_map(&map),
         Err(_) => "No repo map available.".to_string(),
     };
@@ -445,10 +496,11 @@ async fn cmd_plan(
 
     // Build repo map
     println!("Indexing repository...");
-    let repo_map = repo::build_repo_map(".")?;
+    let repo_languages = config.repo_languages();
+    let repo_map = repo::build_repo_map_with_languages(".", &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
-    let client = Mercury2Client::new(api_key)
+    let client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
@@ -460,32 +512,7 @@ async fn cmd_plan(
     println!("Planning with Mercury 2...");
     let (plan, assessments) = planner.plan(goal, &repo_map_str).await?;
 
-    // Store thermal scores from assessments
-    for (i, assessment) in assessments.iter().enumerate() {
-        let file_path = plan
-            .steps
-            .get(i)
-            .map(|s| s.file_path.as_str())
-            .unwrap_or("unknown");
-        db.upsert_thermal_score(
-            file_path,
-            1,
-            1000,
-            assessment.complexity_score,
-            "complexity",
-            "plan",
-            "planner",
-        )?;
-        db.upsert_thermal_score(
-            file_path,
-            1,
-            1000,
-            assessment.risk_score,
-            "risk",
-            "plan",
-            "planner",
-        )?;
-    }
+    store_assessments(db, &plan.steps, &assessments, "plan")?;
 
     // Run merge cycle
     let scheduler = Scheduler::new(config.to_scheduler_config());
@@ -493,6 +520,13 @@ async fn cmd_plan(
 
     // Display plan
     println!("\nExecution Plan ({} steps):", plan.steps.len());
+    println!(
+        "Estimated planning cost: ${:.4}{}",
+        plan.estimated_cost,
+        plan.estimated_tokens
+            .map(|tokens| format!(" | tokens: {tokens}"))
+            .unwrap_or_default()
+    );
     for (i, step) in plan.steps.iter().enumerate() {
         println!(
             "  {}. {} (priority: {:.2})",
@@ -502,6 +536,7 @@ async fn cmd_plan(
         );
         println!("     {}", step.instruction);
     }
+    print_assessment_summary(&plan.steps, &assessments);
 
     // Display heatmap
     let aggregates = db.get_all_aggregates()?;
@@ -538,7 +573,9 @@ async fn cmd_fix(
 
     // Step 2: Index
     println!("[1/7] Indexing repository...");
-    let repo_map = repo::build_repo_map(&project_root.to_string_lossy())?;
+    let repo_languages = config.repo_languages();
+    let repo_map =
+        repo::build_repo_map_with_languages(&project_root.to_string_lossy(), &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
     // Step 3: Plan
@@ -546,7 +583,7 @@ async fn cmd_fix(
     let api_key = std::env::var(&config.api.api_key_env)
         .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
 
-    let client = Mercury2Client::new(api_key)
+    let client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
@@ -555,30 +592,16 @@ async fn cmd_fix(
 
     let planner = engine::Planner::new(client, config.constitutional_prompt());
     let (plan, assessments) = planner.plan(description, &repo_map_str).await?;
+    println!(
+        "  Plan estimate: ${:.4}{}",
+        plan.estimated_cost,
+        plan.estimated_tokens
+            .map(|tokens| format!(" | tokens: {tokens}"))
+            .unwrap_or_default()
+    );
 
-    // Store thermal assessments
-    for (i, assessment) in assessments.iter().enumerate() {
-        if let Some(step) = plan.steps.get(i) {
-            db.upsert_thermal_score(
-                &step.file_path,
-                1,
-                1000,
-                assessment.complexity_score,
-                "complexity",
-                "fix",
-                "planner",
-            )?;
-            db.upsert_thermal_score(
-                &step.file_path,
-                1,
-                1000,
-                assessment.risk_score,
-                "risk",
-                "fix",
-                "planner",
-            )?;
-        }
-    }
+    store_assessments(db, &plan.steps, &assessments, "fix")?;
+    print_assessment_summary(&plan.steps, &assessments);
 
     // Run initial merge
     let mut sched_config = config.to_scheduler_config();
@@ -597,13 +620,34 @@ async fn cmd_fix(
     let hot_zones = db.zones_above(config.thermal.hot_threshold)?;
     println!("  {} hot zone files identified", hot_zones.len());
 
-    // Step 6: Anneal
-    println!("[5/7] Annealing...");
+    // Step 6: Execute planned edits with verification gating
+    println!("[5/7] Patching and verifying plan steps...");
+    let edit_client =
+        MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
+            .with_retries(
+                config.scheduler.retry_limit,
+                config.scheduler.backoff_base_ms,
+            );
+    let patcher = engine::Patcher::new(edit_client);
+
+    let verify_config = VerifyConfig {
+        parse_before_write: config.verification.parse_before_write,
+        test_after_write: config.verification.test_after_write,
+        lint_after_write: config.verification.lint_after_write,
+        mercury2_critique_on_failure: config.verification.mercury2_critique_on_failure,
+        test_command: config.verification.test_command.clone(),
+        lint_command: config.verification.lint_command.clone(),
+    };
+    let verifier = Verifier::new(verify_config, None::<Mercury2Client>);
+    let execution_summary: StepExecutionSummary =
+        engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
+            .await?;
+
+    // Step 7: Anneal + report
+    println!("[6/7] Annealing...");
     scheduler.run_decay_cycle(db, config.thermal.decay_half_life_seconds)?;
     scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
 
-    // Step 7: Report
-    println!("[6/7] Verification...");
     println!("[7/7] Complete!");
 
     let aggregates = db.get_all_aggregates()?;
@@ -613,10 +657,97 @@ async fn cmd_fix(
         println!("{}", render_heatmap_to_string(&aggregates, &active));
     }
 
+    println!("\nExecution summary:");
+    println!("  Accepted steps: {}", execution_summary.accepted);
+    println!("  Rejected steps: {}", execution_summary.rejected);
+    println!(
+        "  Verification failures: {}",
+        execution_summary.verification_failures
+    );
+
     println!("\nCost: ${:.4}", scheduler.current_cost());
     println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
 
     Ok(())
+}
+
+fn store_assessments(
+    db: &ThermalDb,
+    steps: &[engine::PlanStep],
+    assessments: &[api::ThermalAssessment],
+    command: &str,
+) -> Result<()> {
+    for (i, assessment) in assessments.iter().enumerate() {
+        let file_path = steps
+            .get(i)
+            .map(|s| s.file_path.as_str())
+            .unwrap_or("unknown");
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.complexity_score,
+            "complexity",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.dependency_score,
+            "dependency",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.risk_score,
+            "risk",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.churn_score,
+            "churn",
+            command,
+            "planner",
+        )?;
+    }
+    Ok(())
+}
+
+fn print_assessment_summary(steps: &[engine::PlanStep], assessments: &[api::ThermalAssessment]) {
+    if assessments.is_empty() {
+        return;
+    }
+
+    println!("\nAssessment contributions (complexity/dependency/risk/churn):");
+    for (i, assessment) in assessments.iter().enumerate() {
+        let file_path = steps
+            .get(i)
+            .map(|s| s.file_path.as_str())
+            .unwrap_or("unknown");
+        let overall = (assessment.complexity_score
+            + assessment.dependency_score
+            + assessment.risk_score
+            + assessment.churn_score)
+            / 4.0;
+        println!(
+            "  - {} => c:{:.2} d:{:.2} r:{:.2} h:{:.2} avg:{:.2}",
+            file_path,
+            assessment.complexity_score,
+            assessment.dependency_score,
+            assessment.risk_score,
+            assessment.churn_score,
+            overall
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +787,13 @@ lint_after_write = true
 mercury2_critique_on_failure = true
 test_command = "cargo test"
 lint_command = "cargo clippy"
+
+[repo.languages]
+rust = true
+python = false
+typescript = false
+go = false
+java = false
 
 [constitutional]
 style_guide = ""
