@@ -12,7 +12,9 @@ use thiserror::Error;
 
 use mercury_cli::api::{self, Mercury2Client, MercuryEditClient};
 use mercury_cli::db::{self, ThermalDb};
-use mercury_cli::engine::{self, Scheduler, SchedulerConfig};
+use mercury_cli::engine::{
+    self, Scheduler, SchedulerConfig, StepExecutionSummary, Verifier, VerifyConfig,
+};
 use mercury_cli::repo;
 use mercury_cli::swarm;
 use mercury_cli::thermal::{self, render_heatmap_to_string};
@@ -503,7 +505,7 @@ async fn cmd_plan(
     let repo_map = repo::build_repo_map_with_languages(".", &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
-    let client = Mercury2Client::new(api_key)
+    let client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
@@ -603,7 +605,7 @@ async fn cmd_fix(
     let api_key = std::env::var(&config.api.api_key_env)
         .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
 
-    let client = Mercury2Client::new(api_key)
+    let client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
@@ -654,13 +656,34 @@ async fn cmd_fix(
     let hot_zones = db.zones_above(config.thermal.hot_threshold)?;
     println!("  {} hot zone files identified", hot_zones.len());
 
-    // Step 6: Anneal
-    println!("[5/7] Annealing...");
+    // Step 6: Execute planned edits with verification gating
+    println!("[5/7] Patching and verifying plan steps...");
+    let edit_client =
+        MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
+            .with_retries(
+                config.scheduler.retry_limit,
+                config.scheduler.backoff_base_ms,
+            );
+    let patcher = engine::Patcher::new(edit_client);
+
+    let verify_config = VerifyConfig {
+        parse_before_write: config.verification.parse_before_write,
+        test_after_write: config.verification.test_after_write,
+        lint_after_write: config.verification.lint_after_write,
+        mercury2_critique_on_failure: config.verification.mercury2_critique_on_failure,
+        test_command: config.verification.test_command.clone(),
+        lint_command: config.verification.lint_command.clone(),
+    };
+    let verifier = Verifier::new(verify_config, None::<Mercury2Client>);
+    let execution_summary: StepExecutionSummary =
+        engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
+            .await?;
+
+    // Step 7: Anneal + report
+    println!("[6/7] Annealing...");
     scheduler.run_decay_cycle(db, config.thermal.decay_half_life_seconds)?;
     scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
 
-    // Step 7: Report
-    println!("[6/7] Verification...");
     println!("[7/7] Complete!");
 
     let aggregates = db.get_all_aggregates()?;
@@ -669,6 +692,14 @@ async fn cmd_fix(
         println!("\nFinal Thermal Map:");
         println!("{}", render_heatmap_to_string(&aggregates, &active));
     }
+
+    println!("\nExecution summary:");
+    println!("  Accepted steps: {}", execution_summary.accepted);
+    println!("  Rejected steps: {}", execution_summary.rejected);
+    println!(
+        "  Verification failures: {}",
+        execution_summary.verification_failures
+    );
 
     println!("\nCost: ${:.4}", scheduler.current_cost());
     println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
