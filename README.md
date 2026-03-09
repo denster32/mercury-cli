@@ -107,7 +107,7 @@ Every thermal score in the database decays exponentially over a configurable hal
 mercury init
 
 # Generate thermal heat map
-mercury repo plan "fix flaky auth tests"
+mercury plan "fix flaky auth tests"
 
 # View live thermal state
 mercury status --heatmap
@@ -118,15 +118,30 @@ mercury ask "why does the auth module have so many dependencies?"
 # Apply a targeted edit
 mercury edit apply src/auth.rs --instruction "convert retries to exponential backoff"
 
-# The killer workflow: plan → index → patch → verify → commit
+# The current fix workflow (v0.1): index → plan → scaffold cool zones → resolve hot zones → anneal → report
 mercury fix "refactor auth module" --max-agents 50 --max-cost 1.00
 
-# Watch tests and auto-repair failures
+# Watch a command (repair is currently a preview stub)
 mercury watch "cargo test" --repair
 
-# Run a custom workflow
-mercury agent run .mercury/repair.yml
+# Roadmap (not yet implemented in v0.1): custom workflow runner
+# mercury agent run .mercury/repair.yml
 ```
+
+## Implemented in v0.1
+
+| Command | Status | Notes |
+|---|---|---|
+| `mercury init` | Working | Initializes `.mercury/` with config + SQLite thermal DB. |
+| `mercury plan <goal>` | Working | Generates a plan + thermal scores and can write JSON via `--output`. |
+| `mercury status [--heatmap] [--agents] [--budget]` | Working | Reports current thermal state and swarm/budget metadata. |
+| `mercury ask <query>` | Working | Sends repository-aware questions to Mercury 2. |
+| `mercury edit apply/complete/next` | Working | Uses Mercury Edit for instruction patching and completions. |
+| `mercury fix <description>` | Partial | Executes 7-stage pipeline: index, plan, scaffold/resolution discovery, anneal, verification banner, and final report (no automatic patch/apply/commit yet). |
+| `mercury watch <command>` | Stub/Preview | Runs command selection UI text; `--repair` currently prints preview messaging only. |
+| `mercury config get` / `validate` | Working | Reads config values and validates TOML loadability. |
+| `mercury config set` | Stub | Prints guidance; direct file editing is still required. |
+| `mercury agent run ...` | Roadmap | Not available in current clap interface. |
 
 ## Theoretical Foundations
 
