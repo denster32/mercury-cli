@@ -1,0 +1,78 @@
+name: Release Build Artifacts
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_SOURCE: target/release/mercury-cli
+  PACKAGE_BINARY: mercury
+
+jobs:
+  release-build:
+    name: Release build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            archive_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            label: macos-arm64
+            archive_target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin mercury-cli
+
+      - name: Package archive and checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_SHA::7}"
+          PACKAGE_ROOT="mercury-${VERSION}-${{ matrix.archive_target }}"
+          ARCHIVE="${PACKAGE_ROOT}.tar.gz"
+
+          mkdir -p "$PACKAGE_ROOT"
+          cp "$BINARY_SOURCE" "$PACKAGE_ROOT/$PACKAGE_BINARY"
+          cp README.md CHANGELOG.md SECURITY.md "$PACKAGE_ROOT/"
+          tar -czf "$ARCHIVE" "$PACKAGE_ROOT"
+
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          archive = Path("${ARCHIVE}")
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          Path(f"{archive}.sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
+          PY
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-cli-${{ matrix.archive_target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256

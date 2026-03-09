@@ -1,0 +1,7 @@
+<|original_code|>
+{{ORIGINAL_CODE}}
+<|/original_code|>
+
+<|update_snippet|>
+{{UPDATE_SNIPPET}}
+<|/update_snippet|>

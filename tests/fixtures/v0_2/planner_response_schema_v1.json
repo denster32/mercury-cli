@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Mercury CLI Planner Response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "steps",
+    "assessments"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "planner-response-v1"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "file_path",
+          "instruction",
+          "priority",
+          "estimated_tokens"
+        ],
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "instruction": {
+            "type": "string",
+            "minLength": 1
+          },
+          "priority": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "estimated_tokens": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "complexity_score",
+          "dependency_score",
+          "risk_score",
+          "churn_score",
+          "suggested_action",
+          "reasoning"
+        ],
+        "properties": {
+          "complexity_score": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "dependency_score": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "risk_score": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "churn_score": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0
+          },
+          "suggested_action": {
+            "type": "string",
+            "enum": [
+              "lock",
+              "refactor",
+              "test",
+              "monitor",
+              "ignore"
+            ]
+          },
+          "reasoning": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release when running manually, for example 0.2.0
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_SOURCE: target/release/mercury-cli
+  PACKAGE_BINARY: mercury
+
+jobs:
+  build-and-release:
+    name: Build and release (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            archive_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            label: macos-arm64
+            archive_target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+
+          if [[ -z "$VERSION" ]]; then
+            echo "version input is required for manual releases" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin mercury-cli
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_ROOT="mercury-${VERSION}-${{ matrix.archive_target }}"
+          ARCHIVE="${PACKAGE_ROOT}.tar.gz"
+
+          mkdir -p "$PACKAGE_ROOT"
+          cp "$BINARY_SOURCE" "$PACKAGE_ROOT/$PACKAGE_BINARY"
+          cp README.md CHANGELOG.md SECURITY.md "$PACKAGE_ROOT/"
+          tar -czf "$ARCHIVE" "$PACKAGE_ROOT"
+
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          archive = Path("${ARCHIVE}")
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          Path(f"{archive}.sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
+          PY
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-cli-${{ matrix.archive_target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256
+          generate_release_notes: true

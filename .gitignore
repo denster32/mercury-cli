@@ -1,4 +1,7 @@
 /target
+/evals/v0/target/
+/evals/v0/reports/*.json
+/evals/v0/reports/*.md
 *.db
 .env
 .DS_Store

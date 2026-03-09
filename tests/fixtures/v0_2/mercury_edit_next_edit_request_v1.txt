@@ -1,0 +1,19 @@
+<|recently_viewed_code_snippets|>
+{{RECENTLY_VIEWED_SNIPPETS}}
+<|/recently_viewed_code_snippets|>
+
+<|current_file_content|>
+current_file_path: {{CURRENT_FILE_PATH}}
+{{CURRENT_FILE_CONTENT}}
+
+<|code_to_edit|>
+{{CODE_TO_EDIT}}
+<|cursor|>
+{{CURSOR_CONTEXT}}
+<|/cursor|>
+<|/code_to_edit|>
+<|/current_file_content|>
+
+<|edit_diff_history|>
+{{EDIT_HISTORY_UNIDIFF}}
+<|/edit_diff_history|>

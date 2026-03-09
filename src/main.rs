@@ -4,10 +4,12 @@
 //! coordination primitive for multi-agent code editing.
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use mercury_cli::api::{self, Mercury2Client, MercuryEditClient};
@@ -394,7 +396,7 @@ fn cmd_init() -> Result<()> {
     println!("Initialized Mercury in .mercury/");
     println!("  config: .mercury/config.toml");
     println!("  database: .mercury/thermal.db");
-    println!("\nSet your API key: export MERCURY_API_KEY=<your-key>");
+    println!("\nSet your API key: export INCEPTION_API_KEY=<your-key>");
     Ok(())
 }
 
@@ -447,8 +449,7 @@ async fn cmd_ask(
     query: &str,
     effort: Option<api::ReasoningEffort>,
 ) -> Result<()> {
-    let api_key = std::env::var(&config.api.api_key_env)
-        .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
+    let api_key = api::resolve_api_key(&config.api.api_key_env)?;
 
     let mut client = Mercury2Client::new(api_key)
         .with_base_url(config.api.mercury2_endpoint.clone())
@@ -491,8 +492,7 @@ async fn cmd_plan(
     goal: &str,
     output: Option<&Path>,
 ) -> Result<()> {
-    let api_key = std::env::var(&config.api.api_key_env)
-        .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
+    let api_key = api::resolve_api_key(&config.api.api_key_env)?;
 
     // Build repo map
     println!("Indexing repository...");
@@ -563,9 +563,14 @@ async fn cmd_fix(
     max_agents: usize,
     max_cost: f64,
 ) -> Result<()> {
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let artifact_root = create_run_artifact_root(project_root)?;
+
     println!("Mercury Fix: {description}");
     println!("  Max agents: {max_agents}");
     println!("  Max cost: ${max_cost:.2}");
+    println!("  Artifact bundle: {}", artifact_root.display());
     println!();
 
     // Step 1: Init swarm session
@@ -580,8 +585,7 @@ async fn cmd_fix(
 
     // Step 3: Plan
     println!("[2/7] Planning with Mercury 2...");
-    let api_key = std::env::var(&config.api.api_key_env)
-        .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
+    let api_key = api::resolve_api_key(&config.api.api_key_env)?;
 
     let client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
@@ -668,6 +672,55 @@ async fn cmd_fix(
     println!("\nCost: ${:.4}", scheduler.current_cost());
     println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
 
+    let finished_at = Utc::now();
+    write_json_artifact(&artifact_root.join("plan.json"), &plan)?;
+    write_json_artifact(&artifact_root.join("assessments.json"), &assessments)?;
+    write_json_artifact(
+        &artifact_root.join("execution-summary.json"),
+        &execution_summary,
+    )?;
+    if let Some(final_verification) = execution_summary.final_verification.as_ref() {
+        write_json_artifact(
+            &artifact_root.join("final-verification.json"),
+            final_verification,
+        )?;
+    }
+    write_json_artifact(
+        &artifact_root.join("agent-logs.json"),
+        &db.get_agent_logs()?,
+    )?;
+    write_json_artifact(&artifact_root.join("thermal-aggregates.json"), &aggregates)?;
+    if let Some(state) = db.get_swarm_state()? {
+        write_json_artifact(&artifact_root.join("swarm-state.json"), &state)?;
+    }
+    write_json_artifact(
+        &artifact_root.join("metadata.json"),
+        &FixRunMetadata {
+            description: description.to_string(),
+            max_agents,
+            max_cost,
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+            final_bundle_verified: execution_summary.final_bundle_verified,
+            applied: execution_summary.applied,
+            sandbox_run_root: execution_summary
+                .run_root
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            total_cost_usd: scheduler.current_cost(),
+            budget_remaining_usd: scheduler.budget_remaining(),
+        },
+    )?;
+    if let Some(run_root) = execution_summary.run_root.as_ref() {
+        copy_if_exists(
+            &run_root.join("accepted.patch"),
+            &artifact_root.join("diff.patch"),
+        )?;
+    }
+    println!("Artifacts written to {}", artifact_root.display());
+
     Ok(())
 }
 
@@ -750,6 +803,128 @@ fn print_assessment_summary(steps: &[engine::PlanStep], assessments: &[api::Ther
     }
 }
 
+#[derive(Debug, Serialize)]
+struct FixRunMetadata {
+    description: String,
+    max_agents: usize,
+    max_cost: f64,
+    started_at: String,
+    finished_at: String,
+    duration_ms: u64,
+    planner_schema_version: String,
+    final_bundle_verified: bool,
+    applied: bool,
+    sandbox_run_root: Option<String>,
+    total_cost_usd: f64,
+    budget_remaining_usd: f64,
+}
+
+fn create_run_artifact_root(project_root: &Path) -> Result<PathBuf> {
+    let run_id = format!("run-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    let root = project_root.join(".mercury").join("runs").join(run_id);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+fn create_cli_worktree_root(project_root: &Path) -> Result<PathBuf> {
+    let run_id = format!("edit-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    let root = project_root.join(".mercury").join("worktrees").join(run_id);
+    std::fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+fn copy_repo_tree(source: &Path, destination: &Path, root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path
+            .strip_prefix(root)
+            .unwrap_or(source_path.as_path());
+
+        if should_skip_repo_copy(relative) {
+            continue;
+        }
+
+        let destination_path = destination.join(relative);
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&destination_path)?;
+            copy_repo_tree(&source_path, destination, root)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_repo_copy(relative: &Path) -> bool {
+    let relative = relative.to_string_lossy();
+    relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative == ".mercury/worktrees"
+        || relative.starts_with(".mercury/worktrees/")
+        || relative == ".mercury/runs"
+        || relative.starts_with(".mercury/runs/")
+}
+
+fn file_relative_to_project(file: &Path, project_root: &Path) -> Result<PathBuf> {
+    let full_path = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        project_root.join(file)
+    };
+
+    full_path
+        .strip_prefix(project_root)
+        .map(PathBuf::from)
+        .with_context(|| {
+            format!(
+                "file {} must live under project root {}",
+                file.display(),
+                project_root.display()
+            )
+        })
+}
+
+fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = path.with_extension(format!(
+        "mercury-{}.tmp",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    std::fs::write(&temp_path, content)?;
+    std::fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+fn write_json_artifact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+fn copy_if_exists(source: &Path, destination: &Path) -> Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(source, destination)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Default config (fallback)
 // ---------------------------------------------------------------------------
@@ -757,7 +932,7 @@ fn print_assessment_summary(steps: &[engine::PlanStep], assessments: &[api::Ther
 const DEFAULT_CONFIG: &str = r#"[api]
 mercury2_endpoint = "https://api.inceptionlabs.ai/v1/chat/completions"
 mercury_edit_endpoint = "https://api.inceptionlabs.ai/v1"
-api_key_env = "MERCURY_API_KEY"
+api_key_env = "INCEPTION_API_KEY"
 
 [scheduler]
 max_concurrency = 20
@@ -839,8 +1014,7 @@ async fn main() -> Result<()> {
 
         Commands::Edit { action } => {
             let (config, _db, project_root) = load_project()?;
-            let api_key = std::env::var(&config.api.api_key_env)
-                .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
+            let api_key = api::resolve_api_key(&config.api.api_key_env)?;
 
             let edit_client =
                 MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
@@ -862,12 +1036,7 @@ async fn main() -> Result<()> {
                     // original_code and update_snippet — Mercury Edit infers the
                     // change from context. For precise edits, callers provide
                     // the actual update snippet.
-                    let (patched, usage) = patcher
-                        .patch(
-                            &content,
-                            &format!("{content}\n// Instruction: {instruction}"),
-                        )
-                        .await?;
+                    let (patched, usage) = patcher.patch(&content, &instruction).await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
@@ -890,14 +1059,7 @@ async fn main() -> Result<()> {
                                 None
                             },
                         );
-                        verify_and_accept_patch(
-                            &verifier,
-                            &file,
-                            &content,
-                            &patched,
-                            &project_root,
-                        )
-                        .await?;
+                        verify_and_accept_patch(&verifier, &file, &patched, &project_root).await?;
                         println!("Patched {}", file.display());
                     }
                     println!(
@@ -927,7 +1089,9 @@ async fn main() -> Result<()> {
                 EditAction::Next { file } => {
                     let (path, _) = parse_file_line(&file);
                     let content = std::fs::read_to_string(&path)?;
-                    let (result, usage) = patcher.next_edit(&content, "").await?;
+                    let (result, usage) = patcher
+                        .next_edit_with_path(path.to_string_lossy().as_ref(), &content, "")
+                        .await?;
                     println!("{result}");
                     println!(
                         "Tokens: {} | Cost: ${:.4}",
@@ -1027,21 +1191,28 @@ fn build_verify_config(config: &MercuryConfig) -> VerifyConfig {
 async fn verify_and_accept_patch(
     verifier: &Verifier<Mercury2Client>,
     file: &Path,
-    original_content: &str,
     patched_content: &str,
     project_root: &Path,
 ) -> Result<()> {
-    let verification = verifier.verify(file, patched_content, project_root).await?;
+    let sandbox_root = create_cli_worktree_root(project_root)?;
+    copy_repo_tree(project_root, &sandbox_root, project_root)?;
+    let relative_path = file_relative_to_project(file, project_root)?;
+    let sandbox_file = sandbox_root.join(&relative_path);
+
+    if let Some(parent) = sandbox_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&sandbox_file, patched_content)?;
+
+    let verification = verifier
+        .verify(&sandbox_file, patched_content, &sandbox_root)
+        .await?;
     if verification.is_ok() {
+        atomic_write_string(&project_root.join(&relative_path), patched_content)?;
+        let _ = std::fs::remove_dir_all(&sandbox_root);
         return Ok(());
     }
-
-    std::fs::write(file, original_content).with_context(|| {
-        format!(
-            "verification failed and rollback failed for {}",
-            file.display()
-        )
-    })?;
+    let _ = std::fs::remove_dir_all(&sandbox_root);
 
     let structured = serde_json::json!({
         "parse": verification.parse_ok,
@@ -1074,7 +1245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_failure_rolls_back_file_contents() {
+    async fn verify_failure_does_not_mutate_user_worktree() {
         let temp = tempdir().unwrap();
         let file = temp.path().join("sample.rs");
         let original = "fn main() { println!(\"hello\"); }\n";
@@ -1082,8 +1253,7 @@ mod tests {
         std::fs::write(&file, original).unwrap();
 
         let verifier = Verifier::<Mercury2Client>::new(verification_config_that_fails(), None);
-        let result =
-            verify_and_accept_patch(&verifier, &file, original, patched, temp.path()).await;
+        let result = verify_and_accept_patch(&verifier, &file, patched, temp.path()).await;
 
         assert!(result.is_err());
         let after = std::fs::read_to_string(&file).unwrap();

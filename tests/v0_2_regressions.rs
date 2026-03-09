@@ -1,0 +1,261 @@
+use std::fs;
+use std::path::Path;
+
+use mercury_cli::api::{ApiError, ApiUsage, CompletePayload, EditPayload, NextEditPayload};
+use mercury_cli::engine::{
+    execute_plan_steps, ExecutionPlan, Patcher, PlanStep, Scheduler, SchedulerConfig, Verifier,
+    VerifyConfig,
+};
+use mercury_cli::{api::Mercury2Api, api::MercuryEditApi};
+
+struct ScriptedEditApi;
+
+impl MercuryEditApi for ScriptedEditApi {
+    async fn apply(&self, payload: &EditPayload) -> Result<(String, ApiUsage), ApiError> {
+        let candidate = if let Some(rest) = payload.update_snippet.strip_prefix("REPLACE:") {
+            rest.to_string()
+        } else if let Some(rest) = payload.update_snippet.strip_prefix("APPEND:") {
+            format!("{}{}", payload.original_code, rest)
+        } else {
+            payload.update_snippet.clone()
+        };
+
+        Ok((
+            candidate,
+            ApiUsage {
+                tokens_used: 64,
+                cost_usd: 0.001,
+            },
+        ))
+    }
+
+    async fn complete(&self, _payload: &CompletePayload) -> Result<(String, ApiUsage), ApiError> {
+        Ok((String::new(), ApiUsage::default()))
+    }
+
+    async fn next_edit(&self, _payload: &NextEditPayload) -> Result<(String, ApiUsage), ApiError> {
+        Ok((String::new(), ApiUsage::default()))
+    }
+
+    async fn next_edit_with_path(
+        &self,
+        _current_file_path: &str,
+        payload: &NextEditPayload,
+    ) -> Result<(String, ApiUsage), ApiError> {
+        self.next_edit(payload).await
+    }
+}
+
+struct NoopMercury2;
+
+impl Mercury2Api for NoopMercury2 {
+    async fn chat(
+        &self,
+        _system: &str,
+        _user: &str,
+        _max_tokens: u32,
+    ) -> Result<(String, ApiUsage), ApiError> {
+        Err(ApiError::MaxRetries(0))
+    }
+
+    async fn chat_json(
+        &self,
+        _system: &str,
+        _user: &str,
+        _max_tokens: u32,
+    ) -> Result<(mercury_cli::api::ThermalAssessment, ApiUsage), ApiError> {
+        Err(ApiError::MaxRetries(0))
+    }
+
+    async fn chat_json_schema_value(
+        &self,
+        _system: &str,
+        _user: &str,
+        _max_tokens: u32,
+        _schema_name: &str,
+        _schema: serde_json::Value,
+    ) -> Result<(serde_json::Value, ApiUsage), ApiError> {
+        Err(ApiError::MaxRetries(0))
+    }
+}
+
+fn make_scheduler() -> Scheduler {
+    Scheduler::new(SchedulerConfig {
+        max_cost_per_command: 1.0,
+        ..Default::default()
+    })
+}
+
+fn make_verifier() -> Verifier<NoopMercury2> {
+    Verifier::new(
+        VerifyConfig {
+            parse_before_write: true,
+            test_after_write: false,
+            lint_after_write: false,
+            mercury2_critique_on_failure: false,
+            test_command: "true".into(),
+            lint_command: "true".into(),
+        },
+        None::<NoopMercury2>,
+    )
+}
+
+fn write_sample_file(project_root: &Path, contents: &str) -> std::path::PathBuf {
+    let target_file = project_root.join("sample.rs");
+    fs::write(&target_file, contents).expect("sample file should be written");
+    target_file
+}
+
+#[tokio::test]
+async fn rejected_candidate_restores_original_file_when_no_candidate_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = write_sample_file(project_root, "fn hello() {}\n");
+
+    let plan = ExecutionPlan {
+        steps: vec![PlanStep {
+            file_path: "sample.rs".to_string(),
+            instruction: "REPLACE:fn broken( {\n".to_string(),
+            priority: 1.0,
+            estimated_tokens: 64,
+        }],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let patcher = Patcher::new(ScriptedEditApi);
+    let verifier = make_verifier();
+    let scheduler = make_scheduler();
+    let summary = execute_plan_steps(&plan, &patcher, &verifier, &scheduler, &db, project_root)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.accepted, 0);
+    assert_eq!(summary.rejected, 1);
+    assert_eq!(summary.verification_failures, 1);
+    assert_eq!(fs::read_to_string(target_file).unwrap(), "fn hello() {}\n");
+
+    let logs = db.get_agent_logs().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status, "failed");
+}
+
+#[tokio::test]
+async fn rejected_candidate_content_does_not_leak_into_final_file_after_later_acceptance() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = write_sample_file(project_root, "fn hello() {}\n");
+
+    let plan = ExecutionPlan {
+        steps: vec![
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "REPLACE:fn broken( {\n".to_string(),
+                priority: 1.0,
+                estimated_tokens: 64,
+            },
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "REPLACE:fn repaired() {}\n".to_string(),
+                priority: 0.5,
+                estimated_tokens: 64,
+            },
+        ],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let patcher = Patcher::new(ScriptedEditApi);
+    let verifier = make_verifier();
+    let scheduler = make_scheduler();
+    let summary = execute_plan_steps(&plan, &patcher, &verifier, &scheduler, &db, project_root)
+        .await
+        .unwrap();
+
+    let final_content = fs::read_to_string(target_file).unwrap();
+    assert_eq!(summary.accepted, 1);
+    assert_eq!(summary.rejected, 1);
+    assert_eq!(summary.verification_failures, 1);
+    assert_eq!(final_content, "fn repaired() {}\n");
+    assert!(!final_content.contains("broken"));
+}
+
+#[tokio::test]
+async fn same_file_steps_patch_from_latest_accepted_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = write_sample_file(project_root, "pub const A: i32 = 1;\n");
+
+    let plan = ExecutionPlan {
+        steps: vec![
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "REPLACE:pub const A: i32 = 2;\npub const B: i32 = 3;\n".to_string(),
+                priority: 1.0,
+                estimated_tokens: 64,
+            },
+            PlanStep {
+                file_path: "sample.rs".to_string(),
+                instruction: "APPEND:pub fn total() -> i32 { A + B }\n".to_string(),
+                priority: 0.5,
+                estimated_tokens: 64,
+            },
+        ],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let patcher = Patcher::new(ScriptedEditApi);
+    let verifier = make_verifier();
+    let scheduler = make_scheduler();
+    let summary = execute_plan_steps(&plan, &patcher, &verifier, &scheduler, &db, project_root)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.accepted, 2);
+    let final_content = fs::read_to_string(target_file).unwrap();
+    assert!(final_content.contains("pub const B: i32 = 3;"));
+    assert!(final_content.contains("pub fn total() -> i32 { A + B }"));
+}
+
+#[tokio::test]
+async fn rejected_runs_never_dirty_the_user_worktree() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = write_sample_file(project_root, "pub fn stable() -> i32 { 1 }\n");
+    let original = fs::read_to_string(&target_file).unwrap();
+
+    let plan = ExecutionPlan {
+        steps: vec![PlanStep {
+            file_path: "sample.rs".to_string(),
+            instruction: "REPLACE:pub fn broken( {\n".to_string(),
+            priority: 1.0,
+            estimated_tokens: 64,
+        }],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let patcher = Patcher::new(ScriptedEditApi);
+    let verifier = make_verifier();
+    let scheduler = make_scheduler();
+    let summary = execute_plan_steps(&plan, &patcher, &verifier, &scheduler, &db, project_root)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.accepted, 0);
+    assert_eq!(summary.rejected, 1);
+    assert!(!summary.applied);
+    assert!(!summary.final_bundle_verified);
+    assert_eq!(fs::read_to_string(&target_file).unwrap(), original);
+    assert!(!project_root.join(".mercury").join("runs").exists());
+    assert!(project_root.join(".mercury").join("worktrees").exists());
+}

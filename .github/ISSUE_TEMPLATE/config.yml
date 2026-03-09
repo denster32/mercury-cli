@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security policy
+    url: https://github.com/denster32/mercury-cli/security/policy
+    about: Report vulnerabilities privately instead of opening a public issue.
+  - name: Contribution guide
+    url: https://github.com/denster32/mercury-cli/blob/main/CONTRIBUTING.md
+    about: Read the contributor and release expectations before proposing a change.

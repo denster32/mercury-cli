@@ -232,7 +232,7 @@ fn test_config_roundtrip() {
 [api]
 mercury2_endpoint = "https://api.inceptionlabs.ai/v1/chat/completions"
 mercury_edit_endpoint = "https://api.inceptionlabs.ai/v1/edit"
-api_key_env = "MERCURY_API_KEY"
+api_key_env = "INCEPTION_API_KEY"
 
 [scheduler]
 max_concurrency = 20
@@ -344,6 +344,14 @@ async fn test_fix_executes_verification_gate() {
         ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
             async { Ok((String::new(), ApiUsage::default())) }
         }
+
+        fn next_edit_with_path(
+            &self,
+            _current_file_path: &str,
+            payload: &NextEditPayload,
+        ) -> impl Future<Output = Result<(String, ApiUsage), ApiError>> + Send {
+            self.next_edit(payload)
+        }
     }
 
     struct NoopMercury2;
@@ -365,6 +373,17 @@ async fn test_fix_executes_verification_gate() {
             _max_tokens: u32,
         ) -> impl Future<Output = Result<(mercury_cli::api::ThermalAssessment, ApiUsage), ApiError>> + Send
         {
+            async { Err(ApiError::MaxRetries(0)) }
+        }
+
+        fn chat_json_schema_value(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+            _schema_name: &str,
+            _schema: serde_json::Value,
+        ) -> impl Future<Output = Result<(serde_json::Value, ApiUsage), ApiError>> + Send {
             async { Err(ApiError::MaxRetries(0)) }
         }
     }

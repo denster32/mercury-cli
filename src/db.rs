@@ -6,6 +6,7 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection, Result as SqlResult};
+use serde::Serialize;
 use std::path::Path;
 use thiserror::Error;
 
@@ -31,7 +32,7 @@ pub enum DbError {
 // ---------------------------------------------------------------------------
 
 /// A single thermal score entry for a code region.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThermalScore {
     pub id: i64,
     pub file_path: String,
@@ -46,7 +47,7 @@ pub struct ThermalScore {
 }
 
 /// Aggregated project-level thermal view per file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThermalAggregate {
     pub file_path: String,
     pub composite_score: f64,
@@ -57,7 +58,7 @@ pub struct ThermalAggregate {
 }
 
 /// A single agent execution log entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentLogEntry {
     pub id: i64,
     pub agent_id: String,
@@ -72,7 +73,7 @@ pub struct AgentLogEntry {
 }
 
 /// Global swarm state snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SwarmState {
     pub id: i64,
     pub total_agents_spawned: i64,
@@ -85,7 +86,7 @@ pub struct SwarmState {
 }
 
 /// A cool-zone lock record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CoolLock {
     pub file_path: String,
     pub line_start: u32,

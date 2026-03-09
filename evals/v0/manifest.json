@@ -1,0 +1,120 @@
+{
+  "schema_version": "mercury-evals-v0",
+  "suite_id": "rust-v0.2-seeded",
+  "language": "rust",
+  "version": 1,
+  "artifact_schema_version": "mercury-eval-report-v0",
+  "supported_modes": ["baseline"],
+  "cases": [
+    {
+      "id": "rust_parse_unclosed_delimiter",
+      "title": "Parser failure: unclosed delimiter",
+      "path": "cases/rust_parse_unclosed_delimiter",
+      "failure_class": "parser",
+      "failure_stage": "parse",
+      "verifier_command": ["cargo", "check", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["unclosed delimiter"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_type_mismatch",
+      "title": "Compile failure: mismatched types",
+      "path": "cases/rust_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": ["cargo", "check", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["mismatched types"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_missing_function_symbol",
+      "title": "Compile failure: missing function symbol",
+      "path": "cases/rust_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": ["cargo", "check", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["cannot find function", "missing_helper"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_unknown_struct_field",
+      "title": "Compile failure: unknown struct field",
+      "path": "cases/rust_unknown_struct_field",
+      "failure_class": "unknown_field",
+      "failure_stage": "compile",
+      "verifier_command": ["cargo", "check", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["has no field named", "count"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_trait_bound_missing",
+      "title": "Compile failure: missing trait bound",
+      "path": "cases/rust_trait_bound_missing",
+      "failure_class": "trait_bound",
+      "failure_stage": "compile",
+      "verifier_command": ["cargo", "check", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["doesn't implement", "Display"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_runtime_assertion_failure",
+      "title": "Test failure: assertion mismatch",
+      "path": "cases/rust_runtime_assertion_failure",
+      "failure_class": "test_assertion",
+      "failure_stage": "test",
+      "verifier_command": ["cargo", "test", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["assertion `left == right` failed"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_runtime_panic_unwrap",
+      "title": "Test failure: unwrap panic",
+      "path": "cases/rust_runtime_panic_unwrap",
+      "failure_class": "panic_unwrap",
+      "failure_stage": "test",
+      "verifier_command": ["cargo", "test", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["called `Option::unwrap()` on a `None` value"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_off_by_one_range",
+      "title": "Test failure: off-by-one range logic",
+      "path": "cases/rust_off_by_one_range",
+      "failure_class": "logic_off_by_one",
+      "failure_stage": "test",
+      "verifier_command": ["cargo", "test", "--quiet"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["assertion `left == right` failed"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_clippy_needless_return",
+      "title": "Lint failure: needless return",
+      "path": "cases/rust_clippy_needless_return",
+      "failure_class": "clippy_needless_return",
+      "failure_stage": "lint",
+      "verifier_command": ["cargo", "clippy", "--quiet", "--", "-D", "warnings"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["unneeded `return` statement", "needless_return"],
+      "source_files": ["src/lib.rs"]
+    },
+    {
+      "id": "rust_clippy_identity_op",
+      "title": "Lint failure: identity operation",
+      "path": "cases/rust_clippy_identity_op",
+      "failure_class": "clippy_identity_op",
+      "failure_stage": "lint",
+      "verifier_command": ["cargo", "clippy", "--quiet", "--", "-D", "warnings"],
+      "expected_exit_codes": [101],
+      "expected_patterns": ["this operation has no effect", "identity_op"],
+      "source_files": ["src/lib.rs"]
+    }
+  ]
+}

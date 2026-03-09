@@ -1,228 +1,198 @@
-# Mercury CLI 🌡️
+# Mercury CLI
 
-**The first diffusion-native CLI for autonomous code synthesis.**
+Mercury CLI is Mercury-native CI auto-repair for teams using Inception Labs models.
 
-Mercury CLI doesn't treat diffusion models as fast, cheap transformers. It treats them as a fundamentally different cognitive architecture — and builds native tooling to match.
+The product promise is narrow on purpose: take a failing verification loop, generate bounded Mercury repair candidates, verify them in disposable workspaces, and leave behind enough evidence to audit the decision later. v0.2 is the trustworthy local repair core for that workflow. It is not yet a generic agent shell, a draft-PR bot, or a proven concurrent swarm runtime.
 
----
+## Install
 
-## The Problem
-
-Every AI coding tool on the market — Claude Code, GitHub Copilot, Cursor, Codex, OpenClaw — is built on transformer assumptions. Sequential planning. Linear pipelines. One model holds context, reasons step-by-step, generates token-by-token.
-
-That made sense when every model was autoregressive.
-
-**It doesn't make sense for diffusion.**
-
-[Inception Labs' Mercury 2](https://www.inceptionlabs.ai) is a diffusion-based large language model. It doesn't predict the next token. It resolves the entire output field in parallel through iterative refinement — the same way image diffusion models work, applied to text and code. This isn't a faster transformer. It's a different topology of intelligence.
-
-Mercury CLI is built for that topology.
-
-## The Insight
-
-A diffusion model's small context window isn't a limitation. **It's a design principle.**
-
-Instead of one model holding your entire codebase and reasoning sequentially, Mercury CLI spawns many focused agents — each with a tight receptive field scoped to a single file, function, or pattern. The agents don't talk to each other. They read and write to a **shared thermal field**.
-
-This is [stigmergy](https://en.wikipedia.org/wiki/Stigmergy) — the same coordination mechanism ants use. No central planner. No message passing. Just a shared environment that agents modify, and those modifications guide subsequent agents. O(N) scaling instead of O(N²).
-
-## How It Works
-
-### Heat Maps, Not Task Lists
-
-Mercury CLI doesn't plan sequentially. It generates a **thermal heat map** of your codebase:
-
-```
-src/
-├── main.rs                    ░░░░░░░░░░  0.12  LOCKED
-├── engine/
-│   ├── planner.rs             ▓▓▓▓▓░░░░░  0.54  [1 agent]
-│   ├── scheduler.rs           ▓▓▓▓▓▓▓▓▓░  0.91  [4 agents]
-│   └── verifier.rs            ░░░░░░░░░░  0.15  LOCKED
-└── swarm/
-    ├── agent.rs               ▓▓▓▓▓▓░░░░  0.63  [1 agent]
-    └── spawner.rs             ▓▓▓▓░░░░░░  0.41
-
-Global Temperature: 0.78 | Iteration: 3/10 | Budget: $0.23/$0.50
-```
-
-**Hotspots** = complexity clusters, dense dependencies, high risk.
-**Cool zones** = stable, well-understood code.
-
-Execution follows the thermal gradient:
-
-1. **Cool zones first** — resolve simple code, verify it, lock it as immutable scaffolding
-2. **Hot zones last** — attack complexity with multiple agents and iteration passes
-3. **Anneal** — progressively freeze the system toward a stable state
-
-This isn't arbitrary. It's [Simulated Reverse Annealing](https://en.wikipedia.org/wiki/Simulated_annealing) — a proven optimization strategy that outperforms forward search by starting from verified boundary conditions instead of maximum entropy.
-
-### The Swarm
-
-At low concurrency, Mercury CLI is a normal dev tool. At high concurrency, it becomes a **swarm**.
+### From source
 
 ```bash
-# 20 agents (default) — focused development tool
-mercury fix "refactor auth to use exponential backoff"
-
-# 200 agents — full swarm mode
-mercury fix "refactor auth to use exponential backoff" --max-agents 200
+git clone https://github.com/denster32/mercury-cli
+cd mercury-cli
+cargo build --release
 ```
 
-The architecture doesn't change. The **density knob** turns. Same thermal field, same merge engine, same coordination primitive. The swarm emerges from the same code that runs a single agent.
+### From GitHub Releases
 
-Each agent emits a **micro-heat-map** of its scope after every action. These aggregate upward into the project-level thermal model via [Log-Sum-Exp](https://en.wikipedia.org/wiki/LogSumExp) merging — a smooth, differentiable aggregation that preserves gradient topology without saturating.
+The repo includes tagged release workflows for macOS and Linux archives. Until the first tagged release is published, the source build path above is the supported install path.
 
-Monitor agents watch other agents. They detect conflicting patches, semantic drift, and oscillation patterns. When two agents enter a limit cycle of competing optimizations, the monitor triggers a temperature reduction that forces convergence.
+### API key
 
-### Pheromone Decay
-
-Biological pheromones evaporate. Digital ones must too.
-
-Every thermal score in the database decays exponentially over a configurable half-life. This prevents the swarm from fixating on stale hotspots and enables continuous adaptation to a changing codebase. Without decay, the system traps itself in positive feedback loops. With decay, it stays plastic.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│  Planner/Router    (Mercury 2 - 128K)   │  → Repo-level planning, heat map generation
-├─────────────────────────────────────────┤
-│  Patch Engine      (Mercury Edit - 32K) │  → Focused edits with auto-tagged payloads
-├─────────────────────────────────────────┤
-│  Verifier          (Local-first)        │  → Parse, test, lint BEFORE any write
-├─────────────────────────────────────────┤
-│  Scheduler         (Thermal Merge)      │  → Concurrency, decay, budget, aggregation
-└─────────────────────────────────────────┘
-```
-
-**Mercury 2** sees the big picture (128K context) — planning, routing, critique.
-**Mercury Edit** does precise surgery (32K context) — only the exact slice the router hands it.
-**Local tools** verify first, always — parse, test, lint run before any model touches your code.
-**The Scheduler** is the nervous system — thermal merge, pheromone decay, swarm density, budget.
-
-## Commands
+Mercury CLI documentation uses `INCEPTION_API_KEY` as the preferred environment variable. `MERCURY_API_KEY` still works as a backward-compatible fallback.
 
 ```bash
-# Initialize Mercury in your repo
-mercury init
-
-# Generate thermal heat map
-mercury plan "fix flaky auth tests"
-
-# View live thermal state
-mercury status --heatmap
-
-# Ask Mercury 2 about your codebase
-mercury ask "why does the auth module have so many dependencies?"
-
-# Apply a targeted edit
-mercury edit apply src/auth.rs --instruction "convert retries to exponential backoff"
-
-# The current fix workflow (v0.1): index → plan → scaffold cool zones → resolve hot zones → anneal → report
-mercury fix "refactor auth module" --max-agents 50 --max-cost 1.00
-
-# Watch a command (repair is currently a preview stub)
-mercury watch "cargo test" --repair
-
-# Roadmap (not yet implemented in v0.1): custom workflow runner
-# mercury agent run .mercury/repair.yml
+export INCEPTION_API_KEY="your-api-key"
+# Optional fallback for older configs or older CLI help text:
+export MERCURY_API_KEY="$INCEPTION_API_KEY"
 ```
 
-## Implemented in v0.1
+Compatibility note: some current config templates and help text in the CLI still reference `MERCURY_API_KEY`. The runtime should accept both names while the remaining surfaces are being aligned.
 
-| Command | Status | Notes |
-|---|---|---|
-| `mercury init` | Working | Initializes `.mercury/` with config + SQLite thermal DB. |
-| `mercury plan <goal>` | Working | Generates a plan + thermal scores and can write JSON via `--output`. |
-| `mercury status [--heatmap] [--agents] [--budget]` | Working | Reports current thermal state and swarm/budget metadata. |
-| `mercury ask <query>` | Working | Sends repository-aware questions to Mercury 2. |
-| `mercury edit apply/complete/next` | Working | Uses Mercury Edit for instruction patching and completions. |
-| `mercury fix <description>` | Partial | Executes 7-stage pipeline: index, plan, scaffold/resolution discovery, anneal, verification banner, and final report (no automatic patch/apply/commit yet). |
-| `mercury watch <command>` | Stub/Preview | Runs command selection UI text; `--repair` currently prints preview messaging only. |
-| `mercury config get` / `validate` | Working | Reads config values and validates TOML loadability. |
-| `mercury config set` | Stub | Prints guidance; direct file editing is still required. |
-| `mercury agent run ...` | Roadmap | Not available in current clap interface. |
+## 60-Second Demo
 
-## Theoretical Foundations
-
-This isn't just engineering. The architecture is validated by four independent theoretical frameworks:
-
-- **Stigmergy** (Grassé, 1959) — Indirect coordination via environmental modification. The thermal field is a digital pheromone map. Agents coordinate at O(N) instead of O(N²).
-
-- **Simulated Reverse Annealing** — Cool-to-hot execution creates verified boundary conditions before attacking complexity. Proven to outperform forward annealing in combinatorial optimization.
-
-- **Mean-Field Games** (Lasry & Lions, 2006) — The thermal field functions as a Fokker-Planck density distribution. Agents optimize against the macroscopic swarm density, not individual peers. Dynamic load balancing without centralized scheduling.
-
-- **Active Inference / Free Energy Principle** (Friston) — Agents minimize Expected Free Energy along the thermal gradient. Cool zones = pragmatic value (exploit). Hot zones = epistemic value (explore). The swarm naturally balances exploitation and exploration.
-
-For the full theoretical analysis, see [ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## The Budget Model
-
-Mercury CLI isn't about cheap inference. It's about a **different topology of intelligence**.
-
-For the same budget as one frontier model call, you get 200 focused agents operating in parallel. The intelligence isn't in any single agent. It emerges from the swarm — distributed, parallel, convergent.
-
-| Approach | Agents | Intelligence | Scaling |
-|----------|--------|-------------|---------|
-| One Opus call | 1 | Deep sequential reasoning | O(1) |
-| Mercury CLI swarm | 200 | Distributed emergent intelligence | O(N) linear |
-
-## Installation
+The current fastest path is local: reproduce the failure, run Mercury repair, inspect the evidence bundle, and keep only verified changes.
 
 ```bash
-# From source
 git clone https://github.com/denster32/mercury-cli
 cd mercury-cli
 cargo build --release
 
-# Set your API key
-export MERCURY_API_KEY="your-inception-api-key"
+export INCEPTION_API_KEY="your-api-key"
+export MERCURY_API_KEY="$INCEPTION_API_KEY"
 
-# Initialize in your repo
-cd your-project
-mercury init
+./target/release/mercury init
+./target/release/mercury plan "fix the failing auth retry tests"
+./target/release/mercury fix "cargo test fails in auth retry logic"
+./target/release/mercury status --heatmap
 ```
+
+What a good v0.2 run should leave behind:
+
+- a verified diff or accepted patch
+- local verifier output for the parse, test, or lint gates Mercury used
+- run metadata and artifacts under `.mercury/runs/`
+- no partial writes left behind by rejected candidates
+
+## Capability Matrix
+
+| Surface | Status | Reality in the current repo |
+| --- | --- | --- |
+| `mercury init` | Available | Creates `.mercury/` config and thermal database. |
+| `mercury plan <goal>` | Available | Produces a structured repair plan and thermal assessments. |
+| `mercury ask <query>` | Available | Repo-aware Mercury 2 Q&A. |
+| `mercury status [--heatmap] [--agents] [--budget]` | Available | Reports thermal state and scheduler metadata. |
+| `mercury edit apply` | Available | Apply-style Mercury Edit request for focused mutation. |
+| `mercury edit complete` | Available | Completion-style Mercury Edit request for a file or cursor location. |
+| `mercury edit next` | Available | Next-edit prediction using current file state and edit history. |
+| `mercury fix <description>` | Available | Rust-first repair flow with planning, candidate generation, sandbox verification, and artifacts. |
+| `mercury fix --max-agents N` | Available with limits | Changes scheduling and budget parameters today. Do not market it as proof of real swarm speedup until the concurrent executor is measured and shipped. |
+| `mercury watch <command> --repair` | Preview | Command watching exists; the end-to-end autonomous repair loop is still being completed. |
+| `mercury config get` / `validate` | Available | Reads or validates config values. |
+| `mercury config set` | Preview | CLI surface exists, but direct TOML editing may still be the more dependable path. |
+| GitHub Action draft PR bot | Roadmap | Planned for CI auto-repair alpha, not part of v0.2. |
+| Generic workflow DSL / `agent run` | Not planned before v1.0 | Intentionally deferred until the repair core is proven. |
+
+## Safety Model
+
+Mercury CLI should be evaluated like a repair system, not a chatbot shell.
+
+### Candidate isolation
+
+Repair candidates run in disposable workspaces under `.mercury/worktrees/` instead of mutating the user worktree directly.
+
+### Atomic acceptance
+
+Rejected candidates are discarded with the workspace. Accepted candidates are copied back only after local verification succeeds.
+
+### Local verification first
+
+Parse, test, and lint commands are local gates. Model output does not become an accepted repository change until those gates pass.
+
+### Structured output boundary
+
+Planner and critique outputs are treated as data rather than prose. The API layer now supports official-style strict JSON schema requests, and the remaining runtime callsites are being hardened around that contract as part of v0.2.
+
+### Reproducible evidence
+
+Each repair run should leave behind an artifact bundle under `.mercury/runs/` with the plan, candidate diffs, verifier output, timing, and cost metadata.
+
+## What v0.2 Supports
+
+- Rust repositories first
+- local repair loops that can be promoted into CI later
+- Mercury 2 for planning and critique
+- Mercury Edit for focused edits
+- isolated verification and accepted-change copy-back
+- explicit preview labels for incomplete surfaces
+
+## Preview and Roadmap
+
+### Preview in v0.2
+
+- `watch --repair` as a hands-off repair loop
+- `config set` as a fully dependable config-editing surface
+- binary install via tagged release until the first public release exists
+
+### Roadmap after v0.2
+
+- GitHub Action that reproduces failures and opens draft PRs with evidence bundles
+- true multi-worktree concurrent candidate execution
+- conflict arbitration across overlapping edits
+- a second supported language after the Rust-first path
+- live observability for active candidates, cost, and acceptance decisions
+
+## What v0.2 Does Not Claim
+
+- real swarm speedup from `--max-agents`
+- safe parallel candidate execution across many worktrees
+- GitHub draft PR creation
+- broad language support beyond the Rust-first path
+- zero-touch autonomous repair for every failing repo
 
 ## Configuration
 
+Example `.mercury/config.toml`:
+
 ```toml
-# .mercury/config.toml
+[api]
+mercury2_endpoint = "https://api.inceptionlabs.ai/v1/chat/completions"
+mercury_edit_endpoint = "https://api.inceptionlabs.ai/v1"
+api_key_env = "INCEPTION_API_KEY"
 
 [scheduler]
-max_concurrency = 20         # swarm density (1-500)
-max_cost_per_command = 0.50  # USD budget cap
+max_concurrency = 20
+max_cost_per_command = 0.50
+max_agents_per_command = 100
+retry_limit = 3
+backoff_base_ms = 500
 
-[thermal]
-decay_half_life_seconds = 300   # pheromone evaporation rate
-hot_threshold = 0.7             # complexity threshold
-cool_threshold = 0.3            # stability threshold
-lock_cool_zones = true          # freeze verified code
-
-[annealing]
-enable_global_momentum = true
-cooling_rate = 0.02             # convergence speed
+[verification]
+parse_before_write = true
+test_after_write = true
+lint_after_write = true
+mercury2_critique_on_failure = true
+test_command = "cargo test"
+lint_command = "cargo clippy"
 ```
 
-## Why "Mercury"?
+Compatibility note: older configs may still reference `MERCURY_API_KEY`. v0.2 docs prefer `INCEPTION_API_KEY` and treat the older name as a fallback.
 
-Named for the model it's built around. But also: Mercury the element is liquid metal at room temperature. It flows, fills gaps, finds the lowest point. That's what the thermal gradient does — computational energy flows toward complexity and fills the gaps until the system reaches equilibrium.
+## Artifact Bundle
 
-## Status
+A trustworthy repair run leaves behind enough evidence to replay the decision:
 
-**v0.1** — First release. The paradigm is real. The math works. The swarm is alive.
+- planner request and response metadata
+- candidate diffs for generated edits
+- verifier commands and outputs
+- final accept or reject decision
+- timing and cost summary
 
-Built on a Saturday afternoon in Indiana by one developer and five AI models working in parallel — each with a different architecture, none talking to each other, all reading and writing to the same shared field.
+## Architecture
 
-Stigmergy scales.
+Mercury CLI has four practical layers:
 
-## Contributing
+1. `Planner`: Mercury 2 turns a goal plus repository context into a bounded repair plan.
+2. `Edit engine`: Mercury Edit produces focused mutations and next-edit suggestions.
+3. `Verifier`: local parse, test, and lint commands decide whether a candidate is acceptable.
+4. `Runtime`: disposable workspaces, artifacts, cost tracking, and acceptance rules keep the workflow reproducible.
 
-This is MIT licensed. The value isn't in the code — it's in the paradigm. Fork it, extend it, build on it.
+Implementation detail, trust boundaries, and roadmap notes live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-If you're from Inception Labs: let's talk about exposing raw diffusion latents in the API. The thermal field would be even more powerful with native uncertainty scores instead of prompted approximations.
+## Development
 
-If you're from Anthropic: transformers and diffusion aren't competitors. They're complementary architectures. The tooling layer that bridges them is where the real leverage lives.
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --verbose
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and release guidance.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for vulnerability reporting guidance.
 
 ## License
 

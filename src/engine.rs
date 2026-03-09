@@ -5,17 +5,21 @@
 //! - **Verifier**: tree-sitter parse → test → lint → optional Mercury 2 critique
 //! - **Scheduler**: tokio concurrency pool, budget tracking, thermal merge cycles
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 
+use chrono::Utc;
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{
-    ApiError, ApiUsage, Mercury2Api, MercuryEditApi, ThermalAssessment, THERMAL_ANALYSIS_PROMPT,
+    planner_response_json_schema_v1, ApiError, ApiUsage, Mercury2Api, MercuryEditApi,
+    ThermalAssessment, PLANNER_RESPONSE_SCHEMA_NAME, THERMAL_ANALYSIS_PROMPT,
 };
 use crate::db::{DbError, ThermalDb};
 use crate::repo::RepoError;
@@ -110,23 +114,34 @@ impl<A: Mercury2Api> Planner<A> {
         let mut total_usage = ApiUsage::default();
 
         let system_prompt = format!(
-            "{}\n\n{}\n\nAdditionally, generate an execution plan as JSON with this schema:\n\
-             {{\"steps\": [{{\"file_path\": \"...\", \"instruction\": \"...\", \"priority\": 0.0-1.0, \"estimated_tokens\": N}}],\n\
-             \"assessments\": [{{\"complexity_score\": 0-1, \"dependency_score\": 0-1, \"risk_score\": 0-1, \"churn_score\": 0-1, \"suggested_action\": \"...\", \"reasoning\": \"...\"}}]}}",
+            "{}\n\n{}",
             THERMAL_ANALYSIS_PROMPT, self.constitutional_prompt
         );
 
         let user_msg = format!("Goal: {}\n\nRepository Map:\n{}", goal, repo_map);
 
-        let (response, usage) = self.api.chat(&system_prompt, &user_msg, 4096).await?;
+        let (response, usage) = self
+            .api
+            .chat_json_schema_value(
+                &system_prompt,
+                &user_msg,
+                4096,
+                PLANNER_RESPONSE_SCHEMA_NAME,
+                planner_response_json_schema_v1(),
+            )
+            .await?;
         total_usage.tokens_used += usage.tokens_used;
         total_usage.cost_usd += usage.cost_usd;
 
-        // Mercury 2 may wrap JSON in markdown fences — extract the JSON body.
-        let json_str = extract_json(&response);
-
         let parsed: PlannerResponse =
-            serde_json::from_str(json_str).map_err(ApiError::JsonParse)?;
+            serde_json::from_value(response).map_err(ApiError::JsonParse)?;
+        if parsed.schema_version != PLANNER_RESPONSE_SCHEMA_NAME {
+            return Err(ApiError::SchemaViolation(format!(
+                "expected schema_version {}, got {}",
+                PLANNER_RESPONSE_SCHEMA_NAME, parsed.schema_version
+            ))
+            .into());
+        }
 
         let plan = ExecutionPlan {
             steps: parsed.steps,
@@ -139,32 +154,13 @@ impl<A: Mercury2Api> Planner<A> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PlannerResponse {
+    schema_version: String,
     #[serde(default)]
     steps: Vec<PlanStep>,
     #[serde(default)]
     assessments: Vec<ThermalAssessment>,
-}
-
-/// Extract JSON from a response that may be wrapped in markdown code fences.
-fn extract_json(text: &str) -> &str {
-    let trimmed = text.trim();
-    if let Some(start) = trimmed.find("```json") {
-        let after = &trimmed[start + 7..];
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    if let Some(start) = trimmed.find("```") {
-        let after = &trimmed[start + 3..];
-        // skip optional language tag on same line
-        let after = after.trim_start_matches(|c: char| c != '\n');
-        if let Some(end) = after.find("```") {
-            return after[..end].trim();
-        }
-    }
-    trimmed
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +219,17 @@ impl<E: MercuryEditApi> Patcher<E> {
         file_content: &str,
         edit_history: &str,
     ) -> Result<(String, ApiUsage), EngineError> {
+        self.next_edit_with_path("", file_content, edit_history)
+            .await
+    }
+
+    /// Predict the next edit based on file content, history, and file path.
+    pub async fn next_edit_with_path(
+        &self,
+        current_file_path: &str,
+        file_content: &str,
+        edit_history: &str,
+    ) -> Result<(String, ApiUsage), EngineError> {
         use crate::api::NextEditPayload;
         let payload = NextEditPayload {
             file_content: file_content.to_string(),
@@ -231,7 +238,10 @@ impl<E: MercuryEditApi> Patcher<E> {
             recent_snippets: String::new(),
             edit_history: edit_history.to_string(),
         };
-        let (result, usage) = self.api.next_edit(&payload).await?;
+        let (result, usage) = self
+            .api
+            .next_edit_with_path(current_file_path, &payload)
+            .await?;
         Ok((result, usage))
     }
 }
@@ -311,6 +321,10 @@ impl<A: Mercury2Api> Verifier<A> {
             }
         }
 
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         // Write the file before running tests/lint
         std::fs::write(file_path, patched_content)?;
 
@@ -354,6 +368,96 @@ impl<A: Mercury2Api> Verifier<A> {
                 let critique = self
                     .get_critique(api, patched_content, &result.errors)
                     .await;
+                result.critique = critique.ok();
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Run verification against an isolated workspace that already contains the
+    /// candidate files to evaluate.
+    pub async fn verify_workspace(
+        &self,
+        accepted_states: &HashMap<PathBuf, String>,
+        workspace_root: &Path,
+    ) -> Result<VerifyResult, EngineError> {
+        let mut result = VerifyResult {
+            parse_ok: true,
+            test_ok: true,
+            lint_ok: true,
+            critique: None,
+            errors: Vec::new(),
+        };
+
+        if self.config.parse_before_write {
+            for (relative_path, content) in accepted_states {
+                match self.check_parse(content) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        result.parse_ok = false;
+                        result.errors.push(format!(
+                            "tree-sitter parse produced errors for {}",
+                            relative_path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        result.parse_ok = false;
+                        result.errors.push(format!(
+                            "parse check failed for {}: {err}",
+                            relative_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        if self.config.test_after_write {
+            match self.run_command(&self.config.test_command, workspace_root) {
+                Ok(output) if output.success => {}
+                Ok(output) => {
+                    result.test_ok = false;
+                    result
+                        .errors
+                        .push(format!("tests failed in workspace: {}", output.stderr));
+                }
+                Err(err) => {
+                    result.test_ok = false;
+                    result
+                        .errors
+                        .push(format!("test command failed in workspace: {err}"));
+                }
+            }
+        }
+
+        if self.config.lint_after_write {
+            match self.run_command(&self.config.lint_command, workspace_root) {
+                Ok(output) if output.success => {}
+                Ok(output) => {
+                    result.lint_ok = false;
+                    result
+                        .errors
+                        .push(format!("lint failed in workspace: {}", output.stderr));
+                }
+                Err(err) => {
+                    result.lint_ok = false;
+                    result
+                        .errors
+                        .push(format!("lint command failed in workspace: {err}"));
+                }
+            }
+        }
+
+        if !result.is_ok() && self.config.mercury2_critique_on_failure {
+            if let Some(ref api) = self.critique_api {
+                let changed_code = accepted_states
+                    .iter()
+                    .map(|(relative_path, content)| {
+                        format!("// {}\n{}", relative_path.display(), content)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let critique = self.get_critique(api, &changed_code, &result.errors).await;
                 result.critique = critique.ok();
             }
         }
@@ -409,7 +513,7 @@ impl<A: Mercury2Api> Verifier<A> {
 }
 
 /// Result of a verification run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerifyResult {
     pub parse_ok: bool,
     pub test_ok: bool,
@@ -419,16 +523,34 @@ pub struct VerifyResult {
 }
 
 /// Aggregate execution results for `fix` step orchestration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct StepExecutionSummary {
     pub accepted: usize,
     pub rejected: usize,
     pub verification_failures: usize,
+    pub final_bundle_verified: bool,
+    pub applied: bool,
+    pub run_root: Option<PathBuf>,
+    pub final_verification: Option<VerifyResult>,
 }
 
 impl StepExecutionSummary {
     pub fn total(&self) -> usize {
         self.accepted + self.rejected
+    }
+
+    fn merge(&mut self, other: StepExecutionSummary) {
+        self.accepted += other.accepted;
+        self.rejected += other.rejected;
+        self.verification_failures += other.verification_failures;
+        self.final_bundle_verified |= other.final_bundle_verified;
+        self.applied |= other.applied;
+        if self.run_root.is_none() {
+            self.run_root = other.run_root;
+        }
+        if self.final_verification.is_none() {
+            self.final_verification = other.final_verification;
+        }
     }
 }
 
@@ -441,22 +563,114 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     db: &ThermalDb,
     project_root: &Path,
 ) -> Result<StepExecutionSummary, EngineError> {
+    let run_root = create_run_root(project_root)?;
+    let accepted_states = Arc::new(Mutex::new(HashMap::<PathBuf, String>::new()));
+    let mut grouped_steps: BTreeMap<PathBuf, Vec<IndexedPlanStep>> = BTreeMap::new();
+
+    for (index, step) in plan.steps.iter().cloned().enumerate() {
+        grouped_steps
+            .entry(PathBuf::from(&step.file_path))
+            .or_default()
+            .push(IndexedPlanStep { index, step });
+    }
+
+    let max_concurrency = scheduler.config().max_concurrency.max(1);
+    let partials = stream::iter(grouped_steps.into_iter().map(|(relative_path, steps)| {
+        let accepted_states = Arc::clone(&accepted_states);
+        let run_root = run_root.clone();
+        async move {
+            execute_file_group(
+                relative_path,
+                steps,
+                patcher,
+                verifier,
+                scheduler,
+                db,
+                project_root,
+                &run_root,
+                accepted_states,
+            )
+            .await
+        }
+    }))
+    .buffer_unordered(max_concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut summary = StepExecutionSummary {
+        run_root: Some(run_root.clone()),
+        ..StepExecutionSummary::default()
+    };
+
+    for partial in partials {
+        summary.merge(partial?);
+    }
+
+    let accepted_snapshot = accepted_states.lock().await.clone();
+    if accepted_snapshot.is_empty() {
+        return Ok(summary);
+    }
+
+    let final_workspace = run_root.join("final-bundle");
+    prepare_workspace(project_root, &final_workspace, &accepted_snapshot)?;
+    let final_verify = verifier
+        .verify_workspace(&accepted_snapshot, &final_workspace)
+        .await?;
+    summary.final_bundle_verified = final_verify.is_ok();
+    summary.final_verification = Some(final_verify.clone());
+
+    let original_workspace = run_root.join("original-bundle");
+    prepare_workspace(project_root, &original_workspace, &HashMap::new())?;
+    write_bundle_diff(&run_root, &original_workspace, &final_workspace)?;
+
+    if final_verify.is_ok() {
+        apply_changes_atomically(project_root, &accepted_snapshot)?;
+        summary.applied = true;
+    } else {
+        summary.verification_failures += 1;
+    }
+
+    Ok(summary)
+}
+
+impl VerifyResult {
+    /// Returns true if all checks passed.
+    pub fn is_ok(&self) -> bool {
+        self.parse_ok && self.test_ok && self.lint_ok
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedPlanStep {
+    index: usize,
+    step: PlanStep,
+}
+
+async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
+    relative_path: PathBuf,
+    steps: Vec<IndexedPlanStep>,
+    patcher: &Patcher<E>,
+    verifier: &Verifier<A>,
+    scheduler: &Scheduler,
+    db: &ThermalDb,
+    project_root: &Path,
+    run_root: &Path,
+    accepted_states: Arc<Mutex<HashMap<PathBuf, String>>>,
+) -> Result<StepExecutionSummary, EngineError> {
+    let _permit = SchedulerPermit::new(scheduler.acquire().await?, scheduler);
     let mut summary = StepExecutionSummary::default();
-    let mut originals: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut latest_state =
+        read_latest_state(project_root, &accepted_states, &relative_path).await?;
 
-    for (index, step) in plan.steps.iter().enumerate() {
-        let file_path = project_root.join(&step.file_path);
-        let backup = originals
-            .entry(file_path.clone())
-            .or_insert_with(|| std::fs::read_to_string(&file_path).ok())
-            .clone();
-        let original_for_patch = backup.as_deref().unwrap_or_default().to_string();
-
-        let agent_id = format!("fix-step-{}", index + 1);
-        let log_id = db.log_agent_spawn(&agent_id, "fix", &step.file_path)?;
+    for indexed_step in steps {
+        let agent_id = format!("fix-step-{}", indexed_step.index + 1);
+        let log_id = db.log_agent_spawn(&agent_id, "fix", &indexed_step.step.file_path)?;
         db.update_agent_status(log_id, "running", 0, 0.0, None)?;
 
-        let (candidate, usage) = match patcher.patch(&original_for_patch, &step.instruction).await {
+        let (candidate, usage) = match patcher
+            .patch(&latest_state, &indexed_step.step.instruction)
+            .await
+        {
             Ok(value) => value,
             Err(err) => {
                 summary.rejected += 1;
@@ -481,12 +695,33 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
             continue;
         }
 
+        let candidate_root = run_root.join("candidates").join(format!(
+            "step-{:04}-{}",
+            indexed_step.index + 1,
+            sanitize_path_component(&indexed_step.step.file_path)
+        ));
+        let accepted_snapshot = accepted_states.lock().await.clone();
+        prepare_workspace(project_root, &candidate_root, &accepted_snapshot)?;
+
         let verify = verifier
-            .verify(&file_path, &candidate, project_root)
+            .verify(
+                &candidate_root.join(&indexed_step.step.file_path),
+                &candidate,
+                &candidate_root,
+            )
             .await?;
+
         if verify.is_ok() {
+            latest_state = candidate.clone();
+            accepted_states
+                .lock()
+                .await
+                .insert(relative_path.clone(), candidate);
             summary.accepted += 1;
-            let metadata = serde_json::json!({"outcome":"accepted"});
+            let metadata = serde_json::json!({
+                "outcome":"accepted",
+                "sandbox_root": candidate_root.display().to_string(),
+            });
             db.update_agent_status(
                 log_id,
                 "success",
@@ -497,16 +732,11 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
         } else {
             summary.rejected += 1;
             summary.verification_failures += 1;
-            match backup {
-                Some(content) => std::fs::write(&file_path, content)?,
-                None => {
-                    if file_path.exists() {
-                        std::fs::remove_file(&file_path)?;
-                    }
-                }
-            }
-            let reason = verify.errors.join("; ");
-            let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
+            let metadata = serde_json::json!({
+                "outcome":"rejected",
+                "reason": verify.errors.join("; "),
+                "sandbox_root": candidate_root.display().to_string(),
+            });
             db.update_agent_status(
                 log_id,
                 "failed",
@@ -520,11 +750,192 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     Ok(summary)
 }
 
-impl VerifyResult {
-    /// Returns true if all checks passed.
-    pub fn is_ok(&self) -> bool {
-        self.parse_ok && self.test_ok && self.lint_ok
+async fn read_latest_state(
+    project_root: &Path,
+    accepted_states: &Mutex<HashMap<PathBuf, String>>,
+    relative_path: &Path,
+) -> Result<String, EngineError> {
+    if let Some(existing) = accepted_states.lock().await.get(relative_path).cloned() {
+        return Ok(existing);
     }
+
+    let full_path = project_root.join(relative_path);
+    match std::fs::read_to_string(&full_path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(EngineError::Io(err)),
+    }
+}
+
+fn create_run_root(project_root: &Path) -> Result<PathBuf, EngineError> {
+    let run_id = format!("run-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    let run_root = project_root.join(".mercury").join("worktrees").join(run_id);
+    std::fs::create_dir_all(&run_root)?;
+    Ok(run_root)
+}
+
+fn prepare_workspace(
+    project_root: &Path,
+    workspace_root: &Path,
+    accepted_states: &HashMap<PathBuf, String>,
+) -> Result<(), EngineError> {
+    if workspace_root.exists() {
+        std::fs::remove_dir_all(workspace_root)?;
+    }
+    std::fs::create_dir_all(workspace_root)?;
+    copy_project_tree(project_root, workspace_root, project_root)?;
+
+    for (relative_path, content) in accepted_states {
+        let destination = workspace_root.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(destination, content)?;
+    }
+
+    Ok(())
+}
+
+fn write_bundle_diff(
+    run_root: &Path,
+    original_workspace: &Path,
+    final_workspace: &Path,
+) -> Result<(), EngineError> {
+    let output = Command::new("git")
+        .args([
+            "--no-pager",
+            "diff",
+            "--no-index",
+            "--no-color",
+            original_workspace.to_string_lossy().as_ref(),
+            final_workspace.to_string_lossy().as_ref(),
+        ])
+        .output()?;
+
+    let status = output.status.code().unwrap_or_default();
+    if status != 0 && status != 1 {
+        return Err(EngineError::VerificationFailed {
+            reason: format!(
+                "failed to generate bundle diff: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        });
+    }
+
+    std::fs::write(run_root.join("accepted.patch"), output.stdout)?;
+    Ok(())
+}
+
+fn copy_project_tree(source: &Path, destination: &Path, root: &Path) -> Result<(), EngineError> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path
+            .strip_prefix(root)
+            .unwrap_or(source_path.as_path());
+
+        if should_skip_copy(relative) {
+            continue;
+        }
+
+        let destination_path = destination.join(relative);
+        let metadata = entry.metadata()?;
+
+        if metadata.is_dir() {
+            std::fs::create_dir_all(&destination_path)?;
+            copy_project_tree(&source_path, destination, root)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_copy(relative: &Path) -> bool {
+    let relative = relative.to_string_lossy();
+    relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative == ".mercury/worktrees"
+        || relative.starts_with(".mercury/worktrees/")
+        || relative == ".mercury/runs"
+        || relative.starts_with(".mercury/runs/")
+}
+
+fn apply_changes_atomically(
+    project_root: &Path,
+    accepted_states: &HashMap<PathBuf, String>,
+) -> Result<(), EngineError> {
+    let mut originals = HashMap::<PathBuf, Option<Vec<u8>>>::new();
+    let mut staged_writes = Vec::<(PathBuf, PathBuf)>::new();
+
+    for (relative_path, content) in accepted_states {
+        let target_path = project_root.join(relative_path);
+        let original = match std::fs::read(&target_path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(EngineError::Io(err)),
+        };
+        originals.insert(target_path.clone(), original);
+
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = target_path.with_extension(format!(
+            "mercury-{}.tmp",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&temp_path, content)?;
+        staged_writes.push((target_path, temp_path));
+    }
+
+    let mut applied_targets = Vec::<PathBuf>::new();
+    for (target_path, temp_path) in &staged_writes {
+        if let Err(err) = std::fs::rename(temp_path, target_path) {
+            rollback_atomic_targets(&applied_targets, &originals)?;
+            return Err(EngineError::Io(err));
+        }
+        applied_targets.push(target_path.clone());
+    }
+
+    Ok(())
+}
+
+fn rollback_atomic_targets(
+    applied_targets: &[PathBuf],
+    originals: &HashMap<PathBuf, Option<Vec<u8>>>,
+) -> Result<(), EngineError> {
+    for target_path in applied_targets {
+        match originals.get(target_path).cloned().flatten() {
+            Some(original) => {
+                let rollback_path = target_path.with_extension("mercury-rollback.tmp");
+                std::fs::write(&rollback_path, original)?;
+                std::fs::rename(&rollback_path, target_path)?;
+            }
+            None => {
+                if target_path.exists() {
+                    std::fs::remove_file(target_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_path_component(file_path: &str) -> String {
+    file_path
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | ' ' => '_',
+            other => other,
+        })
+        .collect()
 }
 
 struct CommandOutput {
@@ -532,6 +943,26 @@ struct CommandOutput {
     #[allow(dead_code)]
     stdout: String,
     stderr: String,
+}
+
+struct SchedulerPermit<'a> {
+    _permit: OwnedSemaphorePermit,
+    scheduler: &'a Scheduler,
+}
+
+impl<'a> SchedulerPermit<'a> {
+    fn new(permit: OwnedSemaphorePermit, scheduler: &'a Scheduler) -> Self {
+        Self {
+            _permit: permit,
+            scheduler,
+        }
+    }
+}
+
+impl Drop for SchedulerPermit<'_> {
+    fn drop(&mut self) {
+        self.scheduler.release();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,10 +1121,11 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ApiUsage;
+    use crate::api::{ApiUsage, PLANNER_RESPONSE_SCHEMA_NAME};
+    use serde_json::Value;
 
     struct MockPlannerApi {
-        response: String,
+        response: Value,
         usage: ApiUsage,
     }
 
@@ -704,7 +1136,7 @@ mod tests {
             _user: &str,
             _max_tokens: u32,
         ) -> Result<(String, ApiUsage), ApiError> {
-            Ok((self.response.clone(), self.usage))
+            unreachable!("planner tests only use strict schema chat")
         }
 
         async fn chat_json(
@@ -715,12 +1147,32 @@ mod tests {
         ) -> Result<(ThermalAssessment, ApiUsage), ApiError> {
             unreachable!("planner tests only use chat")
         }
+
+        async fn chat_json_schema_value(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+            _schema_name: &str,
+            _schema: Value,
+        ) -> Result<(Value, ApiUsage), ApiError> {
+            Ok((self.response.clone(), self.usage))
+        }
     }
 
     #[tokio::test]
     async fn test_planner_sets_estimated_cost_from_usage() {
         let api = MockPlannerApi {
-            response: r#"{"steps":[{"file_path":"src/main.rs","instruction":"Do thing","priority":0.9,"estimated_tokens":150}],"assessments":[]}"#.to_string(),
+            response: serde_json::json!({
+                "schema_version": PLANNER_RESPONSE_SCHEMA_NAME,
+                "steps": [{
+                    "file_path": "src/main.rs",
+                    "instruction": "Do thing",
+                    "priority": 0.9,
+                    "estimated_tokens": 150
+                }],
+                "assessments": []
+            }),
             usage: ApiUsage {
                 tokens_used: 321,
                 cost_usd: 0.0123,
