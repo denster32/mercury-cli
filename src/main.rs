@@ -490,6 +490,13 @@ async fn cmd_plan(
 
     // Display plan
     println!("\nExecution Plan ({} steps):", plan.steps.len());
+    println!(
+        "Estimated planning cost: ${:.4}{}",
+        plan.estimated_cost,
+        plan.estimated_tokens
+            .map(|tokens| format!(" | tokens: {tokens}"))
+            .unwrap_or_default()
+    );
     for (i, step) in plan.steps.iter().enumerate() {
         println!(
             "  {}. {} (priority: {:.2})",
@@ -552,6 +559,13 @@ async fn cmd_fix(
 
     let planner = engine::Planner::new(client, config.constitutional_prompt());
     let (plan, assessments) = planner.plan(description, &repo_map_str).await?;
+    println!(
+        "  Plan estimate: ${:.4}{}",
+        plan.estimated_cost,
+        plan.estimated_tokens
+            .map(|tokens| format!(" | tokens: {tokens}"))
+            .unwrap_or_default()
+    );
 
     // Store thermal assessments
     for (i, assessment) in assessments.iter().enumerate() {
@@ -720,8 +734,12 @@ async fn main() -> Result<()> {
                     // original_code and update_snippet — Mercury Edit infers the
                     // change from context. For precise edits, callers provide
                     // the actual update snippet.
-                    let (patched, usage) =
-                        patcher.patch(&content, &format!("{content}\n// Instruction: {instruction}")).await?;
+                    let (patched, usage) = patcher
+                        .patch(
+                            &content,
+                            &format!("{content}\n// Instruction: {instruction}"),
+                        )
+                        .await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
