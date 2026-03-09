@@ -304,6 +304,9 @@ enum EditAction {
         /// Dry run — show diff without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Bypass verification checks and force-write the patch.
+        #[arg(long)]
+        force: bool,
     },
     /// Autocomplete at a cursor position.
     Complete {
@@ -835,12 +838,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Edit { action } => {
-            let (config, _db, _root) = load_project()?;
+            let (config, _db, project_root) = load_project()?;
             let api_key = std::env::var(&config.api.api_key_env)
                 .map_err(|_| api::ApiError::MissingApiKey(config.api.api_key_env.clone()))?;
 
             let edit_client =
-                MercuryEditClient::new(api_key, config.api.mercury_edit_endpoint.clone())
+                MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
                     .with_retries(
                         config.scheduler.retry_limit,
                         config.scheduler.backoff_base_ms,
@@ -852,6 +855,7 @@ async fn main() -> Result<()> {
                     file,
                     instruction,
                     dry_run,
+                    force,
                 } => {
                     let content = std::fs::read_to_string(&file)?;
                     // For instruction-based edits, we pass the original as both
@@ -867,8 +871,33 @@ async fn main() -> Result<()> {
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
-                    } else {
+                    } else if force {
+                        println!("WARNING: verification bypassed due to --force");
                         std::fs::write(&file, &patched)?;
+                        println!("Patched {}", file.display());
+                    } else {
+                        let verify_client = Mercury2Client::new(api_key.clone())
+                            .with_base_url(config.api.mercury2_endpoint.clone())
+                            .with_retries(
+                                config.scheduler.retry_limit,
+                                config.scheduler.backoff_base_ms,
+                            );
+                        let verifier = Verifier::new(
+                            build_verify_config(&config),
+                            if config.verification.mercury2_critique_on_failure {
+                                Some(verify_client)
+                            } else {
+                                None
+                            },
+                        );
+                        verify_and_accept_patch(
+                            &verifier,
+                            &file,
+                            &content,
+                            &patched,
+                            &project_root,
+                        )
+                        .await?;
                         println!("Patched {}", file.display());
                     }
                     println!(
@@ -982,4 +1011,82 @@ fn parse_file_line(input: &str) -> (PathBuf, u32) {
         }
     }
     (PathBuf::from(input), 1)
+}
+
+fn build_verify_config(config: &MercuryConfig) -> VerifyConfig {
+    VerifyConfig {
+        parse_before_write: config.verification.parse_before_write,
+        test_after_write: config.verification.test_after_write,
+        lint_after_write: config.verification.lint_after_write,
+        mercury2_critique_on_failure: config.verification.mercury2_critique_on_failure,
+        test_command: config.verification.test_command.clone(),
+        lint_command: config.verification.lint_command.clone(),
+    }
+}
+
+async fn verify_and_accept_patch(
+    verifier: &Verifier<Mercury2Client>,
+    file: &Path,
+    original_content: &str,
+    patched_content: &str,
+    project_root: &Path,
+) -> Result<()> {
+    let verification = verifier.verify(file, patched_content, project_root).await?;
+    if verification.is_ok() {
+        return Ok(());
+    }
+
+    std::fs::write(file, original_content).with_context(|| {
+        format!(
+            "verification failed and rollback failed for {}",
+            file.display()
+        )
+    })?;
+
+    let structured = serde_json::json!({
+        "parse": verification.parse_ok,
+        "test": verification.test_ok,
+        "lint": verification.lint_ok,
+        "critique": verification.critique,
+        "errors": verification.errors,
+    });
+    anyhow::bail!(
+        "patch rejected by verification for {}\n{}",
+        file.display(),
+        serde_json::to_string_pretty(&structured)?
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn verification_config_that_fails() -> VerifyConfig {
+        VerifyConfig {
+            parse_before_write: false,
+            test_after_write: true,
+            lint_after_write: false,
+            mercury2_critique_on_failure: false,
+            test_command: "false".to_string(),
+            lint_command: "true".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_failure_rolls_back_file_contents() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("sample.rs");
+        let original = "fn main() { println!(\"hello\"); }\n";
+        let patched = "fn main() { println!(\"goodbye\"); }\n";
+        std::fs::write(&file, original).unwrap();
+
+        let verifier = Verifier::<Mercury2Client>::new(verification_config_that_fails(), None);
+        let result =
+            verify_and_accept_patch(&verifier, &file, original, patched, temp.path()).await;
+
+        assert!(result.is_err());
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(after, original);
+    }
 }
