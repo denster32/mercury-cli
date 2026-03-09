@@ -469,8 +469,7 @@ impl Mercury2Client {
     /// Estimate USD cost from a [`UsageBlock`], accounting for cached input discount.
     fn estimate_cost(usage: &UsageBlock) -> f64 {
         let uncached_input = (usage.prompt_tokens - usage.cached_input_tokens).max(0);
-        let cached_cost =
-            (usage.cached_input_tokens as f64 / 1000.0) * COST_PER_1K_CACHED_INPUT;
+        let cached_cost = (usage.cached_input_tokens as f64 / 1000.0) * COST_PER_1K_CACHED_INPUT;
         let input_cost = (uncached_input as f64 / 1000.0) * COST_PER_1K_INPUT;
         let output_cost = (usage.completion_tokens as f64 / 1000.0) * COST_PER_1K_OUTPUT;
         cached_cost + input_cost + output_cost
@@ -851,10 +850,7 @@ impl MercuryEditApi for MercuryEditClient {
             ));
         }
         if !payload.cursor.is_empty() {
-            parts.push(format!(
-                "<|cursor|>\n{}\n<|/cursor|>",
-                payload.cursor
-            ));
+            parts.push(format!("<|cursor|>\n{}\n<|/cursor|>", payload.cursor));
         }
         if !payload.edit_history.is_empty() {
             parts.push(format!(
@@ -1083,6 +1079,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn thermal_analysis_prompt_is_non_empty() {
         assert!(!THERMAL_ANALYSIS_PROMPT.is_empty());
         assert!(THERMAL_ANALYSIS_PROMPT.contains("complexity_score"));

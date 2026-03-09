@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -71,6 +72,9 @@ pub struct ExecutionPlan {
     pub constitutional_prompt: String,
     /// Total estimated cost.
     pub estimated_cost: f64,
+    /// Total estimated tokens consumed while generating this plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<i64>,
 }
 
 /// A single step in an execution plan.
@@ -103,6 +107,8 @@ impl<A: Mercury2Api> Planner<A> {
         goal: &str,
         repo_map: &str,
     ) -> Result<(ExecutionPlan, Vec<ThermalAssessment>), EngineError> {
+        let mut total_usage = ApiUsage::default();
+
         let system_prompt = format!(
             "{}\n\n{}\n\nAdditionally, generate an execution plan as JSON with this schema:\n\
              {{\"steps\": [{{\"file_path\": \"...\", \"instruction\": \"...\", \"priority\": 0.0-1.0, \"estimated_tokens\": N}}],\n\
@@ -112,7 +118,9 @@ impl<A: Mercury2Api> Planner<A> {
 
         let user_msg = format!("Goal: {}\n\nRepository Map:\n{}", goal, repo_map);
 
-        let (response, _usage) = self.api.chat(&system_prompt, &user_msg, 4096).await?;
+        let (response, usage) = self.api.chat(&system_prompt, &user_msg, 4096).await?;
+        total_usage.tokens_used += usage.tokens_used;
+        total_usage.cost_usd += usage.cost_usd;
 
         // Mercury 2 may wrap JSON in markdown fences — extract the JSON body.
         let json_str = extract_json(&response);
@@ -123,7 +131,8 @@ impl<A: Mercury2Api> Planner<A> {
         let plan = ExecutionPlan {
             steps: parsed.steps,
             constitutional_prompt: self.constitutional_prompt.clone(),
-            estimated_cost: 0.0,
+            estimated_cost: total_usage.cost_usd,
+            estimated_tokens: Some(total_usage.tokens_used),
         };
 
         Ok((plan, parsed.assessments))
@@ -409,6 +418,108 @@ pub struct VerifyResult {
     pub errors: Vec<String>,
 }
 
+/// Aggregate execution results for `fix` step orchestration.
+#[derive(Debug, Clone, Default)]
+pub struct StepExecutionSummary {
+    pub accepted: usize,
+    pub rejected: usize,
+    pub verification_failures: usize,
+}
+
+impl StepExecutionSummary {
+    pub fn total(&self) -> usize {
+        self.accepted + self.rejected
+    }
+}
+
+/// Execute a plan's steps by patching and verifying each candidate edit.
+pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
+    plan: &ExecutionPlan,
+    patcher: &Patcher<E>,
+    verifier: &Verifier<A>,
+    scheduler: &Scheduler,
+    db: &ThermalDb,
+    project_root: &Path,
+) -> Result<StepExecutionSummary, EngineError> {
+    let mut summary = StepExecutionSummary::default();
+    let mut originals: HashMap<PathBuf, Option<String>> = HashMap::new();
+
+    for (index, step) in plan.steps.iter().enumerate() {
+        let file_path = project_root.join(&step.file_path);
+        let backup = originals
+            .entry(file_path.clone())
+            .or_insert_with(|| std::fs::read_to_string(&file_path).ok())
+            .clone();
+        let original_for_patch = backup.as_deref().unwrap_or_default().to_string();
+
+        let agent_id = format!("fix-step-{}", index + 1);
+        let log_id = db.log_agent_spawn(&agent_id, "fix", &step.file_path)?;
+        db.update_agent_status(log_id, "running", 0, 0.0, None)?;
+
+        let (candidate, usage) = match patcher.patch(&original_for_patch, &step.instruction).await {
+            Ok(value) => value,
+            Err(err) => {
+                summary.rejected += 1;
+                let reason = format!("patch generation failed: {err}");
+                let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
+                db.update_agent_status(log_id, "failed", 0, 0.0, Some(&metadata.to_string()))?;
+                continue;
+            }
+        };
+
+        if let Err(err) = scheduler.record_cost(usage.cost_usd) {
+            summary.rejected += 1;
+            let reason = format!("budget rejected step: {err}");
+            let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
+            db.update_agent_status(
+                log_id,
+                "failed",
+                usage.tokens_used,
+                usage.cost_usd,
+                Some(&metadata.to_string()),
+            )?;
+            continue;
+        }
+
+        let verify = verifier
+            .verify(&file_path, &candidate, project_root)
+            .await?;
+        if verify.is_ok() {
+            summary.accepted += 1;
+            let metadata = serde_json::json!({"outcome":"accepted"});
+            db.update_agent_status(
+                log_id,
+                "success",
+                usage.tokens_used,
+                usage.cost_usd,
+                Some(&metadata.to_string()),
+            )?;
+        } else {
+            summary.rejected += 1;
+            summary.verification_failures += 1;
+            match backup {
+                Some(content) => std::fs::write(&file_path, content)?,
+                None => {
+                    if file_path.exists() {
+                        std::fs::remove_file(&file_path)?;
+                    }
+                }
+            }
+            let reason = verify.errors.join("; ");
+            let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
+            db.update_agent_status(
+                log_id,
+                "failed",
+                usage.tokens_used,
+                usage.cost_usd,
+                Some(&metadata.to_string()),
+            )?;
+        }
+    }
+
+    Ok(summary)
+}
+
 impl VerifyResult {
     /// Returns true if all checks passed.
     pub fn is_ok(&self) -> bool {
@@ -579,6 +690,50 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ApiUsage;
+
+    struct MockPlannerApi {
+        response: String,
+        usage: ApiUsage,
+    }
+
+    impl crate::api::Mercury2Api for MockPlannerApi {
+        async fn chat(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> Result<(String, ApiUsage), ApiError> {
+            Ok((self.response.clone(), self.usage))
+        }
+
+        async fn chat_json(
+            &self,
+            _system: &str,
+            _user: &str,
+            _max_tokens: u32,
+        ) -> Result<(ThermalAssessment, ApiUsage), ApiError> {
+            unreachable!("planner tests only use chat")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_planner_sets_estimated_cost_from_usage() {
+        let api = MockPlannerApi {
+            response: r#"{"steps":[{"file_path":"src/main.rs","instruction":"Do thing","priority":0.9,"estimated_tokens":150}],"assessments":[]}"#.to_string(),
+            usage: ApiUsage {
+                tokens_used: 321,
+                cost_usd: 0.0123,
+            },
+        };
+        let planner = Planner::new(api, "constitution".to_string());
+
+        let (plan, _assessments) = planner.plan("goal", "repo").await.unwrap();
+
+        assert!(plan.estimated_cost > 0.0);
+        assert_eq!(plan.estimated_cost, 0.0123);
+        assert_eq!(plan.estimated_tokens, Some(321));
+    }
 
     #[test]
     fn test_scheduler_budget_tracking() {
@@ -626,7 +781,11 @@ mod tests {
         let db = ThermalDb::in_memory().unwrap();
         db.upsert_thermal_score("a.rs", 1, 50, 0.8, "complexity", "plan", "a1")
             .unwrap();
+        db.upsert_thermal_score("a.rs", 1, 50, 0.5, "dependency", "plan", "a1")
+            .unwrap();
         db.upsert_thermal_score("a.rs", 1, 50, 0.6, "risk", "plan", "a1")
+            .unwrap();
+        db.upsert_thermal_score("a.rs", 1, 50, 0.4, "churn", "plan", "a1")
             .unwrap();
         db.upsert_thermal_score("b.rs", 1, 20, 0.3, "complexity", "plan", "a1")
             .unwrap();

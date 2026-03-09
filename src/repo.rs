@@ -792,22 +792,13 @@ impl Point {
         let rust_file = dir.path().join("lib.rs");
         let python_file = dir.path().join("tool.py");
 
-        fs::write(
-            &rust_file,
-            "fn hello() {}
-",
-        )
-        .expect("write rust");
-        fs::write(
-            &python_file,
-            "def hello():
-    return 1
-",
-        )
-        .expect("write py");
+        fs::write(&rust_file, "fn hello() {}\n").expect("write rust");
+        fs::write(&python_file, "def hello():\n    return 1\n").expect("write py");
 
-        let mut languages = RepoLanguages::default();
-        languages.python = true;
+        let languages = RepoLanguages {
+            python: true,
+            ..Default::default()
+        };
 
         let symbols = parse_directory_with_languages(&dir.path().to_string_lossy(), &languages)
             .expect("parse directory");
@@ -824,27 +815,14 @@ impl Point {
     #[test]
     fn test_build_repo_map_language_counts_follow_enablement() {
         let dir = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            dir.path().join("a.rs"),
-            "fn a() {}
-",
-        )
-        .expect("write a.rs");
-        fs::write(
-            dir.path().join("b.py"),
-            "print('hi')
-",
-        )
-        .expect("write b.py");
-        fs::write(
-            dir.path().join("c.ts"),
-            "export const x = 1;
-",
-        )
-        .expect("write c.ts");
+        fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
+        fs::write(dir.path().join("b.py"), "print('hi')\n").expect("write b.py");
+        fs::write(dir.path().join("c.ts"), "export const x = 1;\n").expect("write c.ts");
 
-        let mut languages = RepoLanguages::default();
-        languages.python = true;
+        let languages = RepoLanguages {
+            python: true,
+            ..Default::default()
+        };
 
         let map = build_repo_map_with_languages(&dir.path().to_string_lossy(), &languages)
             .expect("build repo map");
@@ -852,7 +830,7 @@ impl Point {
         assert_eq!(map.indexed_file_count, 2);
         assert_eq!(map.language_file_counts.get("rust"), Some(&1));
         assert_eq!(map.language_file_counts.get("python"), Some(&1));
-        assert!(map.language_file_counts.get("typescript").is_none());
+        assert!(!map.language_file_counts.contains_key("typescript"));
     }
 
     #[test]
@@ -861,16 +839,10 @@ impl Point {
         fs::create_dir_all(dir.path().join("target")).expect("mkdir target");
         fs::write(
             dir.path().join("target").join("ignored.rs"),
-            "fn ignored() {}
-",
+            "fn ignored() {}\n",
         )
         .expect("write ignored");
-        fs::write(
-            dir.path().join("kept.rs"),
-            "fn kept() {}
-",
-        )
-        .expect("write kept");
+        fs::write(dir.path().join("kept.rs"), "fn kept() {}\n").expect("write kept");
 
         let languages = RepoLanguages::default();
         let mut visited = Vec::new();
@@ -882,22 +854,13 @@ impl Point {
 
         assert_eq!(visited, vec!["kept.rs".to_string()]);
     }
+
     #[test]
     fn test_walk_source_files_visits_only_enabled_extensions() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join("nested")).expect("mkdir");
-        fs::write(
-            dir.path().join("nested").join("x.rs"),
-            "fn x() {}
-",
-        )
-        .expect("write rs");
-        fs::write(
-            dir.path().join("nested").join("y.go"),
-            "package main
-",
-        )
-        .expect("write go");
+        fs::write(dir.path().join("nested").join("x.rs"), "fn x() {}\n").expect("write rs");
+        fs::write(dir.path().join("nested").join("y.go"), "package main\n").expect("write go");
 
         let languages = RepoLanguages {
             rust: true,
