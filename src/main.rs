@@ -457,32 +457,7 @@ async fn cmd_plan(
     println!("Planning with Mercury 2...");
     let (plan, assessments) = planner.plan(goal, &repo_map_str).await?;
 
-    // Store thermal scores from assessments
-    for (i, assessment) in assessments.iter().enumerate() {
-        let file_path = plan
-            .steps
-            .get(i)
-            .map(|s| s.file_path.as_str())
-            .unwrap_or("unknown");
-        db.upsert_thermal_score(
-            file_path,
-            1,
-            1000,
-            assessment.complexity_score,
-            "complexity",
-            "plan",
-            "planner",
-        )?;
-        db.upsert_thermal_score(
-            file_path,
-            1,
-            1000,
-            assessment.risk_score,
-            "risk",
-            "plan",
-            "planner",
-        )?;
-    }
+    store_assessments(db, &plan.steps, &assessments, "plan")?;
 
     // Run merge cycle
     let scheduler = Scheduler::new(config.to_scheduler_config());
@@ -499,6 +474,7 @@ async fn cmd_plan(
         );
         println!("     {}", step.instruction);
     }
+    print_assessment_summary(&plan.steps, &assessments);
 
     // Display heatmap
     let aggregates = db.get_all_aggregates()?;
@@ -553,29 +529,8 @@ async fn cmd_fix(
     let planner = engine::Planner::new(client, config.constitutional_prompt());
     let (plan, assessments) = planner.plan(description, &repo_map_str).await?;
 
-    // Store thermal assessments
-    for (i, assessment) in assessments.iter().enumerate() {
-        if let Some(step) = plan.steps.get(i) {
-            db.upsert_thermal_score(
-                &step.file_path,
-                1,
-                1000,
-                assessment.complexity_score,
-                "complexity",
-                "fix",
-                "planner",
-            )?;
-            db.upsert_thermal_score(
-                &step.file_path,
-                1,
-                1000,
-                assessment.risk_score,
-                "risk",
-                "fix",
-                "planner",
-            )?;
-        }
-    }
+    store_assessments(db, &plan.steps, &assessments, "fix")?;
+    print_assessment_summary(&plan.steps, &assessments);
 
     // Run initial merge
     let mut sched_config = config.to_scheduler_config();
@@ -614,6 +569,85 @@ async fn cmd_fix(
     println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
 
     Ok(())
+}
+
+fn store_assessments(
+    db: &ThermalDb,
+    steps: &[engine::PlanStep],
+    assessments: &[api::ThermalAssessment],
+    command: &str,
+) -> Result<()> {
+    for (i, assessment) in assessments.iter().enumerate() {
+        let file_path = steps
+            .get(i)
+            .map(|s| s.file_path.as_str())
+            .unwrap_or("unknown");
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.complexity_score,
+            "complexity",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.dependency_score,
+            "dependency",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.risk_score,
+            "risk",
+            command,
+            "planner",
+        )?;
+        db.upsert_thermal_score(
+            file_path,
+            1,
+            1000,
+            assessment.churn_score,
+            "churn",
+            command,
+            "planner",
+        )?;
+    }
+    Ok(())
+}
+
+fn print_assessment_summary(steps: &[engine::PlanStep], assessments: &[api::ThermalAssessment]) {
+    if assessments.is_empty() {
+        return;
+    }
+
+    println!("\nAssessment contributions (complexity/dependency/risk/churn):");
+    for (i, assessment) in assessments.iter().enumerate() {
+        let file_path = steps
+            .get(i)
+            .map(|s| s.file_path.as_str())
+            .unwrap_or("unknown");
+        let overall = (assessment.complexity_score
+            + assessment.dependency_score
+            + assessment.risk_score
+            + assessment.churn_score)
+            / 4.0;
+        println!(
+            "  - {} => c:{:.2} d:{:.2} r:{:.2} h:{:.2} avg:{:.2}",
+            file_path,
+            assessment.complexity_score,
+            assessment.dependency_score,
+            assessment.risk_score,
+            assessment.churn_score,
+            overall
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,8 +754,12 @@ async fn main() -> Result<()> {
                     // original_code and update_snippet — Mercury Edit infers the
                     // change from context. For precise edits, callers provide
                     // the actual update snippet.
-                    let (patched, usage) =
-                        patcher.patch(&content, &format!("{content}\n// Instruction: {instruction}")).await?;
+                    let (patched, usage) = patcher
+                        .patch(
+                            &content,
+                            &format!("{content}\n// Instruction: {instruction}"),
+                        )
+                        .await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");

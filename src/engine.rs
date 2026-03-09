@@ -626,7 +626,11 @@ mod tests {
         let db = ThermalDb::in_memory().unwrap();
         db.upsert_thermal_score("a.rs", 1, 50, 0.8, "complexity", "plan", "a1")
             .unwrap();
+        db.upsert_thermal_score("a.rs", 1, 50, 0.5, "dependency", "plan", "a1")
+            .unwrap();
         db.upsert_thermal_score("a.rs", 1, 50, 0.6, "risk", "plan", "a1")
+            .unwrap();
+        db.upsert_thermal_score("a.rs", 1, 50, 0.4, "churn", "plan", "a1")
             .unwrap();
         db.upsert_thermal_score("b.rs", 1, 20, 0.3, "complexity", "plan", "a1")
             .unwrap();
