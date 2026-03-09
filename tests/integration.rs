@@ -149,6 +149,49 @@ fn test_thermal_crud_roundtrip() {
 }
 
 #[test]
+fn test_planning_persists_all_four_metric_types() {
+    use std::collections::BTreeSet;
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let file_path = "src/main.rs";
+
+    db.upsert_thermal_score(file_path, 1, 1000, 0.81, "complexity", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.64, "dependency", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.72, "risk", "plan", "planner")
+        .unwrap();
+    db.upsert_thermal_score(file_path, 1, 1000, 0.49, "churn", "plan", "planner")
+        .unwrap();
+
+    let scheduler = mercury_cli::engine::Scheduler::new(Default::default());
+    scheduler.run_merge_cycle(&db, 1.0).unwrap();
+
+    let score_types: BTreeSet<String> = db
+        .get_scores_for_file(file_path)
+        .unwrap()
+        .into_iter()
+        .map(|score| score.score_type)
+        .collect();
+
+    assert_eq!(
+        score_types,
+        BTreeSet::from([
+            "churn".to_string(),
+            "complexity".to_string(),
+            "dependency".to_string(),
+            "risk".to_string(),
+        ])
+    );
+
+    let aggregate = db.get_aggregate(file_path).unwrap();
+    assert!(
+        aggregate.is_some(),
+        "merge cycle should aggregate four-factor scores"
+    );
+}
+
+#[test]
 fn test_cool_zone_locking() {
     let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
 

@@ -170,3 +170,15 @@ This convergence across independent theoretical domains is strong evidence that 
 ---
 
 *This theoretical analysis was developed collaboratively using five AI architectures: Claude (Anthropic) for conceptual design, ChatGPT 5.4 Pro (OpenAI) for engineering specification, Grok 4.20 (xAI) for stress testing, Gemini Deep Research (Google) for theoretical validation, and Mercury 2 (Inception Labs) for execution testing. No single architecture could have produced this synthesis alone.*
+
+## 9. Persisted Thermal Metrics
+
+Planner and fix workflows persist four thermal factors per targeted file region (`line_start=1`, `line_end=1000`) into `thermal_map`:
+
+- `complexity`: structural and cyclomatic complexity pressure
+- `dependency`: coupling density and dependency fan-in/fan-out pressure
+- `risk`: expected regression or defect likelihood
+- `churn`: recent change velocity derived from repository history
+
+These four labels are stored consistently as `score_type` values and then merged during aggregation into each file's `composite_score` and `max_score`, so routing and heatmap views reflect multi-factor rather than single-factor thermal pressure.
+
