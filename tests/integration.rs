@@ -397,6 +397,7 @@ fn hello() {} // PASS"
         ],
         constitutional_prompt: String::new(),
         estimated_cost: 0.0,
+        estimated_tokens: None,
     };
 
     let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
