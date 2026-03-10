@@ -17,6 +17,7 @@ The format is based on Keep a Changelog, and this project aims to follow Semanti
 - release archives now package the built `mercury-cli` binary as the `mercury` command plus top-level project docs
 - manual release dispatch now supports an explicit version input instead of assuming a tag context
 - project hygiene now defaults to issue templates and private security reporting instead of blank issues
+- CI auto-repair product docs and workflow copy now describe draft-PR creation as a conditional same-repository promotion step, with evidence bundles remaining the primary output for every run
 
 ## [0.1.0]
 

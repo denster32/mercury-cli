@@ -3,8 +3,10 @@
 //! Uses Inception Labs' Mercury 2 with thermal heat maps as a stigmergic
 //! coordination primitive for multi-agent code editing.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::Command;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -17,9 +19,11 @@ use mercury_cli::db::{self, ThermalDb};
 use mercury_cli::engine::{
     self, Scheduler, SchedulerConfig, StepExecutionSummary, Verifier, VerifyConfig,
 };
+use mercury_cli::failure_parser::{self, CargoCommandKind};
 use mercury_cli::repo;
 use mercury_cli::swarm;
 use mercury_cli::thermal::{self, render_heatmap_to_string};
+use mercury_cli::verification;
 
 // ---------------------------------------------------------------------------
 // Top-level error
@@ -555,6 +559,77 @@ async fn cmd_plan(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct FixCommandOutcome {
+    artifact_root: PathBuf,
+    execution_summary: StepExecutionSummary,
+    total_cost_usd: f64,
+    budget_remaining_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatchCommandResult {
+    command: String,
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    parsed_failure: Option<mercury_cli::failure_parser::ParsedFailureReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatchRepairRecord {
+    supported: bool,
+    verifier_command: Option<String>,
+    fix_artifact_root: Option<String>,
+    accepted_steps: usize,
+    rejected_steps: usize,
+    verification_failures: usize,
+    final_bundle_verified: bool,
+    applied: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatchRunRecord {
+    command: String,
+    repair_requested: bool,
+    decision: String,
+    initial_run: WatchCommandResult,
+    confirmation_run: Option<WatchCommandResult>,
+    repair: Option<WatchRepairRecord>,
+    started_at: String,
+    finished_at: String,
+    duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WatchCycleOutcome {
+    artifact_root: PathBuf,
+    record: WatchRunRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustRepairMode {
+    TestLike,
+    Lint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustRepairTarget {
+    verifier_command: String,
+    mode: RustRepairMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoWatchSnapshot(BTreeMap<PathBuf, RepoFileFingerprint>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoFileFingerprint {
+    modified_unix_nanos: u128,
+    len: u64,
+}
+
 async fn cmd_fix(
     config: &MercuryConfig,
     db: &ThermalDb,
@@ -563,6 +638,30 @@ async fn cmd_fix(
     max_agents: usize,
     max_cost: f64,
 ) -> Result<()> {
+    let _ = cmd_fix_with_verify_config(
+        config,
+        db,
+        project_root,
+        description,
+        max_agents,
+        max_cost,
+        build_verify_config(config),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn cmd_fix_with_verify_config(
+    config: &MercuryConfig,
+    db: &ThermalDb,
+    project_root: &Path,
+    description: &str,
+    max_agents: usize,
+    max_cost: f64,
+    verify_config: VerifyConfig,
+    parsed_failure: Option<&failure_parser::ParsedFailureReport>,
+) -> Result<FixCommandOutcome> {
     let started_at = Utc::now();
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
@@ -587,15 +686,37 @@ async fn cmd_fix(
     println!("[2/7] Planning with Mercury 2...");
     let api_key = api::resolve_api_key(&config.api.api_key_env)?;
 
-    let client = Mercury2Client::new(api_key.clone())
+    println!("  Grounding repair context...");
+    let grounding_client = Mercury2Client::new(api_key.clone())
+        .with_base_url(config.api.mercury2_endpoint.clone())
+        .with_retries(
+            config.scheduler.retry_limit,
+            config.scheduler.backoff_base_ms,
+        );
+    let grounded_context = verification::gather_grounded_repair_context(
+        &grounding_client,
+        project_root,
+        &verify_config,
+        description,
+        parsed_failure,
+    )
+    .await?;
+    write_json_artifact(
+        &artifact_root.join("grounded-context.json"),
+        &grounded_context,
+    )?;
+
+    let planner_description = format!("{description}\n\n{}", grounded_context.planner_brief());
+
+    let planner_client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
             config.scheduler.retry_limit,
             config.scheduler.backoff_base_ms,
         );
 
-    let planner = engine::Planner::new(client, config.constitutional_prompt());
-    let (plan, assessments) = planner.plan(description, &repo_map_str).await?;
+    let planner = engine::Planner::new(planner_client, config.constitutional_prompt());
+    let (plan, assessments) = planner.plan(&planner_description, &repo_map_str).await?;
     println!(
         "  Plan estimate: ${:.4}{}",
         plan.estimated_cost,
@@ -634,15 +755,20 @@ async fn cmd_fix(
             );
     let patcher = engine::Patcher::new(edit_client);
 
-    let verify_config = VerifyConfig {
-        parse_before_write: config.verification.parse_before_write,
-        test_after_write: config.verification.test_after_write,
-        lint_after_write: config.verification.lint_after_write,
-        mercury2_critique_on_failure: config.verification.mercury2_critique_on_failure,
-        test_command: config.verification.test_command.clone(),
-        lint_command: config.verification.lint_command.clone(),
-    };
-    let verifier = Verifier::new(verify_config, None::<Mercury2Client>);
+    let verifier_client = Mercury2Client::new(api_key.clone())
+        .with_base_url(config.api.mercury2_endpoint.clone())
+        .with_retries(
+            config.scheduler.retry_limit,
+            config.scheduler.backoff_base_ms,
+        );
+    let verifier = Verifier::new(
+        verify_config,
+        if config.verification.mercury2_critique_on_failure {
+            Some(verifier_client)
+        } else {
+            None
+        },
+    );
     let execution_summary: StepExecutionSummary =
         engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
             .await?;
@@ -693,6 +819,14 @@ async fn cmd_fix(
     if let Some(state) = db.get_swarm_state()? {
         write_json_artifact(&artifact_root.join("swarm-state.json"), &state)?;
     }
+    let grounding_tool_calls = grounded_context
+        .rounds
+        .iter()
+        .map(|round| round.tool_calls.len())
+        .sum::<usize>();
+    let total_cost_usd =
+        scheduler.current_cost() + grounded_context.total_usage.cost_usd + plan.estimated_cost;
+    let budget_remaining_usd = (max_cost - total_cost_usd).max(0.0);
     write_json_artifact(
         &artifact_root.join("metadata.json"),
         &FixRunMetadata {
@@ -703,14 +837,21 @@ async fn cmd_fix(
             finished_at: finished_at.to_rfc3339(),
             duration_ms: started.elapsed().as_millis() as u64,
             planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+            grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
+            grounding_rounds: grounded_context.rounds.len(),
+            grounding_tool_calls,
+            grounding_collected: !grounded_context.summary.trim().is_empty()
+                || !grounded_context.rounds.is_empty(),
+            grounding_cost_usd: grounded_context.total_usage.cost_usd,
+            planner_estimated_cost_usd: plan.estimated_cost,
             final_bundle_verified: execution_summary.final_bundle_verified,
             applied: execution_summary.applied,
             sandbox_run_root: execution_summary
                 .run_root
                 .as_ref()
                 .map(|path| path.display().to_string()),
-            total_cost_usd: scheduler.current_cost(),
-            budget_remaining_usd: scheduler.budget_remaining(),
+            total_cost_usd,
+            budget_remaining_usd,
         },
     )?;
     if let Some(run_root) = execution_summary.run_root.as_ref() {
@@ -721,7 +862,198 @@ async fn cmd_fix(
     }
     println!("Artifacts written to {}", artifact_root.display());
 
-    Ok(())
+    Ok(FixCommandOutcome {
+        artifact_root,
+        execution_summary,
+        total_cost_usd,
+        budget_remaining_usd,
+    })
+}
+
+async fn cmd_watch(
+    config: &MercuryConfig,
+    db: &ThermalDb,
+    project_root: &Path,
+    command: &str,
+    repair: bool,
+) -> Result<()> {
+    println!("Watching: {command}");
+    if repair {
+        println!("Auto-repair enabled for supported Rust verifier commands.");
+    } else {
+        println!("Auto-repair disabled. Failures will be reported only.");
+    }
+    println!("Press Ctrl-C to stop.\n");
+
+    let mut snapshot = capture_repo_watch_snapshot(project_root)?;
+    let mut cycle = 0usize;
+
+    loop {
+        cycle += 1;
+        if cycle > 1 {
+            println!("Waiting for repository changes...");
+            if !wait_for_repo_change(project_root, &mut snapshot).await? {
+                return Ok(());
+            }
+            println!("Change detected. Re-running watch cycle.\n");
+        }
+
+        let outcome = execute_watch_cycle(config, db, project_root, command, repair).await?;
+        print_watch_cycle_result(&outcome);
+        snapshot = capture_repo_watch_snapshot(project_root)?;
+        println!();
+    }
+}
+
+async fn execute_watch_cycle(
+    config: &MercuryConfig,
+    db: &ThermalDb,
+    project_root: &Path,
+    command: &str,
+    repair: bool,
+) -> Result<WatchCycleOutcome> {
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let artifact_root = create_run_artifact_root(project_root)?;
+
+    println!("Running watch command...");
+    let initial_run = run_watch_command(command, project_root)?;
+    replay_watch_command_output("initial", &initial_run);
+
+    let mut decision = "passed_without_repair".to_string();
+    let mut repair_record = None;
+    let mut confirmation_run = None;
+
+    if !initial_run.success {
+        if !repair {
+            decision = "failed_without_repair".to_string();
+        } else if let Some(target) = classify_rust_repair_command(command) {
+            let verify_config = build_watch_verify_config(config, &target);
+            let description = build_watch_repair_description(command, &initial_run);
+            println!(
+                "Watch repair targeting `{}` with Mercury fix...",
+                target.verifier_command
+            );
+            match cmd_fix_with_verify_config(
+                config,
+                db,
+                project_root,
+                &description,
+                config.scheduler.max_concurrency,
+                config.scheduler.max_cost_per_command,
+                verify_config,
+                initial_run.parsed_failure.as_ref(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    repair_record = Some(WatchRepairRecord {
+                        supported: true,
+                        verifier_command: Some(target.verifier_command.clone()),
+                        fix_artifact_root: Some(outcome.artifact_root.display().to_string()),
+                        accepted_steps: outcome.execution_summary.accepted,
+                        rejected_steps: outcome.execution_summary.rejected,
+                        verification_failures: outcome.execution_summary.verification_failures,
+                        final_bundle_verified: outcome.execution_summary.final_bundle_verified,
+                        applied: outcome.execution_summary.applied,
+                        error: None,
+                    });
+                    copy_if_exists(
+                        &outcome.artifact_root.join("diff.patch"),
+                        &artifact_root.join("repair").join("diff.patch"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("execution-summary.json"),
+                        &artifact_root.join("repair").join("execution-summary.json"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("final-verification.json"),
+                        &artifact_root.join("repair").join("final-verification.json"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("metadata.json"),
+                        &artifact_root.join("repair").join("metadata.json"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("plan.json"),
+                        &artifact_root.join("repair").join("plan.json"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("grounded-context.json"),
+                        &artifact_root.join("repair").join("grounded-context.json"),
+                    )?;
+
+                    println!(
+                        "Repair attempt cost: ${:.4} | budget remaining: ${:.4}",
+                        outcome.total_cost_usd, outcome.budget_remaining_usd
+                    );
+                    println!("Re-running watch command after repair...");
+                    let rerun = run_watch_command(command, project_root)?;
+                    replay_watch_command_output("confirmation", &rerun);
+                    let rerun_success = rerun.success;
+                    confirmation_run = Some(rerun);
+                    decision = if rerun_success {
+                        "repaired_and_verified".to_string()
+                    } else if outcome.execution_summary.applied {
+                        "repair_applied_but_command_still_failing".to_string()
+                    } else {
+                        "repair_not_applied".to_string()
+                    };
+                }
+                Err(err) => {
+                    repair_record = Some(WatchRepairRecord {
+                        supported: true,
+                        verifier_command: Some(target.verifier_command.clone()),
+                        fix_artifact_root: None,
+                        accepted_steps: 0,
+                        rejected_steps: 0,
+                        verification_failures: 0,
+                        final_bundle_verified: false,
+                        applied: false,
+                        error: Some(err.to_string()),
+                    });
+                    decision = "repair_flow_failed".to_string();
+                }
+            }
+        } else {
+            repair_record = Some(WatchRepairRecord {
+                supported: false,
+                verifier_command: None,
+                fix_artifact_root: None,
+                accepted_steps: 0,
+                rejected_steps: 0,
+                verification_failures: 0,
+                final_bundle_verified: false,
+                applied: false,
+                error: Some(
+                    "auto-repair currently supports direct Rust verifier commands: cargo test, cargo check, cargo clippy"
+                        .to_string(),
+                ),
+            });
+            decision = "repair_not_supported".to_string();
+        }
+    }
+
+    let finished_at = Utc::now();
+    let record = WatchRunRecord {
+        command: command.to_string(),
+        repair_requested: repair,
+        decision,
+        initial_run,
+        confirmation_run,
+        repair: repair_record,
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+
+    write_json_artifact(&artifact_root.join("watch.json"), &record)?;
+    write_watch_output_artifacts(&artifact_root, &record)?;
+
+    Ok(WatchCycleOutcome {
+        artifact_root,
+        record,
+    })
 }
 
 fn store_assessments(
@@ -812,6 +1144,12 @@ struct FixRunMetadata {
     finished_at: String,
     duration_ms: u64,
     planner_schema_version: String,
+    grounding_schema_version: String,
+    grounding_rounds: usize,
+    grounding_tool_calls: usize,
+    grounding_collected: bool,
+    grounding_cost_usd: f64,
+    planner_estimated_cost_usd: f64,
     final_bundle_verified: bool,
     applied: bool,
     sandbox_run_root: Option<String>,
@@ -1111,12 +1449,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Watch { command, repair } => {
-            println!("Watching: {command}");
-            if repair {
-                println!("Auto-repair enabled.");
-            }
-            println!("(Watch mode not yet fully implemented in v0.1)");
-            // TODO: implement watch loop in v0.2
+            let (config, db, root) = load_project()?;
+            cmd_watch(&config, &db, &root, &command, repair).await?;
         }
 
         Commands::Config { action } => match action {
@@ -1188,6 +1522,289 @@ fn build_verify_config(config: &MercuryConfig) -> VerifyConfig {
     }
 }
 
+fn build_watch_verify_config(config: &MercuryConfig, target: &RustRepairTarget) -> VerifyConfig {
+    let mut verify_config = build_verify_config(config);
+    match target.mode {
+        RustRepairMode::TestLike => {
+            verify_config.test_after_write = true;
+            verify_config.test_command = target.verifier_command.clone();
+            verify_config.lint_after_write = false;
+        }
+        RustRepairMode::Lint => {
+            verify_config.test_after_write = false;
+            verify_config.lint_after_write = true;
+            verify_config.lint_command = target.verifier_command.clone();
+        }
+    }
+    verify_config
+}
+
+fn classify_rust_repair_command(command: &str) -> Option<RustRepairTarget> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || failure_parser::contains_shell_composition(trimmed) {
+        return None;
+    }
+
+    let command_parts = failure_parser::parse_command_parts(trimmed);
+    let command_kind = failure_parser::classify_cargo_command(&command_parts);
+    let mode = match command_kind {
+        CargoCommandKind::Test | CargoCommandKind::Check => RustRepairMode::TestLike,
+        CargoCommandKind::Clippy => RustRepairMode::Lint,
+        CargoCommandKind::Unknown => return None,
+    };
+
+    Some(RustRepairTarget {
+        verifier_command: trimmed.to_string(),
+        mode,
+    })
+}
+
+fn build_watch_repair_description(command: &str, result: &WatchCommandResult) -> String {
+    let mut description = format!(
+        "Repair the repository so the Rust verifier command `{command}` succeeds.\nExit code: {}.\nFocus only on the changes needed to make that command pass.\n",
+        result
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+
+    let stderr = truncate_watch_output(&result.stderr, 6000);
+    if !stderr.is_empty() {
+        description.push_str("\nCommand stderr:\n");
+        description.push_str(&stderr);
+        description.push('\n');
+    }
+
+    let stdout = truncate_watch_output(&result.stdout, 4000);
+    if !stdout.is_empty() {
+        description.push_str("\nCommand stdout:\n");
+        description.push_str(&stdout);
+        description.push('\n');
+    }
+
+    if let Some(parsed_failure) = result.parsed_failure.as_ref() {
+        let parsed =
+            serde_json::to_string_pretty(parsed_failure).unwrap_or_else(|_| "{}".to_string());
+        description.push_str("\nStructured parsed failure:\n");
+        description.push_str(&parsed);
+        description.push('\n');
+    }
+
+    let tool_surface = failure_parser::repo_native_tool_surface()
+        .into_iter()
+        .map(|tool| format!("- {}: {}", tool.name, tool.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !tool_surface.is_empty() {
+        description
+            .push_str("\nRepo-native tool surface available to grounding and repair loop:\n");
+        description.push_str(&tool_surface);
+        description.push('\n');
+    }
+
+    description
+}
+
+fn truncate_watch_output(output: &str, max_chars: usize) -> String {
+    let trimmed = output.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let truncated: String = trimmed.chars().take(max_chars).collect();
+    format!("{truncated}\n...[truncated]")
+}
+
+fn run_watch_command(command: &str, working_dir: &Path) -> Result<WatchCommandResult> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = run_watch_command_with_shell(&shell, command, working_dir)
+        .or_else(|_| run_watch_command_with_shell("/bin/sh", command, working_dir))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let parsed_failure = if output.status.success() {
+        None
+    } else {
+        parse_supported_watch_failure(command, &stdout, &stderr)
+    };
+
+    Ok(WatchCommandResult {
+        command: command.to_string(),
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+        parsed_failure,
+    })
+}
+
+fn parse_supported_watch_failure(
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+) -> Option<mercury_cli::failure_parser::ParsedFailureReport> {
+    if failure_parser::contains_shell_composition(command) {
+        return None;
+    }
+    let parts = failure_parser::parse_command_parts(command);
+    let command_kind = failure_parser::classify_cargo_command(&parts);
+    if matches!(command_kind, CargoCommandKind::Unknown) {
+        return None;
+    }
+    Some(failure_parser::parse_cargo_failure(&parts, stdout, stderr))
+}
+
+fn run_watch_command_with_shell(
+    shell: &str,
+    command: &str,
+    working_dir: &Path,
+) -> Result<std::process::Output> {
+    Command::new(shell)
+        .arg("-lc")
+        .arg(command)
+        .current_dir(working_dir)
+        .output()
+        .with_context(|| format!("failed to execute watch command with shell `{shell}`"))
+}
+
+fn replay_watch_command_output(label: &str, result: &WatchCommandResult) {
+    let status = result
+        .exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".to_string());
+    println!(
+        "[watch:{label}] exit={status} success={}",
+        if result.success { "true" } else { "false" }
+    );
+    if !result.stdout.is_empty() {
+        print!("{}", result.stdout);
+    }
+    if !result.stderr.is_empty() {
+        eprint!("{}", result.stderr);
+    }
+}
+
+fn print_watch_cycle_result(outcome: &WatchCycleOutcome) {
+    println!("Decision: {}", outcome.record.decision);
+    println!("Artifact bundle: {}", outcome.artifact_root.display());
+    if let Some(repair) = outcome.record.repair.as_ref() {
+        if let Some(verifier_command) = repair.verifier_command.as_ref() {
+            println!("Targeted verifier: {verifier_command}");
+        }
+        if let Some(path) = repair.fix_artifact_root.as_ref() {
+            println!("Repair run artifacts: {path}");
+        }
+        if let Some(error) = repair.error.as_ref() {
+            println!("Repair note: {error}");
+        }
+    }
+}
+
+fn write_watch_output_artifacts(artifact_root: &Path, record: &WatchRunRecord) -> Result<()> {
+    atomic_write_string(
+        &artifact_root.join("initial.stdout.txt"),
+        &record.initial_run.stdout,
+    )?;
+    atomic_write_string(
+        &artifact_root.join("initial.stderr.txt"),
+        &record.initial_run.stderr,
+    )?;
+    if let Some(parsed_failure) = record.initial_run.parsed_failure.as_ref() {
+        write_json_artifact(&artifact_root.join("initial.failure.json"), parsed_failure)?;
+    }
+    if let Some(confirmation) = record.confirmation_run.as_ref() {
+        atomic_write_string(
+            &artifact_root.join("confirmation.stdout.txt"),
+            &confirmation.stdout,
+        )?;
+        atomic_write_string(
+            &artifact_root.join("confirmation.stderr.txt"),
+            &confirmation.stderr,
+        )?;
+        if let Some(parsed_failure) = confirmation.parsed_failure.as_ref() {
+            write_json_artifact(
+                &artifact_root.join("confirmation.failure.json"),
+                parsed_failure,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn capture_repo_watch_snapshot(project_root: &Path) -> Result<RepoWatchSnapshot> {
+    let mut files = BTreeMap::new();
+    collect_repo_watch_snapshot(project_root, project_root, &mut files)?;
+    Ok(RepoWatchSnapshot(files))
+}
+
+fn collect_repo_watch_snapshot(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<PathBuf, RepoFileFingerprint>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).unwrap_or(path.as_path());
+
+        if should_skip_watch_path(relative) {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_repo_watch_snapshot(root, &path, files)?;
+        } else if metadata.is_file() {
+            let modified_unix_nanos = metadata
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            files.insert(
+                relative.to_path_buf(),
+                RepoFileFingerprint {
+                    modified_unix_nanos,
+                    len: metadata.len(),
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_watch_path(relative: &Path) -> bool {
+    let relative = relative.to_string_lossy();
+    relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative == ".mercury"
+        || relative.starts_with(".mercury/")
+}
+
+async fn wait_for_repo_change(
+    project_root: &Path,
+    baseline: &mut RepoWatchSnapshot,
+) -> Result<bool> {
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Stopping watch.");
+                return Ok(false);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(750)) => {
+                let current = capture_repo_watch_snapshot(project_root)?;
+                if &current != baseline {
+                    *baseline = current;
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
 async fn verify_and_accept_patch(
     verifier: &Verifier<Mercury2Client>,
     file: &Path,
@@ -1219,6 +1836,7 @@ async fn verify_and_accept_patch(
         "test": verification.test_ok,
         "lint": verification.lint_ok,
         "critique": verification.critique,
+        "command_results": verification.command_results,
         "errors": verification.errors,
     });
     anyhow::bail!(
@@ -1232,6 +1850,51 @@ async fn verify_and_accept_patch(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn sample_config() -> MercuryConfig {
+        MercuryConfig {
+            api: ApiConfig {
+                mercury2_endpoint: "https://example.invalid/chat".to_string(),
+                mercury_edit_endpoint: "https://example.invalid/edit".to_string(),
+                api_key_env: "INCEPTION_API_KEY".to_string(),
+            },
+            scheduler: SchedulerConfigToml {
+                max_concurrency: 2,
+                max_cost_per_command: 3.0,
+                max_agents_per_command: 2,
+                retry_limit: 2,
+                backoff_base_ms: 100,
+            },
+            thermal: ThermalConfig {
+                decay_half_life_seconds: 60.0,
+                aggregation_method: "max".to_string(),
+                rescan_on_git_pull: false,
+                hot_threshold: 0.7,
+                cool_threshold: 0.3,
+                lock_cool_zones: true,
+            },
+            annealing: AnnealingConfig {
+                enable_global_momentum: true,
+                initial_temperature: 1.0,
+                cooling_rate: 0.9,
+                min_modification_threshold: 0.1,
+            },
+            verification: VerificationConfig {
+                parse_before_write: true,
+                test_after_write: true,
+                lint_after_write: true,
+                mercury2_critique_on_failure: false,
+                test_command: "cargo test".to_string(),
+                lint_command: "cargo clippy".to_string(),
+            },
+            constitutional: ConstitutionalConfig {
+                style_guide: String::new(),
+                architecture_rules: String::new(),
+                naming_conventions: String::new(),
+            },
+            repo: RepoConfig::default(),
+        }
+    }
 
     fn verification_config_that_fails() -> VerifyConfig {
         VerifyConfig {
@@ -1258,5 +1921,68 @@ mod tests {
         assert!(result.is_err());
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(after, original);
+    }
+
+    #[test]
+    fn classify_rust_repair_command_supports_env_prefixes_and_toolchains() {
+        let target =
+            classify_rust_repair_command("RUST_BACKTRACE=1 cargo +nightly test -p mercury-cli")
+                .unwrap();
+        assert_eq!(
+            target.verifier_command,
+            "RUST_BACKTRACE=1 cargo +nightly test -p mercury-cli"
+        );
+        assert_eq!(target.mode, RustRepairMode::TestLike);
+    }
+
+    #[test]
+    fn classify_rust_repair_command_supports_env_wrapper_prefixes() {
+        let target = classify_rust_repair_command("env RUST_BACKTRACE=1 cargo test --quiet")
+            .expect("env wrapper command should be supported");
+        assert_eq!(target.mode, RustRepairMode::TestLike);
+
+        let clippy_target =
+            classify_rust_repair_command("env -i RUSTFLAGS=-Dwarnings cargo clippy")
+                .expect("env wrapper clippy command should be supported");
+        assert_eq!(clippy_target.mode, RustRepairMode::Lint);
+    }
+
+    #[test]
+    fn classify_rust_repair_command_rejects_shell_composition() {
+        assert!(classify_rust_repair_command("cargo test && cargo clippy").is_none());
+        assert!(classify_rust_repair_command("cargo test | tee out.txt").is_none());
+    }
+
+    #[test]
+    fn build_watch_verify_config_targets_only_the_requested_rust_verifier() {
+        let config = sample_config();
+        let clippy_target = classify_rust_repair_command("cargo clippy --workspace").unwrap();
+        let clippy_verify = build_watch_verify_config(&config, &clippy_target);
+        assert!(!clippy_verify.test_after_write);
+        assert!(clippy_verify.lint_after_write);
+        assert_eq!(clippy_verify.lint_command, "cargo clippy --workspace");
+
+        let test_target = classify_rust_repair_command("cargo test -p mercury-cli").unwrap();
+        let test_verify = build_watch_verify_config(&config, &test_target);
+        assert!(test_verify.test_after_write);
+        assert!(!test_verify.lint_after_write);
+        assert_eq!(test_verify.test_command, "cargo test -p mercury-cli");
+    }
+
+    #[test]
+    fn capture_repo_watch_snapshot_ignores_mercury_internal_state() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("src");
+        let mercury_runs = temp.path().join(".mercury").join("runs");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&mercury_runs).unwrap();
+        std::fs::write(source.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(mercury_runs.join("watch.json"), "{}\n").unwrap();
+
+        let before = capture_repo_watch_snapshot(temp.path()).unwrap();
+        std::fs::write(mercury_runs.join("watch.json"), "{\"decision\":\"noop\"}\n").unwrap();
+        let after = capture_repo_watch_snapshot(temp.path()).unwrap();
+
+        assert_eq!(before, after);
     }
 }

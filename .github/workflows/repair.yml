@@ -1,0 +1,666 @@
+name: Mercury CI Auto-Repair Draft PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      failure_command:
+        description: Shell command expected to fail before repair; workflow records whether it passes after repair.
+        required: true
+        type: string
+      repair_goal:
+        description: Optional higher-level repair goal passed to `mercury-cli fix`.
+        required: false
+        type: string
+      source_ref:
+        description: Git ref or SHA to repair. Defaults to the triggering SHA.
+        required: false
+        type: string
+      base_ref:
+        description: Base branch to use if the workflow reaches the draft-PR step. Defaults to the triggering branch or repo default branch.
+        required: false
+        type: string
+      setup_command:
+        description: Optional setup command to run inside the isolated worktree before reproduction.
+        required: false
+        type: string
+      lint_command:
+        description: Optional secondary verifier to wire into `.mercury/config.toml`.
+        required: false
+        type: string
+      max_agents:
+        description: Maximum Mercury agents for this repair run.
+        required: false
+        default: 20
+        type: number
+      max_cost:
+        description: Maximum Mercury spend in USD for this repair run.
+        required: false
+        default: 0.5
+        type: number
+      artifact_retention_days:
+        description: Artifact retention window in days.
+        required: false
+        default: 14
+        type: number
+      dry_run:
+        description: Run the repair flow and upload evidence without attempting branch push or PR mutation.
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      failure_command:
+        required: true
+        type: string
+      repair_goal:
+        required: false
+        type: string
+      source_ref:
+        required: false
+        type: string
+      base_ref:
+        required: false
+        type: string
+      setup_command:
+        required: false
+        type: string
+      lint_command:
+        required: false
+        type: string
+      max_agents:
+        required: false
+        default: 20
+        type: number
+      max_cost:
+        required: false
+        default: 0.5
+        type: number
+      artifact_retention_days:
+        required: false
+        default: 14
+        type: number
+      dry_run:
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      INCEPTION_API_KEY:
+        required: false
+      MERCURY_API_KEY:
+        required: false
+      inception_api_key:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: repair-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  repair:
+    name: Repair failing verifier in isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      repair_status: ${{ steps.orchestrate.outputs.repair_status }}
+      repair_verified: ${{ steps.orchestrate.outputs.repair_verified }}
+      pr_branch: ${{ steps.orchestrate.outputs.pr_branch }}
+      base_ref: ${{ steps.orchestrate.outputs.base_ref }}
+      artifact_name: ${{ steps.orchestrate.outputs.artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Mercury CLI
+        run: cargo build --release --locked --bin mercury-cli
+
+      - name: Orchestrate isolated repair attempt
+        id: orchestrate
+        shell: bash
+        env:
+          FAILURE_COMMAND: ${{ inputs.failure_command }}
+          REPAIR_GOAL: ${{ inputs.repair_goal }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+          SETUP_COMMAND: ${{ inputs.setup_command }}
+          LINT_COMMAND: ${{ inputs.lint_command }}
+          MAX_AGENTS: ${{ inputs.max_agents }}
+          MAX_COST: ${{ inputs.max_cost }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INCEPTION_API_KEY: ${{ secrets.inception_api_key || secrets.INCEPTION_API_KEY || secrets.MERCURY_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
+          import shutil
+          import subprocess
+          import traceback
+          from pathlib import Path
+
+          def run_bash(command: str, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+              return subprocess.run(
+                  ["bash", "-lc", command],
+                  cwd=str(cwd),
+                  env=env,
+                  text=True,
+                  capture_output=True,
+              )
+
+          def git_output(args: list[str], cwd: Path) -> str:
+              return subprocess.check_output(args, cwd=str(cwd), text=True).strip()
+
+          def write_text(path: Path, content: str) -> None:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(content, encoding="utf-8")
+
+          def write_json(path: Path, payload: object) -> None:
+              write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+          def append_output(name: str, value: str) -> None:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                  handle.write(f"{name}<<__EOF__\n{value}\n__EOF__\n")
+
+          def load_json(path: Path) -> dict:
+              if not path.exists():
+                  return {}
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  return {}
+
+          def upsert_section_value(text: str, section: str, key: str, rendered_value: str) -> str:
+              section_pattern = re.compile(rf"(?ms)(^\[{re.escape(section)}\]\s*$)(.*?)(?=^\[|\Z)")
+              match = section_pattern.search(text)
+              replacement_line = f"{key} = {rendered_value}"
+              if match:
+                  body = match.group(2)
+                  key_pattern = re.compile(rf"(?m)^{re.escape(key)}\s*=.*$")
+                  if key_pattern.search(body):
+                      updated_body = key_pattern.sub(replacement_line, body, count=1)
+                  else:
+                      separator = "" if body.endswith("\n") or body == "" else "\n"
+                      updated_body = f"{body}{separator}{replacement_line}\n"
+                  return text[:match.start(2)] + updated_body + text[match.end(2):]
+              suffix = "" if text.endswith("\n") else "\n"
+              return f"{text}{suffix}\n[{section}]\n{replacement_line}\n"
+
+          def patch_mercury_config(config_path: Path, failure_command: str, lint_command: str | None) -> None:
+              text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+              text = upsert_section_value(text, "api", "api_key_env", json.dumps("INCEPTION_API_KEY"))
+              text = upsert_section_value(text, "verification", "test_after_write", "true")
+              text = upsert_section_value(text, "verification", "test_command", json.dumps(failure_command))
+              if lint_command:
+                  text = upsert_section_value(text, "verification", "lint_after_write", "true")
+                  text = upsert_section_value(text, "verification", "lint_command", json.dumps(lint_command))
+              else:
+                  text = upsert_section_value(text, "verification", "lint_after_write", "false")
+              write_text(config_path, text)
+
+          repo_root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          runner_temp = Path(os.environ["RUNNER_TEMP"]).resolve()
+          run_key = f"{os.environ.get('GITHUB_RUN_ID', 'local')}-{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
+          run_root = runner_temp / f"mercury-repair-{run_key}"
+          artifact_dir = run_root / "artifact"
+          worktree_dir = run_root / "worktree"
+          logs_dir = artifact_dir / "logs"
+          artifact_name = f"mercury-repair-{run_key}"
+          artifact_dir.mkdir(parents=True, exist_ok=True)
+          logs_dir.mkdir(parents=True, exist_ok=True)
+          # Pre-create required evidence contract files so validation works for all terminal states.
+          write_json(
+              artifact_dir / "decision.json",
+              {
+                  "status": "internal_error",
+                  "baseline_reproduced": False,
+                  "repair_verified": False,
+                  "final_bundle_verified": False,
+                  "applied": False,
+                  "post_verify_exit": None,
+                  "diff_bytes": 0,
+                  "pr_branch": "",
+              },
+          )
+          write_json(artifact_dir / "environment.json", {})
+          write_text(
+              artifact_dir / "summary.md",
+              "# Mercury CI Repair\n\n- Status: `internal_error`\n- Run did not finish orchestration.\n",
+          )
+          write_text(
+              artifact_dir / "pr-body.md",
+              "## Mercury CI Auto-Repair\n\nThis run did not produce a PR-ready patch.\n",
+          )
+          write_text(artifact_dir / "repair.diff", "")
+          write_text(artifact_dir / "repair.diffstat.txt", "")
+          write_text(logs_dir / "baseline.stdout.log", "")
+          write_text(logs_dir / "baseline.stderr.log", "")
+
+          status = "internal_error"
+          baseline_reproduced = False
+          repair_verified = False
+          final_bundle_verified = False
+          applied = False
+          post_verify_exit = None
+          diff_bytes = 0
+          source_sha = ""
+          run_dir = None
+          pr_branch = ""
+          pr_title = ""
+          commit_message = ""
+          base_ref = (os.environ.get("BASE_REF") or "").strip()
+          dry_run = False
+
+          try:
+              failure_command = (os.environ.get("FAILURE_COMMAND") or "").strip()
+              if not failure_command:
+                  raise RuntimeError("failure_command input is required")
+
+              repair_goal = (os.environ.get("REPAIR_GOAL") or "").strip()
+              if not repair_goal:
+                  repair_goal = f"Repair the repository so this verifier command passes: {failure_command}"
+
+              source_ref = (os.environ.get("SOURCE_REF") or "").strip() or os.environ.get("GITHUB_SHA", "HEAD")
+              source_sha = git_output(["git", "rev-parse", source_ref], repo_root)
+              dry_run = (os.environ.get("DRY_RUN") or "").strip().lower() == "true"
+
+              current_ref_name = os.environ.get("GITHUB_REF_NAME", "").strip()
+              current_ref_type = os.environ.get("GITHUB_REF_TYPE", "").strip()
+              default_branch = (os.environ.get("DEFAULT_BRANCH") or "main").strip() or "main"
+              if not base_ref:
+                  if current_ref_type == "branch" and current_ref_name:
+                      base_ref = current_ref_name
+                  else:
+                      base_ref = default_branch
+
+              run_suffix = source_sha[:12]
+              pr_branch = f"mercury/repair/{run_suffix}-{run_key}"
+              pr_title = f"Mercury repair: make `{failure_command}` pass"
+              if len(pr_title) > 120:
+                  pr_title = pr_title[:117] + "..."
+              commit_message = f"mercury: automated repair for {source_sha[:12]}"
+
+              env = os.environ.copy()
+              api_key = (os.environ.get("INCEPTION_API_KEY") or "").strip()
+              if api_key:
+                  env["INCEPTION_API_KEY"] = api_key
+                  env.setdefault("MERCURY_API_KEY", api_key)
+
+              if worktree_dir.exists():
+                  shutil.rmtree(worktree_dir)
+              subprocess.check_call(["git", "worktree", "add", "--detach", str(worktree_dir), source_sha], cwd=repo_root)
+
+              setup_command = (os.environ.get("SETUP_COMMAND") or "").strip()
+              if setup_command:
+                  setup_result = run_bash(setup_command, worktree_dir, env)
+                  write_text(logs_dir / "setup.stdout.log", setup_result.stdout)
+                  write_text(logs_dir / "setup.stderr.log", setup_result.stderr)
+                  if setup_result.returncode != 0:
+                      status = "setup_failed"
+                      raise RuntimeError(f"setup command failed with exit code {setup_result.returncode}")
+
+              baseline = run_bash(failure_command, worktree_dir, env)
+              write_text(logs_dir / "baseline.stdout.log", baseline.stdout)
+              write_text(logs_dir / "baseline.stderr.log", baseline.stderr)
+              baseline_reproduced = baseline.returncode != 0
+              if not baseline_reproduced:
+                  status = "baseline_not_reproduced"
+              elif not api_key:
+                  status = "missing_api_key"
+              else:
+                  mercury_bin = repo_root / "target" / "release" / "mercury-cli"
+                  init_result = run_bash(f"{shlex.quote(str(mercury_bin))} init", worktree_dir, env)
+                  write_text(logs_dir / "mercury-init.stdout.log", init_result.stdout)
+                  write_text(logs_dir / "mercury-init.stderr.log", init_result.stderr)
+                  if init_result.returncode != 0:
+                      raise RuntimeError(f"mercury init failed with exit code {init_result.returncode}")
+
+                  config_path = worktree_dir / ".mercury" / "config.toml"
+                  patch_mercury_config(
+                      config_path,
+                      failure_command=failure_command,
+                      lint_command=(os.environ.get("LINT_COMMAND") or "").strip() or None,
+                  )
+
+                  max_agents = str(os.environ.get("MAX_AGENTS") or "20")
+                  max_cost = str(os.environ.get("MAX_COST") or "0.5")
+                  repair_cmd = (
+                      f"{shlex.quote(str(mercury_bin))} fix {shlex.quote(repair_goal)} "
+                      f"--max-agents {shlex.quote(max_agents)} --max-cost {shlex.quote(max_cost)}"
+                  )
+                  repair = run_bash(repair_cmd, worktree_dir, env)
+                  write_text(logs_dir / "repair.stdout.log", repair.stdout)
+                  write_text(logs_dir / "repair.stderr.log", repair.stderr)
+
+                  runs_root = worktree_dir / ".mercury" / "runs"
+                  if runs_root.exists():
+                      run_dirs = sorted(
+                          [path for path in runs_root.iterdir() if path.is_dir()],
+                          key=lambda path: path.stat().st_mtime,
+                          reverse=True,
+                      )
+                      if run_dirs:
+                          run_dir = run_dirs[0]
+                          shutil.copytree(run_dir, artifact_dir / "mercury-run", dirs_exist_ok=True)
+
+                  metadata = load_json((run_dir / "metadata.json") if run_dir else Path("/dev/null"))
+                  execution_summary = load_json((run_dir / "execution-summary.json") if run_dir else Path("/dev/null"))
+                  final_bundle_verified = bool(
+                      metadata.get("final_bundle_verified", execution_summary.get("final_bundle_verified", False))
+                  )
+                  applied = bool(metadata.get("applied", execution_summary.get("applied", False)))
+
+                  post_verify = run_bash(failure_command, worktree_dir, env)
+                  write_text(logs_dir / "post-repair.stdout.log", post_verify.stdout)
+                  write_text(logs_dir / "post-repair.stderr.log", post_verify.stderr)
+                  post_verify_exit = post_verify.returncode
+
+                  diff_result = run_bash(
+                      f"git diff --binary {shlex.quote(source_sha)} -- . ':(exclude).mercury'",
+                      worktree_dir,
+                      env,
+                  )
+                  diff_text = diff_result.stdout
+                  diff_bytes = len(diff_text.encode("utf-8"))
+                  write_text(artifact_dir / "repair.diff", diff_text)
+                  diff_stat = run_bash(
+                      f"git diff --stat {shlex.quote(source_sha)} -- . ':(exclude).mercury'",
+                      worktree_dir,
+                      env,
+                  )
+                  write_text(artifact_dir / "repair.diffstat.txt", diff_stat.stdout)
+                  git_status = run_bash("git status --short", worktree_dir, env)
+                  write_text(artifact_dir / "git-status.txt", git_status.stdout)
+
+                  repair_verified = all(
+                      [
+                          baseline_reproduced,
+                          final_bundle_verified,
+                          applied,
+                          post_verify.returncode == 0,
+                          bool(diff_text.strip()),
+                      ]
+                  )
+                  status = "verified_patch_ready" if repair_verified else "repair_not_verified"
+
+              environment_payload = {
+                  "repository": os.environ.get("GITHUB_REPOSITORY"),
+                  "run_id": os.environ.get("GITHUB_RUN_ID"),
+                  "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                  "workflow": os.environ.get("GITHUB_WORKFLOW"),
+                  "actor": os.environ.get("GITHUB_ACTOR"),
+                  "dry_run": dry_run,
+                  "source_ref": source_ref,
+                  "source_sha": source_sha,
+                  "base_ref": base_ref,
+                  "failure_command": failure_command,
+                  "repair_goal": repair_goal,
+                  "setup_command": setup_command,
+                  "lint_command": (os.environ.get("LINT_COMMAND") or "").strip() or None,
+                  "max_agents": os.environ.get("MAX_AGENTS"),
+                  "max_cost": os.environ.get("MAX_COST"),
+                  "worktree_dir": str(worktree_dir),
+                  "mercury_run_dir": str(run_dir) if run_dir else None,
+              }
+              decision_payload = {
+                  "status": status,
+                  "baseline_reproduced": baseline_reproduced,
+                  "repair_verified": repair_verified,
+                  "final_bundle_verified": final_bundle_verified,
+                  "applied": applied,
+                  "dry_run": dry_run,
+                  "post_verify_exit": post_verify_exit,
+                  "diff_bytes": diff_bytes,
+                  "pr_branch": pr_branch,
+                  "pr_title": pr_title,
+                  "commit_message": commit_message,
+              }
+              write_json(artifact_dir / "environment.json", environment_payload)
+              write_json(artifact_dir / "decision.json", decision_payload)
+
+              summary_lines = [
+                  "# Mercury CI Repair",
+                  "",
+                  f"- Status: `{status}`",
+                  f"- Source SHA: `{source_sha or 'unknown'}`",
+                  f"- Base ref: `{base_ref}`",
+                  f"- Failure command: `{failure_command}`",
+                  f"- Baseline reproduced: `{str(baseline_reproduced).lower()}`",
+                  f"- Final bundle verified: `{str(final_bundle_verified).lower()}`",
+                  f"- Patch applied: `{str(applied).lower()}`",
+                  f"- Dry run: `{str(dry_run).lower()}`",
+                  f"- Post-repair verifier exit: `{post_verify_exit if post_verify_exit is not None else 'n/a'}`",
+                  f"- Non-.mercury diff bytes: `{diff_bytes}`",
+                  f"- Proposed branch: `{pr_branch}`",
+                  f"- Draft PR eligible: `{str(repair_verified).lower()}`",
+                  "- Draft PR mutation is only attempted after a verified repair when `dry_run=false` and the workflow can push to the same repository.",
+                  f"- Mercury run directory: `{run_dir.name if run_dir else 'none'}`",
+              ]
+              write_text(artifact_dir / "summary.md", "\n".join(summary_lines) + "\n")
+
+              pr_body_lines = [
+                  "## Mercury CI Auto-Repair",
+                  "",
+                  "If this run reaches the draft-PR mutation step, this body accompanies the PR opened or updated by the `Mercury CI Auto-Repair Draft PR` workflow after reproducing a failing verifier in an isolated git worktree.",
+                  "",
+                  f"- Failure command: `{failure_command}`",
+                  f"- Repair goal: `{repair_goal}`",
+                  f"- Source SHA: `{source_sha or 'unknown'}`",
+                  f"- Base ref: `{base_ref}`",
+                  f"- Baseline reproduced: `{str(baseline_reproduced).lower()}`",
+                  f"- Final bundle verified: `{str(final_bundle_verified).lower()}`",
+                  f"- Mercury applied a patch: `{str(applied).lower()}`",
+                  f"- Dry run: `{str(dry_run).lower()}`",
+                  f"- Post-repair verifier exit: `{post_verify_exit if post_verify_exit is not None else 'n/a'}`",
+                  "- Evidence bundle: __ARTIFACT_URL__",
+                  "",
+                  "### Review notes",
+                  "",
+                  "- The presence of `pr-body.md` in the artifact bundle does not mean the workflow actually created or updated a PR.",
+                  "- The patch was generated and verified in CI, not applied directly to the default branch.",
+                  "- `.mercury/` state is excluded from the commit; only repo file changes are pushed.",
+                  "- Inspect `repair.diff`, the copied `mercury-run/` bundle, and verifier logs before merging.",
+              ]
+              write_text(artifact_dir / "pr-body.md", "\n".join(pr_body_lines) + "\n")
+
+          except Exception:
+              trace = traceback.format_exc()
+              write_text(artifact_dir / "internal-error.txt", trace)
+              if status == "internal_error":
+                  write_json(
+                      artifact_dir / "decision.json",
+                      {
+                          "status": status,
+                          "baseline_reproduced": baseline_reproduced,
+                          "repair_verified": repair_verified,
+                          "final_bundle_verified": final_bundle_verified,
+                          "applied": applied,
+                          "post_verify_exit": post_verify_exit,
+                          "diff_bytes": diff_bytes,
+                          "pr_branch": pr_branch,
+                      },
+                  )
+                  write_text(
+                      artifact_dir / "summary.md",
+                      "# Mercury CI Repair\n\n"
+                      f"- Status: `{status}`\n"
+                      "- The workflow hit an internal orchestration error before finishing.\n"
+                      "- See `internal-error.txt` in this artifact bundle.\n",
+                  )
+                  write_text(
+                      artifact_dir / "pr-body.md",
+                      "## Mercury CI Auto-Repair\n\n"
+                      "This run did not produce a PR-ready patch, so the workflow did not reach the draft-PR mutation step. See the artifact bundle for details.\n",
+                  )
+          finally:
+              append_output("artifact_dir", str(artifact_dir))
+              append_output("artifact_name", artifact_name)
+              append_output("repair_worktree", str(worktree_dir))
+              append_output("repair_status", status)
+              append_output("repair_verified", str(repair_verified).lower())
+              append_output("baseline_reproduced", str(baseline_reproduced).lower())
+              append_output("source_sha", source_sha)
+              append_output("pr_branch", pr_branch)
+              append_output("base_ref", base_ref)
+              append_output("pr_title", pr_title)
+              append_output("commit_message", commit_message)
+              append_output("pr_body_path", str(artifact_dir / "pr-body.md"))
+          PY
+
+      - name: Upload evidence bundle
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.orchestrate.outputs.artifact_name }}
+          path: ${{ steps.orchestrate.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Validate evidence bundle contract
+        if: always()
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ steps.orchestrate.outputs.artifact_dir }}
+        run: |
+          set -euo pipefail
+          test -f "$ARTIFACT_DIR/summary.md"
+          test -f "$ARTIFACT_DIR/decision.json"
+          test -f "$ARTIFACT_DIR/environment.json"
+          test -f "$ARTIFACT_DIR/pr-body.md"
+          test -f "$ARTIFACT_DIR/repair.diff"
+          test -f "$ARTIFACT_DIR/repair.diffstat.txt"
+          test -f "$ARTIFACT_DIR/logs/baseline.stdout.log"
+          test -f "$ARTIFACT_DIR/logs/baseline.stderr.log"
+
+      - name: Publish run summary
+        if: always()
+        shell: bash
+        run: cat "${{ steps.orchestrate.outputs.artifact_dir }}/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push repair branch when eligible
+        if: steps.orchestrate.outputs.repair_verified == 'true' && inputs.dry_run != true
+        shell: bash
+        env:
+          WORKTREE: ${{ steps.orchestrate.outputs.repair_worktree }}
+          PR_BRANCH: ${{ steps.orchestrate.outputs.pr_branch }}
+          COMMIT_MESSAGE: ${{ steps.orchestrate.outputs.commit_message }}
+        run: |
+          set -euo pipefail
+          rm -rf "$WORKTREE/.mercury"
+          git -C "$WORKTREE" checkout -B "$PR_BRANCH"
+          git -C "$WORKTREE" config user.name "mercury-ci[bot]"
+          git -C "$WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$WORKTREE" add -A
+          if git -C "$WORKTREE" diff --cached --quiet; then
+            echo "Verified repair produced no committable diff" >&2
+            exit 1
+          fi
+          git -C "$WORKTREE" commit -m "$COMMIT_MESSAGE"
+          git -C "$WORKTREE" push --force-with-lease origin "HEAD:refs/heads/$PR_BRANCH"
+
+      - name: Open or update draft PR when eligible
+        if: steps.orchestrate.outputs.repair_verified == 'true' && inputs.dry_run != true
+        uses: actions/github-script@v7
+        env:
+          PR_BRANCH: ${{ steps.orchestrate.outputs.pr_branch }}
+          BASE_REF: ${{ steps.orchestrate.outputs.base_ref }}
+          PR_TITLE: ${{ steps.orchestrate.outputs.pr_title }}
+          PR_BODY_FILE: ${{ steps.orchestrate.outputs.pr_body_path }}
+          ARTIFACT_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts/${{ steps.upload.outputs.artifact-id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const core = require('@actions/core');
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const head = `${owner}:${process.env.PR_BRANCH}`;
+            const base = process.env.BASE_REF;
+            let body = fs.readFileSync(process.env.PR_BODY_FILE, 'utf8');
+            body = body.replace('__ARTIFACT_URL__', process.env.ARTIFACT_URL);
+
+            const { data: pulls } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head,
+              base,
+              per_page: 10,
+            });
+
+            if (pulls.length > 0) {
+              const pr = pulls[0];
+              await github.rest.pulls.update({
+                owner,
+                repo,
+                pull_number: pr.number,
+                title: process.env.PR_TITLE,
+                body,
+                base,
+              });
+              if (!pr.draft) {
+                await github.graphql(
+                  `mutation($pullRequestId: ID!) {
+                    convertPullRequestToDraft(input: { pullRequestId: $pullRequestId }) {
+                      pullRequest {
+                        number
+                        isDraft
+                      }
+                    }
+                  }`,
+                  { pullRequestId: pr.node_id },
+                );
+              }
+              core.notice(`Updated draft PR #${pr.number}`);
+            } else {
+              const { data: pr } = await github.rest.pulls.create({
+                owner,
+                repo,
+                head: process.env.PR_BRANCH,
+                base,
+                title: process.env.PR_TITLE,
+                body,
+                draft: true,
+              });
+              core.notice(`Created draft PR #${pr.number}`);
+            }
+
+      - name: Remove isolated worktree
+        if: always()
+        shell: bash
+        env:
+          WORKTREE: ${{ steps.orchestrate.outputs.repair_worktree }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$WORKTREE" && -d "$WORKTREE" ]]; then
+            git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"
+          fi
+
+      - name: Fail on blocking orchestration errors
+        if: always()
+        shell: bash
+        env:
+          REPAIR_STATUS: ${{ steps.orchestrate.outputs.repair_status }}
+        run: |
+          set -euo pipefail
+          case "$REPAIR_STATUS" in
+            verified_patch_ready|repair_not_verified)
+              ;;
+            *)
+              echo "Blocking repair status: $REPAIR_STATUS" >&2
+              exit 1
+              ;;
+          esac

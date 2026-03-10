@@ -255,7 +255,47 @@ struct JsonSchemaFormat {
     schema: Value,
 }
 
+/// OpenAI-compatible tool definition for Mercury chat requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunctionDefinition,
+}
+
+/// Function metadata attached to a [`ToolDefinition`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolFunctionDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: Value,
+}
+
+/// OpenAI-compatible `tool_choice` request parameter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Mode(String),
+    Function(ToolChoiceFunction),
+}
+
+/// Select a specific function tool by name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolChoiceFunction {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolChoiceFunctionName,
+}
+
+/// Function name wrapper for [`ToolChoiceFunction`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolChoiceFunctionName {
+    pub name: String,
+}
+
 /// The top-level chat completion request body.
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -265,6 +305,10 @@ struct ChatRequest {
     response_format: Option<ResponseFormat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ToolChoice>,
 }
 
 /// Token usage counters embedded in a chat completion response.
@@ -294,6 +338,31 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+}
+
+/// OpenAI-compatible tool call emitted by the model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolCallFunction,
+}
+
+/// Function call metadata emitted in a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl ToolCallFunction {
+    /// Parse JSON arguments emitted for this tool call.
+    pub fn parse_arguments(&self) -> Result<Value, ApiError> {
+        Ok(serde_json::from_str(&self.arguments)?)
+    }
 }
 
 /// The top-level chat completion response.
@@ -609,13 +678,15 @@ async fn post_json_with_retry_raw(
     }
 }
 
-fn parse_chat_response(raw: &[u8]) -> Result<(String, ApiUsage), ApiError> {
+fn parse_chat_response_with_tools(
+    raw: &[u8],
+) -> Result<(String, Vec<ToolCall>, ApiUsage), ApiError> {
     let resp: ChatResponse = serde_json::from_slice(raw)?;
-    let content = resp
+    let (content, tool_calls) = resp
         .choices
         .into_iter()
         .next()
-        .and_then(|c| c.message.content)
+        .map(|c| (c.message.content.unwrap_or_default(), c.message.tool_calls))
         .unwrap_or_default();
     let usage = match resp.usage {
         Some(u) => ApiUsage {
@@ -624,6 +695,11 @@ fn parse_chat_response(raw: &[u8]) -> Result<(String, ApiUsage), ApiError> {
         },
         None => ApiUsage::default(),
     };
+    Ok((content, tool_calls, usage))
+}
+
+fn parse_chat_response(raw: &[u8]) -> Result<(String, ApiUsage), ApiError> {
+    let (content, _tool_calls, usage) = parse_chat_response_with_tools(raw)?;
     Ok((content, usage))
 }
 
@@ -678,6 +754,26 @@ pub trait Mercury2Api: Send + Sync {
         schema_name: &str,
         schema: Value,
     ) -> impl std::future::Future<Output = Result<(Value, ApiUsage), ApiError>> + Send;
+
+    /// Send a chat completion request with OpenAI-compatible tool definitions.
+    ///
+    /// The default implementation falls back to plain chat so existing mocks
+    /// can ignore tool support until they need to exercise the tool loop.
+    fn chat_with_tools(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        tools: Vec<ToolDefinition>,
+        tool_choice: Option<ToolChoice>,
+    ) -> impl std::future::Future<Output = Result<(String, Vec<ToolCall>, ApiUsage), ApiError>> + Send
+    {
+        async move {
+            let _ = (tools, tool_choice);
+            let (content, usage) = self.chat(system, user, max_tokens).await?;
+            Ok((content, Vec::new(), usage))
+        }
+    }
 }
 
 /// Trait abstracting Mercury Edit operations so callers can inject fakes.
@@ -858,14 +954,16 @@ impl Mercury2Client {
             .record_usage(usage, self.transport_config().budget_limit)
     }
 
-    async fn do_chat(
+    fn build_chat_request(
         &self,
         system: &str,
         user: &str,
         max_tokens: u32,
         response_format: Option<ResponseFormat>,
-    ) -> Result<(String, ApiUsage), ApiError> {
-        let body = ChatRequest {
+        tools: Option<Vec<ToolDefinition>>,
+        tool_choice: Option<ToolChoice>,
+    ) -> ChatRequest {
+        ChatRequest {
             model: self.model.clone(),
             messages: vec![
                 ChatMessage {
@@ -880,7 +978,19 @@ impl Mercury2Client {
             max_tokens,
             response_format,
             reasoning_effort: self.reasoning_effort,
-        };
+            tools,
+            tool_choice,
+        }
+    }
+
+    async fn do_chat(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        response_format: Option<ResponseFormat>,
+    ) -> Result<(String, ApiUsage), ApiError> {
+        let body = self.build_chat_request(system, user, max_tokens, response_format, None, None);
 
         let raw = post_json_with_retry_raw(
             &self.http,
@@ -903,8 +1013,46 @@ impl Mercury2Client {
             total_cost_usd = self.cumulative_cost(),
             "Mercury 2 call completed"
         );
-
         Ok((content, api_usage))
+    }
+
+    /// Send a chat request with OpenAI-compatible tool definitions and return
+    /// both assistant text and tool calls for a future repair loop.
+    pub async fn chat_with_tools(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        tools: Vec<ToolDefinition>,
+        tool_choice: Option<ToolChoice>,
+    ) -> Result<(String, Vec<ToolCall>, ApiUsage), ApiError> {
+        let body =
+            self.build_chat_request(system, user, max_tokens, None, Some(tools), tool_choice);
+
+        let raw = post_json_with_retry_raw(
+            &self.http,
+            &self.api_key,
+            &self.base_url,
+            &body,
+            self.transport_config(),
+            &self.transport_state,
+            "chat/completions",
+        )
+        .await?;
+
+        let (content, tool_calls, api_usage) = parse_chat_response_with_tools(&raw)?;
+        self.track_usage(&api_usage)?;
+
+        debug!(
+            tokens = api_usage.tokens_used,
+            cost_usd = api_usage.cost_usd,
+            total_tokens = self.cumulative_tokens(),
+            total_cost_usd = self.cumulative_cost(),
+            tool_calls = tool_calls.len(),
+            "Mercury 2 tool call completed"
+        );
+
+        Ok((content, tool_calls, api_usage))
     }
 }
 
@@ -958,6 +1106,17 @@ impl Mercury2Api for Mercury2Client {
     ) -> Result<(Value, ApiUsage), ApiError> {
         self.chat_with_json_schema(system, user, max_tokens, schema_name, schema)
             .await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        tools: Vec<ToolDefinition>,
+        tool_choice: Option<ToolChoice>,
+    ) -> Result<(String, Vec<ToolCall>, ApiUsage), ApiError> {
+        Mercury2Client::chat_with_tools(self, system, user, max_tokens, tools, tool_choice).await
     }
 }
 
@@ -1081,6 +1240,8 @@ impl MercuryEditClient {
             max_tokens: payload.max_tokens,
             response_format: None,
             reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -1094,6 +1255,8 @@ impl MercuryEditClient {
             max_tokens: 4096,
             response_format: None,
             reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 
@@ -1523,6 +1686,8 @@ mod tests {
                 planner_response_json_schema_v1(),
             )),
             reasoning_effort: Some(ReasoningEffort::Medium),
+            tools: None,
+            tool_choice: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialization should succeed in test");
@@ -1597,6 +1762,91 @@ mod tests {
         assert!(content.contains(
             "<|code_to_edit|>\nmod api;\n<|cursor|>\n1:1\n<|/cursor|>\n<|/code_to_edit|>"
         ));
+    }
+
+    #[test]
+    fn tool_call_request_serializes_tools_and_named_tool_choice() {
+        let request = ChatRequest {
+            model: MERCURY2_MODEL.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "fix failing tests".into(),
+            }],
+            max_tokens: 256,
+            response_format: None,
+            reasoning_effort: Some(ReasoningEffort::Low),
+            tools: Some(vec![ToolDefinition {
+                kind: "function".into(),
+                function: ToolFunctionDefinition {
+                    name: "run_tests".into(),
+                    description: Some("Run targeted tests".into()),
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"],
+                        "additionalProperties": false
+                    }),
+                },
+            }]),
+            tool_choice: Some(ToolChoice::Function(ToolChoiceFunction {
+                kind: "function".into(),
+                function: ToolChoiceFunctionName {
+                    name: "run_tests".into(),
+                },
+            })),
+        };
+
+        let body = serde_json::to_value(&request).expect("serialization should succeed in test");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "run_tests");
+        assert_eq!(body["tool_choice"]["type"], "function");
+        assert_eq!(body["tool_choice"]["function"]["name"], "run_tests");
+    }
+
+    #[test]
+    fn parse_chat_response_with_tools_extracts_tool_calls_and_usage() {
+        let raw = br#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"src/lib.rs\"}"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14,
+                "cached_input_tokens": 0
+            }
+        }"#;
+
+        let (content, tool_calls, usage) =
+            parse_chat_response_with_tools(raw).expect("parse should succeed in test");
+        assert_eq!(content, "");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_123");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            tool_calls[0]
+                .function
+                .parse_arguments()
+                .expect("valid json")["path"],
+            "src/lib.rs"
+        );
+        assert_eq!(usage.tokens_used, 14);
     }
 
     #[test]

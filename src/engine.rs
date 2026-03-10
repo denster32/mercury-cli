@@ -22,6 +22,10 @@ use crate::api::{
     ThermalAssessment, PLANNER_RESPONSE_SCHEMA_NAME, THERMAL_ANALYSIS_PROMPT,
 };
 use crate::db::{DbError, ThermalDb};
+use crate::failure_parser::{
+    classify_cargo_command, parse_cargo_failure, parse_command_parts, CargoCommandKind,
+    ParsedFailureReport,
+};
 use crate::repo::RepoError;
 use crate::thermal::{self, ThermalError};
 
@@ -296,11 +300,23 @@ impl<A: Mercury2Api> Verifier<A> {
         patched_content: &str,
         project_root: &Path,
     ) -> Result<VerifyResult, EngineError> {
+        self.verify_internal(file_path, patched_content, project_root, true)
+            .await
+    }
+
+    async fn verify_internal(
+        &self,
+        file_path: &Path,
+        patched_content: &str,
+        project_root: &Path,
+        allow_critique: bool,
+    ) -> Result<VerifyResult, EngineError> {
         let mut result = VerifyResult {
             parse_ok: true,
             test_ok: true,
             lint_ok: true,
             critique: None,
+            command_results: Vec::new(),
             errors: Vec::new(),
         };
 
@@ -331,12 +347,18 @@ impl<A: Mercury2Api> Verifier<A> {
         // Step 2: run tests
         if self.config.test_after_write {
             match self.run_command(&self.config.test_command, project_root) {
-                Ok(output) if output.success => {}
                 Ok(output) => {
-                    result.test_ok = false;
+                    let failed = !output.success;
+                    let failure_summary = output.failure_summary();
                     result
-                        .errors
-                        .push(format!("tests failed: {}", output.stderr));
+                        .command_results
+                        .push(VerifierCommandResult::from(&output));
+                    if failed {
+                        result.test_ok = false;
+                        result
+                            .errors
+                            .push(format!("tests failed: {failure_summary}"));
+                    }
                 }
                 Err(e) => {
                     result.test_ok = false;
@@ -348,12 +370,18 @@ impl<A: Mercury2Api> Verifier<A> {
         // Step 3: run linter
         if self.config.lint_after_write {
             match self.run_command(&self.config.lint_command, project_root) {
-                Ok(output) if output.success => {}
                 Ok(output) => {
-                    result.lint_ok = false;
+                    let failed = !output.success;
+                    let failure_summary = output.failure_summary();
                     result
-                        .errors
-                        .push(format!("lint failed: {}", output.stderr));
+                        .command_results
+                        .push(VerifierCommandResult::from(&output));
+                    if failed {
+                        result.lint_ok = false;
+                        result
+                            .errors
+                            .push(format!("lint failed: {failure_summary}"));
+                    }
                 }
                 Err(e) => {
                     result.lint_ok = false;
@@ -363,7 +391,7 @@ impl<A: Mercury2Api> Verifier<A> {
         }
 
         // Step 4: Mercury 2 critique on failure
-        if !result.is_ok() && self.config.mercury2_critique_on_failure {
+        if allow_critique && !result.is_ok() && self.config.mercury2_critique_on_failure {
             if let Some(ref api) = self.critique_api {
                 let critique = self
                     .get_critique(api, patched_content, &result.errors)
@@ -387,6 +415,7 @@ impl<A: Mercury2Api> Verifier<A> {
             test_ok: true,
             lint_ok: true,
             critique: None,
+            command_results: Vec::new(),
             errors: Vec::new(),
         };
 
@@ -414,12 +443,18 @@ impl<A: Mercury2Api> Verifier<A> {
 
         if self.config.test_after_write {
             match self.run_command(&self.config.test_command, workspace_root) {
-                Ok(output) if output.success => {}
                 Ok(output) => {
-                    result.test_ok = false;
+                    let failed = !output.success;
+                    let failure_summary = output.failure_summary();
                     result
-                        .errors
-                        .push(format!("tests failed in workspace: {}", output.stderr));
+                        .command_results
+                        .push(VerifierCommandResult::from(&output));
+                    if failed {
+                        result.test_ok = false;
+                        result
+                            .errors
+                            .push(format!("tests failed in workspace: {failure_summary}"));
+                    }
                 }
                 Err(err) => {
                     result.test_ok = false;
@@ -432,12 +467,18 @@ impl<A: Mercury2Api> Verifier<A> {
 
         if self.config.lint_after_write {
             match self.run_command(&self.config.lint_command, workspace_root) {
-                Ok(output) if output.success => {}
                 Ok(output) => {
-                    result.lint_ok = false;
+                    let failed = !output.success;
+                    let failure_summary = output.failure_summary();
                     result
-                        .errors
-                        .push(format!("lint failed in workspace: {}", output.stderr));
+                        .command_results
+                        .push(VerifierCommandResult::from(&output));
+                    if failed {
+                        result.lint_ok = false;
+                        result
+                            .errors
+                            .push(format!("lint failed in workspace: {failure_summary}"));
+                    }
                 }
                 Err(err) => {
                     result.lint_ok = false;
@@ -477,21 +518,42 @@ impl<A: Mercury2Api> Verifier<A> {
     }
 
     fn run_command(&self, cmd: &str, working_dir: &Path) -> Result<CommandOutput, EngineError> {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
             return Err(EngineError::VerificationFailed {
                 reason: "empty command".to_string(),
             });
         }
-        let output = Command::new(parts[0])
-            .args(&parts[1..])
+        if trimmed.contains('\0') {
+            return Err(EngineError::VerificationFailed {
+                reason: "command contains NUL byte".to_string(),
+            });
+        }
+
+        let command_parts = parse_command_parts(trimmed);
+        let output = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(trimmed)
+            .arg("mercury-verifier")
             .current_dir(working_dir)
             .output()?;
 
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let parsed_failure = if !output.status.success() {
+            parse_command_failure(&command_parts, &stdout, &stderr)
+        } else {
+            None
+        };
+
         Ok(CommandOutput {
+            command: trimmed.to_string(),
+            command_parts,
             success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code(),
+            stdout,
+            stderr,
+            parsed_failure,
         })
     }
 
@@ -514,11 +576,36 @@ impl<A: Mercury2Api> Verifier<A> {
 
 /// Result of a verification run.
 #[derive(Debug, Clone, Serialize)]
+pub struct VerifierCommandResult {
+    pub command: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub parsed_failure: Option<ParsedFailureReport>,
+}
+
+impl From<&CommandOutput> for VerifierCommandResult {
+    fn from(output: &CommandOutput) -> Self {
+        Self {
+            command: output.command.clone(),
+            success: output.success,
+            exit_code: output.exit_code,
+            stdout: output.stdout.clone(),
+            stderr: output.stderr.clone(),
+            parsed_failure: output.parsed_failure.clone(),
+        }
+    }
+}
+
+/// Result of a verification run.
+#[derive(Debug, Clone, Serialize)]
 pub struct VerifyResult {
     pub parse_ok: bool,
     pub test_ok: bool,
     pub lint_ok: bool,
     pub critique: Option<String>,
+    pub command_results: Vec<VerifierCommandResult>,
     pub errors: Vec<String>,
 }
 
@@ -528,6 +615,7 @@ pub struct StepExecutionSummary {
     pub accepted: usize,
     pub rejected: usize,
     pub verification_failures: usize,
+    pub retry_attempts: usize,
     pub final_bundle_verified: bool,
     pub applied: bool,
     pub run_root: Option<PathBuf>,
@@ -543,6 +631,7 @@ impl StepExecutionSummary {
         self.accepted += other.accepted;
         self.rejected += other.rejected;
         self.verification_failures += other.verification_failures;
+        self.retry_attempts += other.retry_attempts;
         self.final_bundle_verified |= other.final_bundle_verified;
         self.applied |= other.applied;
         if self.run_root.is_none() {
@@ -667,7 +756,7 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
         let log_id = db.log_agent_spawn(&agent_id, "fix", &indexed_step.step.file_path)?;
         db.update_agent_status(log_id, "running", 0, 0.0, None)?;
 
-        let (candidate, usage) = match patcher
+        let (candidate, initial_usage) = match patcher
             .patch(&latest_state, &indexed_step.step.instruction)
             .await
         {
@@ -681,33 +770,37 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
             }
         };
 
-        if let Err(err) = scheduler.record_cost(usage.cost_usd) {
+        let mut total_tokens = initial_usage.tokens_used;
+        let mut total_cost = initial_usage.cost_usd;
+
+        if let Err(err) = scheduler.record_cost(initial_usage.cost_usd) {
             summary.rejected += 1;
             let reason = format!("budget rejected step: {err}");
             let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
             db.update_agent_status(
                 log_id,
                 "failed",
-                usage.tokens_used,
-                usage.cost_usd,
+                total_tokens,
+                total_cost,
                 Some(&metadata.to_string()),
             )?;
             continue;
         }
 
-        let candidate_root = run_root.join("candidates").join(format!(
+        let step_root = run_root.join("candidates").join(format!(
             "step-{:04}-{}",
             indexed_step.index + 1,
             sanitize_path_component(&indexed_step.step.file_path)
         ));
         let accepted_snapshot = accepted_states.lock().await.clone();
-        prepare_workspace(project_root, &candidate_root, &accepted_snapshot)?;
+        let attempt_one_root = step_root.join("attempt-1");
+        prepare_workspace(project_root, &attempt_one_root, &accepted_snapshot)?;
 
         let verify = verifier
             .verify(
-                &candidate_root.join(&indexed_step.step.file_path),
+                &attempt_one_root.join(&indexed_step.step.file_path),
                 &candidate,
-                &candidate_root,
+                &attempt_one_root,
             )
             .await?;
 
@@ -720,31 +813,100 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
             summary.accepted += 1;
             let metadata = serde_json::json!({
                 "outcome":"accepted",
-                "sandbox_root": candidate_root.display().to_string(),
+                "sandbox_root": attempt_one_root.display().to_string(),
+                "retry_attempts": 0,
             });
             db.update_agent_status(
                 log_id,
                 "success",
-                usage.tokens_used,
-                usage.cost_usd,
+                total_tokens,
+                total_cost,
                 Some(&metadata.to_string()),
             )?;
-        } else {
-            summary.rejected += 1;
-            summary.verification_failures += 1;
+            continue;
+        }
+
+        let mut rejection_reason = verify.errors.join("; ");
+        let mut rejection_root = attempt_one_root.clone();
+        let mut accepted_candidate: Option<(String, PathBuf)> = None;
+
+        if let Some(critique) = verify.critique.as_deref() {
+            summary.retry_attempts += 1;
+            let retry_history =
+                build_retry_history(&indexed_step.step.instruction, &verify, critique);
+            match patcher
+                .next_edit_with_path(&indexed_step.step.file_path, &candidate, &retry_history)
+                .await
+            {
+                Ok((retry_candidate, retry_usage)) => {
+                    total_tokens += retry_usage.tokens_used;
+                    total_cost += retry_usage.cost_usd;
+
+                    if let Err(err) = scheduler.record_cost(retry_usage.cost_usd) {
+                        rejection_reason = format!("budget rejected retry: {err}");
+                    } else {
+                        let attempt_two_root = step_root.join("attempt-2");
+                        prepare_workspace(project_root, &attempt_two_root, &accepted_snapshot)?;
+                        let retry_verify = verifier
+                            .verify_internal(
+                                &attempt_two_root.join(&indexed_step.step.file_path),
+                                &retry_candidate,
+                                &attempt_two_root,
+                                false,
+                            )
+                            .await?;
+
+                        if retry_verify.is_ok() {
+                            accepted_candidate = Some((retry_candidate, attempt_two_root.clone()));
+                        } else {
+                            rejection_reason = retry_verify.errors.join("; ");
+                            rejection_root = attempt_two_root;
+                        }
+                    }
+                }
+                Err(err) => {
+                    rejection_reason = format!("retry generation failed: {err}");
+                }
+            }
+        }
+
+        if let Some((accepted, sandbox_root)) = accepted_candidate {
+            latest_state = accepted.clone();
+            accepted_states
+                .lock()
+                .await
+                .insert(relative_path.clone(), accepted);
+            summary.accepted += 1;
             let metadata = serde_json::json!({
-                "outcome":"rejected",
-                "reason": verify.errors.join("; "),
-                "sandbox_root": candidate_root.display().to_string(),
+                "outcome":"accepted",
+                "sandbox_root": sandbox_root.display().to_string(),
+                "retry_attempts": 1,
             });
             db.update_agent_status(
                 log_id,
-                "failed",
-                usage.tokens_used,
-                usage.cost_usd,
+                "success",
+                total_tokens,
+                total_cost,
                 Some(&metadata.to_string()),
             )?;
+            continue;
         }
+
+        summary.rejected += 1;
+        summary.verification_failures += 1;
+        let metadata = serde_json::json!({
+            "outcome":"rejected",
+            "reason": rejection_reason,
+            "sandbox_root": rejection_root.display().to_string(),
+            "retry_attempts": usize::from(verify.critique.is_some()),
+        });
+        db.update_agent_status(
+            log_id,
+            "failed",
+            total_tokens,
+            total_cost,
+            Some(&metadata.to_string()),
+        )?;
     }
 
     Ok(summary)
@@ -939,10 +1101,70 @@ fn sanitize_path_component(file_path: &str) -> String {
 }
 
 struct CommandOutput {
+    command: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    command_parts: Vec<String>,
     success: bool,
-    #[allow(dead_code)]
+    exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    parsed_failure: Option<ParsedFailureReport>,
+}
+
+impl CommandOutput {
+    fn failure_summary(&self) -> String {
+        let stderr = self.stderr.trim();
+        if !stderr.is_empty() {
+            return stderr.to_string();
+        }
+
+        let stdout = self.stdout.trim();
+        if !stdout.is_empty() {
+            return stdout.to_string();
+        }
+
+        match self.exit_code {
+            Some(code) => format!("command exited with status {code}"),
+            None => "command exited without a status code".to_string(),
+        }
+    }
+}
+
+fn build_retry_history(instruction: &str, verify: &VerifyResult, critique: &str) -> String {
+    let mut sections = vec![format!("original_instruction:\n{instruction}")];
+
+    if !verify.errors.is_empty() {
+        sections.push(format!(
+            "verification_errors:\n{}",
+            verify.errors.join("\n")
+        ));
+    }
+
+    let parsed_failures = verify
+        .command_results
+        .iter()
+        .filter_map(|result| result.parsed_failure.as_ref())
+        .collect::<Vec<_>>();
+    if !parsed_failures.is_empty() {
+        let structured =
+            serde_json::to_string_pretty(&parsed_failures).unwrap_or_else(|_| "[]".to_string());
+        sections.push(format!("structured_failures:\n{structured}"));
+    }
+
+    sections.push(format!("critique:\n{critique}"));
+    sections.join("\n\n")
+}
+
+fn parse_command_failure(
+    command_parts: &[String],
+    stdout: &str,
+    stderr: &str,
+) -> Option<ParsedFailureReport> {
+    if classify_cargo_command(command_parts) == CargoCommandKind::Unknown {
+        return None;
+    }
+
+    Some(parse_cargo_failure(command_parts, stdout, stderr))
 }
 
 struct SchedulerPermit<'a> {
@@ -1122,7 +1344,10 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::api::{ApiUsage, PLANNER_RESPONSE_SCHEMA_NAME};
+    use crate::failure_parser::{CargoCommandKind, FailureStage};
     use serde_json::Value;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     struct MockPlannerApi {
         response: Value,
@@ -1208,6 +1433,7 @@ mod tests {
             test_ok: true,
             lint_ok: true,
             critique: None,
+            command_results: vec![],
             errors: vec![],
         };
         assert!(ok.is_ok());
@@ -1217,9 +1443,108 @@ mod tests {
             test_ok: false,
             lint_ok: true,
             critique: None,
+            command_results: vec![],
             errors: vec!["test failed".to_string()],
         };
         assert!(!fail.is_ok());
+    }
+
+    #[test]
+    fn test_run_command_uses_shell_for_quoted_pipeline_commands() {
+        let verifier = Verifier::new(
+            VerifyConfig {
+                parse_before_write: false,
+                test_after_write: false,
+                lint_after_write: false,
+                mercury2_critique_on_failure: false,
+                test_command: "true".to_string(),
+                lint_command: "true".to_string(),
+            },
+            None::<MockPlannerApi>,
+        );
+        let temp = tempfile::tempdir().unwrap();
+
+        let output = verifier
+            .run_command("printf '%s' 'hello shell' | cat", temp.path())
+            .unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.stdout, "hello shell");
+        assert_eq!(
+            output.command_parts,
+            vec![
+                "printf".to_string(),
+                "%s".to_string(),
+                "hello shell".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_captures_structured_cargo_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let cargo_script = bin_dir.join("cargo");
+        fs::write(
+            &cargo_script,
+            concat!(
+                "#!/bin/sh\n",
+                "printf 'running 1 test\\n'\n",
+                "printf 'test tests::broken ... FAILED\\n'\n",
+                "printf ' --> src/lib.rs:7:9\\n' >&2\n",
+                "printf 'assertion `left == right` failed\\n' >&2\n",
+                "exit 1\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&cargo_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cargo_script, permissions).unwrap();
+
+        let test_command = format!("PATH='{}:$PATH' cargo test", bin_dir.display());
+        let verifier = Verifier::new(
+            VerifyConfig {
+                parse_before_write: true,
+                test_after_write: true,
+                lint_after_write: false,
+                mercury2_critique_on_failure: false,
+                test_command,
+                lint_command: "true".to_string(),
+            },
+            None::<MockPlannerApi>,
+        );
+
+        let verify = verifier
+            .verify(
+                &temp.path().join("src/lib.rs"),
+                "pub fn ok() {}\n",
+                temp.path(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!verify.test_ok);
+        assert_eq!(verify.command_results.len(), 1);
+
+        let command = &verify.command_results[0];
+        assert!(!command.success);
+        let parsed = command.parsed_failure.as_ref().unwrap();
+        assert_eq!(parsed.command, CargoCommandKind::Test);
+        assert_eq!(parsed.stage, FailureStage::Test);
+        assert_eq!(parsed.failures.len(), 1);
+        assert_eq!(parsed.failures[0].error_class, "test.assertion");
+        assert_eq!(
+            parsed.failures[0].target.file_path.as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(parsed.failures[0].target.line, Some(7));
+        assert_eq!(parsed.failures[0].target.column, Some(9));
+        assert_eq!(
+            parsed.failures[0].target.symbol.as_deref(),
+            Some("tests::broken")
+        );
     }
 
     #[test]

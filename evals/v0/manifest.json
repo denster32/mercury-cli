@@ -1,10 +1,12 @@
 {
   "schema_version": "mercury-evals-v0",
-  "suite_id": "rust-v0.2-seeded",
+  "suite_id": "rust-v0.3-seeded",
   "language": "rust",
-  "version": 1,
+  "version": 3,
   "artifact_schema_version": "mercury-eval-report-v0",
-  "supported_modes": ["baseline"],
+  "supported_modes": [
+    "baseline"
+  ],
   "cases": [
     {
       "id": "rust_parse_unclosed_delimiter",
@@ -12,10 +14,38 @@
       "path": "cases/rust_parse_unclosed_delimiter",
       "failure_class": "parser",
       "failure_stage": "parse",
-      "verifier_command": ["cargo", "check", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["unclosed delimiter"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unclosed delimiter"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:parse",
+        "class:parser",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 45,
+      "demo_track": "docs"
     },
     {
       "id": "rust_type_mismatch",
@@ -23,10 +53,38 @@
       "path": "cases/rust_type_mismatch",
       "failure_class": "type_mismatch",
       "failure_stage": "compile",
-      "verifier_command": ["cargo", "check", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["mismatched types"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "mismatched types"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:type_mismatch",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 75,
+      "demo_track": "docs"
     },
     {
       "id": "rust_missing_function_symbol",
@@ -34,10 +92,39 @@
       "path": "cases/rust_missing_function_symbol",
       "failure_class": "missing_symbol",
       "failure_stage": "compile",
-      "verifier_command": ["cargo", "check", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["cannot find function", "missing_helper"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "cannot find function",
+        "missing_helper"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:missing_symbol",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 75,
+      "demo_track": "extended"
     },
     {
       "id": "rust_unknown_struct_field",
@@ -45,10 +132,39 @@
       "path": "cases/rust_unknown_struct_field",
       "failure_class": "unknown_field",
       "failure_stage": "compile",
-      "verifier_command": ["cargo", "check", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["has no field named", "count"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "has no field named",
+        "count"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:unknown_field",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 75,
+      "demo_track": "extended"
     },
     {
       "id": "rust_trait_bound_missing",
@@ -56,10 +172,39 @@
       "path": "cases/rust_trait_bound_missing",
       "failure_class": "trait_bound",
       "failure_stage": "compile",
-      "verifier_command": ["cargo", "check", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["doesn't implement", "Display"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "doesn't implement",
+        "Display"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:trait_bound",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 75,
+      "demo_track": "extended"
     },
     {
       "id": "rust_runtime_assertion_failure",
@@ -67,10 +212,38 @@
       "path": "cases/rust_runtime_assertion_failure",
       "failure_class": "test_assertion",
       "failure_stage": "test",
-      "verifier_command": ["cargo", "test", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["assertion `left == right` failed"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:test_assertion",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 120,
+      "demo_track": "docs"
     },
     {
       "id": "rust_runtime_panic_unwrap",
@@ -78,10 +251,38 @@
       "path": "cases/rust_runtime_panic_unwrap",
       "failure_class": "panic_unwrap",
       "failure_stage": "test",
-      "verifier_command": ["cargo", "test", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["called `Option::unwrap()` on a `None` value"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "called `Option::unwrap()` on a `None` value"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:panic_unwrap",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 120,
+      "demo_track": "extended"
     },
     {
       "id": "rust_off_by_one_range",
@@ -89,10 +290,38 @@
       "path": "cases/rust_off_by_one_range",
       "failure_class": "logic_off_by_one",
       "failure_stage": "test",
-      "verifier_command": ["cargo", "test", "--quiet"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["assertion `left == right` failed"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:logic_off_by_one",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 120,
+      "demo_track": "docs"
     },
     {
       "id": "rust_clippy_needless_return",
@@ -100,10 +329,42 @@
       "path": "cases/rust_clippy_needless_return",
       "failure_class": "clippy_needless_return",
       "failure_stage": "lint",
-      "verifier_command": ["cargo", "clippy", "--quiet", "--", "-D", "warnings"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["unneeded `return` statement", "needless_return"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unneeded `return` statement",
+        "needless_return"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_needless_return",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "docs"
     },
     {
       "id": "rust_clippy_identity_op",
@@ -111,10 +372,1648 @@
       "path": "cases/rust_clippy_identity_op",
       "failure_class": "clippy_identity_op",
       "failure_stage": "lint",
-      "verifier_command": ["cargo", "clippy", "--quiet", "--", "-D", "warnings"],
-      "expected_exit_codes": [101],
-      "expected_patterns": ["this operation has no effect", "identity_op"],
-      "source_files": ["src/lib.rs"]
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "this operation has no effect",
+        "identity_op"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_identity_op",
+        "kind:seed",
+        "variant:seed"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_parse_unclosed_delimiter_v2",
+      "title": "Parser failure: unclosed delimiter (variant 2)",
+      "path": "cases/rust_parse_unclosed_delimiter",
+      "failure_class": "parser",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unclosed delimiter"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:parse",
+        "class:parser",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_parse_unclosed_delimiter_v3",
+      "title": "Parser failure: unclosed delimiter (variant 3)",
+      "path": "cases/rust_parse_unclosed_delimiter",
+      "failure_class": "parser",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unclosed delimiter"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:parse",
+        "class:parser",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_parse_unclosed_delimiter_v4",
+      "title": "Parser failure: unclosed delimiter (variant 4)",
+      "path": "cases/rust_parse_unclosed_delimiter",
+      "failure_class": "parser",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unclosed delimiter"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:parse",
+        "class:parser",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_parse_unclosed_delimiter_v5",
+      "title": "Parser failure: unclosed delimiter (variant 5)",
+      "path": "cases/rust_parse_unclosed_delimiter",
+      "failure_class": "parser",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unclosed delimiter"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:parse",
+        "class:parser",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_type_mismatch_v2",
+      "title": "Compile failure: mismatched types (variant 2)",
+      "path": "cases/rust_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "mismatched types"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:type_mismatch",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_type_mismatch_v3",
+      "title": "Compile failure: mismatched types (variant 3)",
+      "path": "cases/rust_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "mismatched types"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:type_mismatch",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_type_mismatch_v4",
+      "title": "Compile failure: mismatched types (variant 4)",
+      "path": "cases/rust_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "mismatched types"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:type_mismatch",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_type_mismatch_v5",
+      "title": "Compile failure: mismatched types (variant 5)",
+      "path": "cases/rust_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "mismatched types"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:type_mismatch",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_missing_function_symbol_v2",
+      "title": "Compile failure: missing function symbol (variant 2)",
+      "path": "cases/rust_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "cannot find function",
+        "missing_helper"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:missing_symbol",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_missing_function_symbol_v3",
+      "title": "Compile failure: missing function symbol (variant 3)",
+      "path": "cases/rust_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "cannot find function",
+        "missing_helper"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:missing_symbol",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_missing_function_symbol_v4",
+      "title": "Compile failure: missing function symbol (variant 4)",
+      "path": "cases/rust_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "cannot find function",
+        "missing_helper"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:missing_symbol",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_missing_function_symbol_v5",
+      "title": "Compile failure: missing function symbol (variant 5)",
+      "path": "cases/rust_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "cannot find function",
+        "missing_helper"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:missing_symbol",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_unknown_struct_field_v2",
+      "title": "Compile failure: unknown struct field (variant 2)",
+      "path": "cases/rust_unknown_struct_field",
+      "failure_class": "unknown_field",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "has no field named",
+        "count"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:unknown_field",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_unknown_struct_field_v3",
+      "title": "Compile failure: unknown struct field (variant 3)",
+      "path": "cases/rust_unknown_struct_field",
+      "failure_class": "unknown_field",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "has no field named",
+        "count"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:unknown_field",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_unknown_struct_field_v4",
+      "title": "Compile failure: unknown struct field (variant 4)",
+      "path": "cases/rust_unknown_struct_field",
+      "failure_class": "unknown_field",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "has no field named",
+        "count"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:unknown_field",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_unknown_struct_field_v5",
+      "title": "Compile failure: unknown struct field (variant 5)",
+      "path": "cases/rust_unknown_struct_field",
+      "failure_class": "unknown_field",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "has no field named",
+        "count"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:unknown_field",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_trait_bound_missing_v2",
+      "title": "Compile failure: missing trait bound (variant 2)",
+      "path": "cases/rust_trait_bound_missing",
+      "failure_class": "trait_bound",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "doesn't implement",
+        "Display"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:trait_bound",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_trait_bound_missing_v3",
+      "title": "Compile failure: missing trait bound (variant 3)",
+      "path": "cases/rust_trait_bound_missing",
+      "failure_class": "trait_bound",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "doesn't implement",
+        "Display"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:trait_bound",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_trait_bound_missing_v4",
+      "title": "Compile failure: missing trait bound (variant 4)",
+      "path": "cases/rust_trait_bound_missing",
+      "failure_class": "trait_bound",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "doesn't implement",
+        "Display"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:trait_bound",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_trait_bound_missing_v5",
+      "title": "Compile failure: missing trait bound (variant 5)",
+      "path": "cases/rust_trait_bound_missing",
+      "failure_class": "trait_bound",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "cargo",
+        "check",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "doesn't implement",
+        "Display"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:compile",
+        "class:trait_bound",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 90,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_assertion_failure_v2",
+      "title": "Test failure: assertion mismatch (variant 2)",
+      "path": "cases/rust_runtime_assertion_failure",
+      "failure_class": "test_assertion",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:test_assertion",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_assertion_failure_v3",
+      "title": "Test failure: assertion mismatch (variant 3)",
+      "path": "cases/rust_runtime_assertion_failure",
+      "failure_class": "test_assertion",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:test_assertion",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_assertion_failure_v4",
+      "title": "Test failure: assertion mismatch (variant 4)",
+      "path": "cases/rust_runtime_assertion_failure",
+      "failure_class": "test_assertion",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:test_assertion",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_assertion_failure_v5",
+      "title": "Test failure: assertion mismatch (variant 5)",
+      "path": "cases/rust_runtime_assertion_failure",
+      "failure_class": "test_assertion",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:test_assertion",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_panic_unwrap_v2",
+      "title": "Test failure: unwrap panic (variant 2)",
+      "path": "cases/rust_runtime_panic_unwrap",
+      "failure_class": "panic_unwrap",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "called `Option::unwrap()` on a `None` value"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:panic_unwrap",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_panic_unwrap_v3",
+      "title": "Test failure: unwrap panic (variant 3)",
+      "path": "cases/rust_runtime_panic_unwrap",
+      "failure_class": "panic_unwrap",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "called `Option::unwrap()` on a `None` value"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:panic_unwrap",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_panic_unwrap_v4",
+      "title": "Test failure: unwrap panic (variant 4)",
+      "path": "cases/rust_runtime_panic_unwrap",
+      "failure_class": "panic_unwrap",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "called `Option::unwrap()` on a `None` value"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:panic_unwrap",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_runtime_panic_unwrap_v5",
+      "title": "Test failure: unwrap panic (variant 5)",
+      "path": "cases/rust_runtime_panic_unwrap",
+      "failure_class": "panic_unwrap",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "called `Option::unwrap()` on a `None` value"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:panic_unwrap",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_off_by_one_range_v2",
+      "title": "Test failure: off-by-one range logic (variant 2)",
+      "path": "cases/rust_off_by_one_range",
+      "failure_class": "logic_off_by_one",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:logic_off_by_one",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_off_by_one_range_v3",
+      "title": "Test failure: off-by-one range logic (variant 3)",
+      "path": "cases/rust_off_by_one_range",
+      "failure_class": "logic_off_by_one",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:logic_off_by_one",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_off_by_one_range_v4",
+      "title": "Test failure: off-by-one range logic (variant 4)",
+      "path": "cases/rust_off_by_one_range",
+      "failure_class": "logic_off_by_one",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:logic_off_by_one",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_off_by_one_range_v5",
+      "title": "Test failure: off-by-one range logic (variant 5)",
+      "path": "cases/rust_off_by_one_range",
+      "failure_class": "logic_off_by_one",
+      "failure_stage": "test",
+      "verifier_command": [
+        "cargo",
+        "test",
+        "--quiet"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "assertion `left == right` failed"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:test",
+        "class:logic_off_by_one",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 135,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_needless_return_v2",
+      "title": "Lint failure: needless return (variant 2)",
+      "path": "cases/rust_clippy_needless_return",
+      "failure_class": "clippy_needless_return",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unneeded `return` statement",
+        "needless_return"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_needless_return",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_needless_return_v3",
+      "title": "Lint failure: needless return (variant 3)",
+      "path": "cases/rust_clippy_needless_return",
+      "failure_class": "clippy_needless_return",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unneeded `return` statement",
+        "needless_return"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_needless_return",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_needless_return_v4",
+      "title": "Lint failure: needless return (variant 4)",
+      "path": "cases/rust_clippy_needless_return",
+      "failure_class": "clippy_needless_return",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unneeded `return` statement",
+        "needless_return"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_needless_return",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_needless_return_v5",
+      "title": "Lint failure: needless return (variant 5)",
+      "path": "cases/rust_clippy_needless_return",
+      "failure_class": "clippy_needless_return",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "unneeded `return` statement",
+        "needless_return"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_needless_return",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_identity_op_v2",
+      "title": "Lint failure: identity operation (variant 2)",
+      "path": "cases/rust_clippy_identity_op",
+      "failure_class": "clippy_identity_op",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "this operation has no effect",
+        "identity_op"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_identity_op",
+        "kind:variant",
+        "variant:v2"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_identity_op_v3",
+      "title": "Lint failure: identity operation (variant 3)",
+      "path": "cases/rust_clippy_identity_op",
+      "failure_class": "clippy_identity_op",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "this operation has no effect",
+        "identity_op"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_identity_op",
+        "kind:variant",
+        "variant:v3"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_identity_op_v4",
+      "title": "Lint failure: identity operation (variant 4)",
+      "path": "cases/rust_clippy_identity_op",
+      "failure_class": "clippy_identity_op",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "this operation has no effect",
+        "identity_op"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_identity_op",
+        "kind:variant",
+        "variant:v4"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
+    },
+    {
+      "id": "rust_clippy_identity_op_v5",
+      "title": "Lint failure: identity operation (variant 5)",
+      "path": "cases/rust_clippy_identity_op",
+      "failure_class": "clippy_identity_op",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "cargo",
+        "clippy",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "expected_exit_codes": [
+        101
+      ],
+      "expected_patterns": [
+        "this operation has no effect",
+        "identity_op"
+      ],
+      "source_files": [
+        "src/lib.rs"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "rust-v0.3-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "easy",
+      "tags": [
+        "rust",
+        "v0",
+        "seeded",
+        "stage:lint",
+        "class:clippy_identity_op",
+        "kind:variant",
+        "variant:v5"
+      ],
+      "timeout_seconds": 105,
+      "demo_track": "none"
     }
-  ]
+  ],
+  "description": "Mercury v0.3 eval harness corpus: 50 seeded Rust failure case ids backed by 10 canonical fixture crates for baseline red-state validation and CI workflow validation.",
+  "default_timeout_seconds": 120
 }

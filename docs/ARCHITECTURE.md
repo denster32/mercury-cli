@@ -1,184 +1,105 @@
-# Mercury CLI Architecture
+# Mercury CLI Architecture (v0.3 Alpha)
 
-This document describes the execution model behind Mercury CLI's v0.2 positioning: Mercury-native CI auto-repair built on a trustworthy local repair core. The emphasis here is product boundary, trust boundaries, and the difference between implemented runtime behavior and roadmap claims.
+This document describes the current runtime and trust boundaries for Mercury CLI as a v0.3 CI auto-repair alpha.
 
-## Product Boundary
+Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
-Mercury CLI is not trying to be a generic AI coding shell.
+- start from a failing Rust verifier command
+- attempt bounded repair with Mercury models
+- verify locally in isolation before acceptance
+- emit a reviewable evidence bundle
+- optionally open or update a draft PR through GitHub Actions
 
-The current wedge is narrower and more defensible:
+## Implemented Workflow Surfaces
 
-- input: a local repository plus a failing goal or failing verification command
-- planner: Mercury 2 produces bounded repair intent from repository context
-- editor: Mercury Edit proposes focused file mutations
-- verifier: local commands decide whether a candidate is acceptable
-- output: an accepted patch or a rejected run with artifacts that explain why
+### Local `fix`
 
-The intended progression is:
+`mercury-cli fix "<goal>"` runs a Rust-first repair loop with planning, candidate generation, verifier execution, and artifact emission under `.mercury/runs/<run-id>/`.
 
-- v0.2: trustworthy local repair core
-- v0.3: CI auto-repair alpha on top of that core
-- v1.0: true concurrent multi-worktree swarm runtime
+### Local `watch --repair`
 
-## What The Current Runtime Makes True
+`mercury-cli watch "<command>" --repair` auto-repair is intentionally limited to direct Rust verifier commands:
 
-These are the claims the repo should be able to support today after the runtime refactor:
+- `cargo test ...`
+- `cargo check ...`
+- `cargo clippy ...`
+- optional env-prefix variants that still resolve directly to those commands
 
-- repair work happens in disposable workspaces under `.mercury/worktrees/`
-- rejected candidates are discarded with the workspace instead of being rolled back in-place
-- accepted files are copied back only after local verification succeeds
-- accepted writes use an atomic temp-file-and-rename path rather than partial file overwrites
-- runs emit evidence under `.mercury/runs/` so decisions are inspectable later
+Composed shell commands (`&&`, pipes, redirection, shell wrappers like `make test` or `just test`) are observed but marked `repair_not_supported`.
 
-These are the claims the docs should not overstate yet:
+### CI Draft PR Workflow
 
-- measured swarm speedup from `--max-agents`
-- broad language support beyond the Rust-first path
-- fully autonomous CI draft PR creation
-- blanket end-to-end strict schema enforcement across every planner callsite
+`.github/workflows/repair.yml` (`Mercury CI Auto-Repair Draft PR`) performs:
 
-## Runtime Layers
+1. checkout and build `mercury-cli`
+2. isolated baseline failure reproduction in a detached git worktree
+3. Mercury repair attempt (`fix`)
+4. post-repair verifier rerun
+5. evidence bundle validation and upload
+6. draft PR creation/update only when repair is verified, `dry_run != true`, and the workflow can push to the same repository with required permissions
+7. final workflow status is blocking for orchestration failures (`baseline_not_reproduced`, `missing_api_key`, `setup_failed`, `internal_error`) even though artifacts are still uploaded
 
-### 1. Repository context and targeting
+## Safety Model
 
-The CLI gathers repository context, language information, failure signals, and stored thermal state before asking the planner for a repair strategy.
+The v0.3 alpha safety boundary is workflow-first and evidence-first.
 
-Responsibilities:
+### Candidate isolation
 
-- identify relevant files and failure regions
-- collect context without overstuffing prompts
-- preserve enough metadata to explain later why a target was chosen
+Repair attempts run in disposable worktrees (`.mercury/worktrees/` locally, detached worktree in CI workflow).
 
-### 2. Planner and structured outputs
+### Atomic accept/reject path
 
-Mercury 2 is responsible for planning and critique, not direct repository mutation.
+Rejected candidates are discarded with their sandbox. Accepted candidates are copied back after verification gates succeed.
 
-The product direction for v0.2 is versioned structured planner output. In the current repo, the API layer already supports official-style strict JSON schema requests, and the runtime is being hardened around that contract. Docs should present this as a boundary the product is moving toward, not as permission to treat planner prose as trustworthy.
+### Verification gates before promotion
 
-Planner responsibilities:
+No patch is considered CI draft-PR eligible unless all are true:
 
-- identify likely failing regions
-- propose bounded repair steps
-- estimate cost and token usage
-- emit thermal assessments used for prioritization and reporting
+- baseline failure reproduced
+- run metadata indicates final bundle verification
+- repair marked applied
+- post-repair verifier exit is zero
+- non-empty non-`.mercury` diff exists
 
-### 3. Edit engine protocol
+### Reproducible artifacts
 
-Mercury Edit is responsible for focused mutation, not repo-wide planning.
+Runs are expected to emit inspectable evidence for replay and audit.
 
-Two request shapes matter:
+## Evidence Bundle Contract
 
-- `Apply Edit`: original code plus concrete update snippets
-- `Next Edit`: current file path, current file content with nested `code_to_edit`, optional recently viewed snippets, and chronological unidiff edit history
+The workflow validates a minimum artifact contract before summary publishing:
 
-Protocol compliance matters because the product promise depends on predictable edits rather than ad hoc prompt wrappers.
+- `summary.md`
+- `decision.json`
+- `environment.json`
+- `pr-body.md`
+- `repair.diff`
+- `repair.diffstat.txt`
+- `logs/baseline.stdout.log`
+- `logs/baseline.stderr.log`
 
-### 4. Candidate sandbox runtime
+When repair executes, bundle logs also include repair and post-repair verifier outputs; setup/init logs are included when those steps run.
 
-Candidate generation and verification happen in an isolated workspace under `.mercury/worktrees/`.
+If a nested Mercury run directory is available, it is copied into `mercury-run/` inside the uploaded bundle.
 
-The runtime has three separate states:
+## Structured Data Boundaries
 
-- generation: produce a candidate patch inside the workspace
-- verification: run parse, test, and lint gates inside the workspace only
-- acceptance: copy back accepted results atomically and discard the workspace
+- Workflow decision/environment payloads are JSON with stable keys used by docs/tests.
+- Eval harness (`evals/v0`) is manifest-driven and emits schema/version metadata in reports.
+- Planner critique text remains advisory prose and should not be treated as a strict machine contract.
 
-This separation is the core trust boundary of v0.2.
+## Known v0.3 Alpha Limits
 
-### 5. Acceptance, rollback, and crash safety
+- Rust-first scope only for auto-repair targeting.
+- `--max-agents` currently configures budget/scheduler surfaces; do not treat it as proven runtime swarm speedup.
+- CI automation is draft-PR oriented, not autonomous merge.
+- Public benchmark reporting is still behind corpus/harness readiness.
 
-Mercury CLI should never rely on direct writes to the user worktree as part of failed verification.
+## Relationship to Case Studies
 
-Correct behavior:
+Reproducible operator flows are documented in:
 
-- rejected candidate: discard workspace only
-- accepted candidate: copy verified files back atomically
-- crash during verification: user worktree remains unchanged
+- `docs/case-studies/local-red-to-green.md`
+- `docs/case-studies/ci-draft-pr-flow.md`
 
-### 6. Artifacts and evidence
-
-Every repair run should leave behind enough evidence to audit what happened later.
-
-Minimum bundle:
-
-- plan metadata
-- candidate diffs
-- verifier commands and outputs
-- final decision
-- timing and cost summary
-
-## Safety Invariants
-
-The v0.2 product promise depends on a short list of non-negotiables:
-
-- a failed run must never dirty the user worktree
-- no feature flag should imply concurrency or autonomy that is not actually happening
-- model output must be gated by local verification before becoming an accepted change
-- every run should emit reproducible evidence
-
-These are product constraints, not optional implementation details.
-
-## Capability Boundaries
-
-### Available in v0.2
-
-- Rust-first repair path
-- local CLI workflow
-- isolated verification and reproducible artifacts
-- Mercury Edit surfaces for apply, complete, and next-edit workflows
-- honest preview labels for incomplete surfaces
-
-### Preview in v0.2
-
-- `watch --repair` as an end-to-end autonomous repair loop
-- `config set` as a fully dependable config editing surface
-- binary install via tagged release until a public release is published
-
-### Roadmap after v0.2
-
-- CI auto-repair alpha
-- failure parsers for standard Rust verifier commands
-- GitHub Action that produces draft repair evidence
-- one bounded critique-and-retry pass on failed verification
-- richer artifact bundles and public benchmark reporting
-
-### v1.0 bar
-
-- true parallel candidate execution
-- conflict arbitration across overlapping edits
-- measurable speedup from higher agent counts
-- second language support
-- public evidence that the swarm claim is true in runtime behavior, not just config names
-
-## Scheduler Reality Check
-
-Thermal terminology exists in the codebase, but the safe product claim for v0.2 is still a bounded repair runtime, not a proven swarm scheduler.
-
-Be explicit about the distinction:
-
-- v0.2 can use thermal scoring for routing and reporting
-- v0.2 should not market `--max-agents` as proof of parallel execution if the executor is still partial or not yet benchmarked
-- v1.0 is the right milestone for a true concurrent multi-worktree swarm claim
-
-## Why Thermal State Still Exists
-
-Thermal scores still add value before full swarm execution exists.
-
-They provide:
-
-- prioritization of likely repair zones
-- a compact way to summarize complexity and risk
-- a reporting surface for plan outputs and status views
-
-That is enough value to keep the concept without overselling the runtime.
-
-## Design Notes
-
-Mercury CLI borrows language from stigmergy, annealing, and swarm systems, but those ideas should remain explanatory until runtime behavior proves them.
-
-A good rule for docs and product messaging:
-
-- describe safety behavior as facts
-- describe preview behavior as preview
-- describe roadmap behavior as roadmap
-- keep theory below the product layer until benchmarks prove it
+Treat those files as the primary runbooks. This architecture document describes invariants and boundaries they rely on.
