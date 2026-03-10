@@ -12,8 +12,9 @@ use crate::api::{
 };
 use crate::engine::VerifyConfig;
 use crate::failure_parser::{
-    classify_cargo_command, contains_shell_composition, parse_cargo_failure, parse_command_parts,
-    repo_native_tool_surface, CargoCommandKind, ParsedFailureReport, RepoNativeTool,
+    classify_verifier_command, command_start_index, contains_shell_composition, env_option_arity,
+    is_env_assignment, parse_command_parts, parse_verifier_failure, repo_native_tool_surface,
+    ParsedFailureReport, RepoNativeTool, VerifierCommandKind,
 };
 
 pub const GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME: &str = "grounded-repair-context-v1";
@@ -349,24 +350,23 @@ impl RepoToolExecutor {
         if command.is_empty() {
             return Err("missing command".to_string());
         }
-        if contains_shell_composition(command) {
-            return Err(format!("shell composition is not allowed: {command}"));
-        }
 
-        let parts = parse_command_parts(command);
-        let command_kind = classify_cargo_command(&parts);
-        if matches!(command_kind, CargoCommandKind::Unknown) {
-            return Err(format!("command not allowlisted: {command}"));
-        }
+        let parts = parse_allowlisted_verifier_parts(command)?;
+        let command_kind = classify_verifier_command(&parts);
 
-        let mut process = build_allowlisted_cargo_command(&parts, &self.workspace_root)?;
+        let mut process = build_allowlisted_verifier_command(&parts, &self.workspace_root)?;
         let output = process.output().map_err(|err| err.to_string())?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let parsed_failure = if output.status.success() {
             None
         } else {
-            Some(parse_cargo_failure(&parts, &stdout, &stderr))
+            Some(parse_verifier_failure(
+                &command_kind,
+                &parts,
+                &stdout,
+                &stderr,
+            ))
         };
 
         Ok(json!({
@@ -659,7 +659,33 @@ fn create_grounding_workspace(project_root: &Path) -> Result<PathBuf, Verificati
     Ok(root)
 }
 
-fn build_allowlisted_cargo_command(
+pub fn parse_allowlisted_verifier_parts(command: &str) -> Result<Vec<String>, String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("command is empty".to_string());
+    }
+    if contains_shell_composition(trimmed) {
+        return Err(format!("shell composition is not allowed: {trimmed}"));
+    }
+
+    let parts = parse_command_parts(trimmed);
+    if parts.is_empty() {
+        return Err("command is empty".to_string());
+    }
+    if matches!(
+        classify_verifier_command(&parts),
+        VerifierCommandKind::Unknown
+    ) {
+        return Err(format!("command not allowlisted: {trimmed}"));
+    }
+    Ok(parts)
+}
+
+pub fn verifier_command_allowlisted(command: &str) -> bool {
+    parse_allowlisted_verifier_parts(command).is_ok()
+}
+
+pub fn build_allowlisted_verifier_command(
     parts: &[String],
     workspace_root: &Path,
 ) -> Result<Command, String> {
@@ -667,8 +693,8 @@ fn build_allowlisted_cargo_command(
         return Err("command is empty".to_string());
     }
 
-    let command_kind = classify_cargo_command(parts);
-    if matches!(command_kind, CargoCommandKind::Unknown) {
+    let command_kind = classify_verifier_command(parts);
+    if matches!(command_kind, VerifierCommandKind::Unknown) {
         return Err(format!("command not allowlisted: {}", parts.join(" ")));
     }
 
@@ -695,18 +721,28 @@ fn build_allowlisted_cargo_command(
                 idx += 1;
                 continue;
             }
-            if part == "-u" {
-                idx += 1;
-                let key = parts
-                    .get(idx)
-                    .ok_or_else(|| "env -u requires a variable name".to_string())?;
-                env_remove.push(key.clone());
-                idx += 1;
-                continue;
-            }
             if is_env_assignment(part) {
                 env_set.push(parse_env_assignment(part)?);
                 idx += 1;
+                continue;
+            }
+            if let Some(consumes_next) = env_option_arity(part) {
+                idx += 1;
+                if part.starts_with("--unset=") {
+                    if let Some((_, key)) = part.split_once('=') {
+                        env_remove.push(key.to_string());
+                    }
+                    continue;
+                }
+                if consumes_next && !part.contains('=') {
+                    let Some(value) = parts.get(idx) else {
+                        return Err(format!("env wrapper option requires a value: {part}"));
+                    };
+                    if part == "-u" || part == "--unset" {
+                        env_remove.push(value.clone());
+                    }
+                    idx += 1;
+                }
                 continue;
             }
             if part.starts_with('-') {
@@ -721,12 +757,15 @@ fn build_allowlisted_cargo_command(
         idx += 1;
     }
 
-    if parts.get(idx).map(String::as_str) != Some("cargo") {
+    let command_idx = command_start_index(parts);
+    if command_idx < idx {
         return Err(format!("command not allowlisted: {}", parts.join(" ")));
     }
-    idx += 1;
-
-    let mut command = Command::new("cargo");
+    idx = command_idx;
+    let program = parts
+        .get(idx)
+        .ok_or_else(|| format!("command not allowlisted: {}", parts.join(" ")))?;
+    let mut command = Command::new(program);
     command.current_dir(workspace_root);
     if env_clear {
         command.env_clear();
@@ -737,7 +776,7 @@ fn build_allowlisted_cargo_command(
     for (key, value) in env_set {
         command.env(key, value);
     }
-    command.args(&parts[idx..]);
+    command.args(&parts[idx + 1..]);
     Ok(command)
 }
 
@@ -746,20 +785,6 @@ fn parse_env_assignment(part: &str) -> Result<(String, String), String> {
         .split_once('=')
         .ok_or_else(|| format!("invalid env assignment: {part}"))?;
     Ok((name.to_string(), value.to_string()))
-}
-
-fn is_env_assignment(part: &str) -> bool {
-    let Some((name, _)) = part.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .next()
-            .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
 }
 
 fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -1064,6 +1089,33 @@ members = []
         );
         assert!(result.success);
         assert_eq!(result.output["success"], Value::Bool(true));
+    }
+
+    #[test]
+    fn build_allowlisted_verifier_command_accepts_typescript_commands() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path();
+
+        let npm_test = parse_command_parts("env NODE_ENV=test npm run test -- --runInBand");
+        assert!(build_allowlisted_verifier_command(&npm_test, workspace).is_ok());
+
+        let npx_lint = parse_command_parts("env -i npx --yes eslint src");
+        assert!(build_allowlisted_verifier_command(&npx_lint, workspace).is_ok());
+
+        let pnpm_check = parse_command_parts("pnpm exec tsc --noEmit");
+        assert!(build_allowlisted_verifier_command(&pnpm_check, workspace).is_ok());
+    }
+
+    #[test]
+    fn build_allowlisted_verifier_command_rejects_unsupported_inputs() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path();
+
+        let unsupported_env = parse_command_parts("env -x npm test");
+        assert!(build_allowlisted_verifier_command(&unsupported_env, workspace).is_err());
+
+        let unsupported_script = parse_command_parts("npm run build");
+        assert!(build_allowlisted_verifier_command(&unsupported_script, workspace).is_err());
     }
 
     #[tokio::test]

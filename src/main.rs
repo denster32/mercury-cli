@@ -4,8 +4,11 @@
 //! coordination primitive for multi-agent code editing.
 
 use std::collections::BTreeMap;
+use std::env;
+use std::fs::OpenOptions;
+use std::io::IsTerminal;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -247,6 +250,12 @@ enum Commands {
         /// Render the thermal heatmap.
         #[arg(long)]
         heatmap: bool,
+        /// Stream status updates continuously until Ctrl-C.
+        #[arg(long)]
+        live: bool,
+        /// Live refresh interval in milliseconds.
+        #[arg(long, default_value = "1500")]
+        interval_ms: u64,
         /// Show active agents.
         #[arg(long)]
         agents: bool,
@@ -280,15 +289,21 @@ enum Commands {
         /// Maximum cost in USD.
         #[arg(long, default_value = "0.50")]
         max_cost: f64,
+        /// Enforce non-interactive output intended for CI logs.
+        #[arg(long)]
+        noninteractive: bool,
     },
 
     /// Watch a shell command and auto-repair failures.
     Watch {
-        /// The shell command to watch.
+        /// The allowlisted verifier command to watch.
         command: String,
         /// Auto-repair failures.
         #[arg(long)]
         repair: bool,
+        /// Enforce non-interactive output intended for CI logs.
+        #[arg(long)]
+        noninteractive: bool,
     },
 
     /// Get or set configuration values.
@@ -378,6 +393,137 @@ fn load_project() -> Result<(MercuryConfig, ThermalDb, PathBuf)> {
     Ok((config, db, project_root))
 }
 
+const VERIFIER_ALLOWLIST_OVERRIDE_ENV: &str = "MERCURY_ALLOW_UNSAFE_VERIFIER_COMMANDS";
+const SENSITIVE_ENV_VARS: &[&str] = &[
+    "INCEPTION_API_KEY",
+    "MERCURY_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+const SENSITIVE_MARKERS: &[&str] = &[
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+];
+
+fn running_in_ci() -> bool {
+    env::var("CI")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false)
+        || env::var("GITHUB_ACTIONS")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false)
+}
+
+fn is_noninteractive_mode(explicit: bool) -> bool {
+    explicit || running_in_ci() || !std::io::stdout().is_terminal()
+}
+
+fn verifier_command_allowlisted(command: &str) -> bool {
+    verification::verifier_command_allowlisted(command)
+}
+
+fn enforce_verifier_allowlist(verify_config: &VerifyConfig) -> Result<()> {
+    let override_enabled = env::var(VERIFIER_ALLOWLIST_OVERRIDE_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if override_enabled {
+        eprintln!(
+            "WARNING: verifier command allowlist bypass enabled via {}",
+            VERIFIER_ALLOWLIST_OVERRIDE_ENV
+        );
+        return Ok(());
+    }
+
+    let mut violations = Vec::new();
+    if verify_config.test_after_write && !verifier_command_allowlisted(&verify_config.test_command)
+    {
+        violations.push(format!(
+            "test_command=`{}`",
+            verify_config.test_command.trim()
+        ));
+    }
+    if verify_config.lint_after_write && !verifier_command_allowlisted(&verify_config.lint_command)
+    {
+        violations.push(format!(
+            "lint_command=`{}`",
+            verify_config.lint_command.trim()
+        ));
+    }
+
+    if violations.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "verifier allowlist violation: {}. Supported verifier commands are direct allowlisted Rust/TypeScript verifier invocations (including env-prefix variants) without shell composition. Set {}=1 to bypass.",
+        violations.join(", "),
+        VERIFIER_ALLOWLIST_OVERRIDE_ENV
+    )
+}
+
+fn redact_secrets(text: &str) -> String {
+    let mut redacted = text.to_string();
+
+    for key in SENSITIVE_ENV_VARS {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.len() >= 4 && redacted.contains(trimmed) {
+                redacted = redacted.replace(trimmed, &format!("[REDACTED:{}]", key));
+            }
+        }
+    }
+
+    let mut sanitized_lines = Vec::new();
+    for line in redacted.lines() {
+        let lowercase = line.to_ascii_lowercase();
+        if SENSITIVE_MARKERS
+            .iter()
+            .any(|marker| lowercase.contains(marker))
+        {
+            if let Some((prefix, _)) = line.split_once('=') {
+                sanitized_lines.push(format!("{prefix}=[REDACTED]"));
+                continue;
+            }
+            if let Some((prefix, _)) = line.split_once(':') {
+                sanitized_lines.push(format!("{prefix}: [REDACTED]"));
+                continue;
+            }
+        }
+        sanitized_lines.push(line.to_string());
+    }
+
+    let mut joined = sanitized_lines.join("\n");
+    if text.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn write_audit_event(artifact_root: &Path, event: &str, details: serde_json::Value) -> Result<()> {
+    let path = artifact_root.join("audit.log");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "event": event,
+        "details": details,
+    });
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, &payload)?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
@@ -404,7 +550,18 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(db: &ThermalDb, heatmap: bool, agents: bool, budget: bool) -> Result<()> {
+fn cmd_status(
+    db: &ThermalDb,
+    heatmap: bool,
+    live: bool,
+    interval_ms: u64,
+    agents: bool,
+    budget: bool,
+) -> Result<()> {
+    if live {
+        return cmd_status_live(db, heatmap, agents, budget, interval_ms.max(250));
+    }
+
     if heatmap || (!agents && !budget) {
         let aggregates = db.get_all_aggregates()?;
         if aggregates.is_empty() {
@@ -445,6 +602,80 @@ fn cmd_status(db: &ThermalDb, heatmap: bool, agents: bool, budget: bool) -> Resu
     }
 
     Ok(())
+}
+
+fn cmd_status_live(
+    db: &ThermalDb,
+    heatmap: bool,
+    agents: bool,
+    budget: bool,
+    interval_ms: u64,
+) -> Result<()> {
+    if !std::io::stdout().is_terminal() {
+        anyhow::bail!("`status --live` requires a TTY terminal");
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize runtime for live status")?;
+
+    runtime.block_on(async {
+        loop {
+            let aggregates = db.get_all_aggregates()?;
+            let active = db.get_active_agents()?;
+            let state = db.get_swarm_state()?;
+
+            print!("\x1B[2J\x1B[H");
+            println!(
+                "Mercury live status  |  {}  |  refresh={}ms  |  ctrl-c to stop\n",
+                Utc::now().to_rfc3339(),
+                interval_ms
+            );
+
+            if heatmap || (!agents && !budget) {
+                println!("{}", render_heatmap_to_string(&aggregates, &active));
+            }
+
+            if agents {
+                if active.is_empty() {
+                    println!("\nActive Agents: 0");
+                } else {
+                    println!("\nActive Agents ({}):", active.len());
+                    for agent in active.iter().take(12) {
+                        println!(
+                            "  {} | {} | {} | {}",
+                            agent.agent_id, agent.file_path, agent.status, agent.started_at
+                        );
+                    }
+                    if active.len() > 12 {
+                        println!("  ... {} more", active.len() - 12);
+                    }
+                }
+            }
+
+            if budget {
+                if let Some(state) = state {
+                    println!("\nBudget:");
+                    println!("  Total cost: ${:.4}", state.total_cost_usd);
+                    println!("  Total tokens: {}", state.total_tokens_used);
+                    println!("  Agents spawned: {}", state.total_agents_spawned);
+                    println!("  Temperature: {:.2}", state.global_temperature);
+                    println!("  Iteration: {}", state.iteration_count);
+                } else {
+                    println!("\nBudget:\n  No swarm session active.");
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nStopping live status.");
+                    break Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+            }
+        }
+    })
 }
 
 async fn cmd_ask(
@@ -637,6 +868,7 @@ async fn cmd_fix(
     description: &str,
     max_agents: usize,
     max_cost: f64,
+    noninteractive: bool,
 ) -> Result<()> {
     let _ = cmd_fix_with_verify_config(
         config,
@@ -647,6 +879,7 @@ async fn cmd_fix(
         max_cost,
         build_verify_config(config),
         None,
+        noninteractive,
     )
     .await?;
     Ok(())
@@ -661,15 +894,44 @@ async fn cmd_fix_with_verify_config(
     max_cost: f64,
     verify_config: VerifyConfig,
     parsed_failure: Option<&failure_parser::ParsedFailureReport>,
+    noninteractive: bool,
 ) -> Result<FixCommandOutcome> {
     let started_at = Utc::now();
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
+    let description_redacted = redact_secrets(description);
 
-    println!("Mercury Fix: {description}");
+    if let Err(err) = enforce_verifier_allowlist(&verify_config) {
+        let _ = write_audit_event(
+            &artifact_root,
+            "fix_run_rejected_allowlist",
+            serde_json::json!({
+                "description": description_redacted,
+                "error": redact_secrets(&err.to_string()),
+            }),
+        );
+        return Err(err);
+    }
+    write_audit_event(
+        &artifact_root,
+        "fix_run_started",
+        serde_json::json!({
+            "description": description_redacted,
+            "max_agents": max_agents,
+            "max_cost": max_cost,
+            "noninteractive": noninteractive,
+            "ci": running_in_ci(),
+            "allowlist_override": env::var(VERIFIER_ALLOWLIST_OVERRIDE_ENV).ok(),
+        }),
+    )?;
+
+    println!("Mercury Fix: {}", description_redacted);
     println!("  Max agents: {max_agents}");
     println!("  Max cost: ${max_cost:.2}");
     println!("  Artifact bundle: {}", artifact_root.display());
+    if noninteractive {
+        println!("  Mode: noninteractive");
+    }
     println!();
 
     // Step 1: Init swarm session
@@ -727,6 +989,15 @@ async fn cmd_fix_with_verify_config(
 
     store_assessments(db, &plan.steps, &assessments, "fix")?;
     print_assessment_summary(&plan.steps, &assessments);
+    write_audit_event(
+        &artifact_root,
+        "fix_plan_ready",
+        serde_json::json!({
+            "plan_steps": plan.steps.len(),
+            "estimated_cost_usd": plan.estimated_cost,
+            "estimated_tokens": plan.estimated_tokens,
+        }),
+    )?;
 
     // Run initial merge
     let mut sched_config = config.to_scheduler_config();
@@ -772,6 +1043,17 @@ async fn cmd_fix_with_verify_config(
     let execution_summary: StepExecutionSummary =
         engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
             .await?;
+    write_audit_event(
+        &artifact_root,
+        "fix_execution_complete",
+        serde_json::json!({
+            "accepted_steps": execution_summary.accepted,
+            "rejected_steps": execution_summary.rejected,
+            "verification_failures": execution_summary.verification_failures,
+            "applied": execution_summary.applied,
+            "final_bundle_verified": execution_summary.final_bundle_verified,
+        }),
+    )?;
 
     // Step 7: Anneal + report
     println!("[6/7] Annealing...");
@@ -830,7 +1112,7 @@ async fn cmd_fix_with_verify_config(
     write_json_artifact(
         &artifact_root.join("metadata.json"),
         &FixRunMetadata {
-            description: description.to_string(),
+            description: description_redacted.clone(),
             max_agents,
             max_cost,
             started_at: started_at.to_rfc3339(),
@@ -860,6 +1142,16 @@ async fn cmd_fix_with_verify_config(
             &artifact_root.join("diff.patch"),
         )?;
     }
+    write_audit_event(
+        &artifact_root,
+        "fix_run_completed",
+        serde_json::json!({
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "total_cost_usd": total_cost_usd,
+            "budget_remaining_usd": budget_remaining_usd,
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    )?;
     println!("Artifacts written to {}", artifact_root.display());
 
     Ok(FixCommandOutcome {
@@ -876,12 +1168,21 @@ async fn cmd_watch(
     project_root: &Path,
     command: &str,
     repair: bool,
+    noninteractive: bool,
 ) -> Result<()> {
-    println!("Watching: {command}");
+    let watch_parts = verification::parse_allowlisted_verifier_parts(command)
+        .map_err(|err| anyhow::anyhow!("watch command rejected: {err}"))?;
+    let normalized_watch_command = watch_parts.join(" ");
+    let watch_command = redact_secrets(&normalized_watch_command);
+    println!("Watching: {watch_command}");
+    println!("Execution mode: direct allowlisted verifier command (no shell).");
     if repair {
         println!("Auto-repair enabled for supported Rust verifier commands.");
     } else {
         println!("Auto-repair disabled. Failures will be reported only.");
+    }
+    if noninteractive {
+        println!("Mode: noninteractive");
     }
     println!("Press Ctrl-C to stop.\n");
 
@@ -898,8 +1199,16 @@ async fn cmd_watch(
             println!("Change detected. Re-running watch cycle.\n");
         }
 
-        let outcome = execute_watch_cycle(config, db, project_root, command, repair).await?;
-        print_watch_cycle_result(&outcome);
+        let outcome = execute_watch_cycle(
+            config,
+            db,
+            project_root,
+            &watch_parts,
+            repair,
+            noninteractive,
+        )
+        .await?;
+        print_watch_cycle_result(&outcome, noninteractive);
         snapshot = capture_repo_watch_snapshot(project_root)?;
         println!();
     }
@@ -909,16 +1218,28 @@ async fn execute_watch_cycle(
     config: &MercuryConfig,
     db: &ThermalDb,
     project_root: &Path,
-    command: &str,
+    command_parts: &[String],
     repair: bool,
+    noninteractive: bool,
 ) -> Result<WatchCycleOutcome> {
     let started_at = Utc::now();
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
+    let command_display = command_parts.join(" ");
 
     println!("Running watch command...");
-    let initial_run = run_watch_command(command, project_root)?;
-    replay_watch_command_output("initial", &initial_run);
+    let initial_run = run_watch_command(command_parts, project_root)?;
+    replay_watch_command_output("initial", &initial_run, noninteractive);
+    write_audit_event(
+        &artifact_root,
+        "watch_cycle_initial_run",
+        serde_json::json!({
+            "command": initial_run.command,
+            "success": initial_run.success,
+            "exit_code": initial_run.exit_code,
+            "repair_requested": repair,
+        }),
+    )?;
 
     let mut decision = "passed_without_repair".to_string();
     let mut repair_record = None;
@@ -927,9 +1248,9 @@ async fn execute_watch_cycle(
     if !initial_run.success {
         if !repair {
             decision = "failed_without_repair".to_string();
-        } else if let Some(target) = classify_rust_repair_command(command) {
+        } else if let Some(target) = classify_rust_repair_command_parts(command_parts) {
             let verify_config = build_watch_verify_config(config, &target);
-            let description = build_watch_repair_description(command, &initial_run);
+            let description = build_watch_repair_description(&command_display, &initial_run);
             println!(
                 "Watch repair targeting `{}` with Mercury fix...",
                 target.verifier_command
@@ -943,6 +1264,7 @@ async fn execute_watch_cycle(
                 config.scheduler.max_cost_per_command,
                 verify_config,
                 initial_run.parsed_failure.as_ref(),
+                noninteractive,
             )
             .await
             {
@@ -988,8 +1310,8 @@ async fn execute_watch_cycle(
                         outcome.total_cost_usd, outcome.budget_remaining_usd
                     );
                     println!("Re-running watch command after repair...");
-                    let rerun = run_watch_command(command, project_root)?;
-                    replay_watch_command_output("confirmation", &rerun);
+                    let rerun = run_watch_command(command_parts, project_root)?;
+                    replay_watch_command_output("confirmation", &rerun, noninteractive);
                     let rerun_success = rerun.success;
                     confirmation_run = Some(rerun);
                     decision = if rerun_success {
@@ -1036,7 +1358,7 @@ async fn execute_watch_cycle(
 
     let finished_at = Utc::now();
     let record = WatchRunRecord {
-        command: command.to_string(),
+        command: command_display,
         repair_requested: repair,
         decision,
         initial_run,
@@ -1049,6 +1371,15 @@ async fn execute_watch_cycle(
 
     write_json_artifact(&artifact_root.join("watch.json"), &record)?;
     write_watch_output_artifacts(&artifact_root, &record)?;
+    write_audit_event(
+        &artifact_root,
+        "watch_cycle_completed",
+        serde_json::json!({
+            "decision": record.decision,
+            "duration_ms": record.duration_ms,
+            "repair_requested": record.repair_requested,
+        }),
+    )?;
 
     Ok(WatchCycleOutcome {
         artifact_root,
@@ -1329,11 +1660,13 @@ async fn main() -> Result<()> {
 
         Commands::Status {
             heatmap,
+            live,
+            interval_ms,
             agents,
             budget,
         } => {
             let (_config, db, _root) = load_project()?;
-            cmd_status(&db, heatmap, agents, budget)?;
+            cmd_status(&db, heatmap, live, interval_ms, agents, budget)?;
         }
 
         Commands::Plan { goal, output } => {
@@ -1443,14 +1776,30 @@ async fn main() -> Result<()> {
             description,
             max_agents,
             max_cost,
+            noninteractive,
         } => {
             let (config, db, root) = load_project()?;
-            cmd_fix(&config, &db, &root, &description, max_agents, max_cost).await?;
+            let noninteractive = is_noninteractive_mode(noninteractive);
+            cmd_fix(
+                &config,
+                &db,
+                &root,
+                &description,
+                max_agents,
+                max_cost,
+                noninteractive,
+            )
+            .await?;
         }
 
-        Commands::Watch { command, repair } => {
+        Commands::Watch {
+            command,
+            repair,
+            noninteractive,
+        } => {
             let (config, db, root) = load_project()?;
-            cmd_watch(&config, &db, &root, &command, repair).await?;
+            let noninteractive = is_noninteractive_mode(noninteractive);
+            cmd_watch(&config, &db, &root, &command, repair, noninteractive).await?;
         }
 
         Commands::Config { action } => match action {
@@ -1559,7 +1908,26 @@ fn classify_rust_repair_command(command: &str) -> Option<RustRepairTarget> {
     })
 }
 
+fn classify_rust_repair_command_parts(command_parts: &[String]) -> Option<RustRepairTarget> {
+    if command_parts.is_empty() {
+        return None;
+    }
+
+    let command_kind = failure_parser::classify_cargo_command(command_parts);
+    let mode = match command_kind {
+        CargoCommandKind::Test | CargoCommandKind::Check => RustRepairMode::TestLike,
+        CargoCommandKind::Clippy => RustRepairMode::Lint,
+        CargoCommandKind::Unknown => return None,
+    };
+
+    Some(RustRepairTarget {
+        verifier_command: command_parts.join(" "),
+        mode,
+    })
+}
+
 fn build_watch_repair_description(command: &str, result: &WatchCommandResult) -> String {
+    let command = redact_secrets(command);
     let mut description = format!(
         "Repair the repository so the Rust verifier command `{command}` succeeds.\nExit code: {}.\nFocus only on the changes needed to make that command pass.\n",
         result
@@ -1615,21 +1983,25 @@ fn truncate_watch_output(output: &str, max_chars: usize) -> String {
     format!("{truncated}\n...[truncated]")
 }
 
-fn run_watch_command(command: &str, working_dir: &Path) -> Result<WatchCommandResult> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let output = run_watch_command_with_shell(&shell, command, working_dir)
-        .or_else(|_| run_watch_command_with_shell("/bin/sh", command, working_dir))?;
+fn run_watch_command(command_parts: &[String], working_dir: &Path) -> Result<WatchCommandResult> {
+    let mut process = verification::build_allowlisted_verifier_command(command_parts, working_dir)
+        .map_err(|err| anyhow::anyhow!("watch command rejected: {err}"))?;
+    let output = process
+        .output()
+        .context("failed to execute watch command")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
     let parsed_failure = if output.status.success() {
         None
     } else {
-        parse_supported_watch_failure(command, &stdout, &stderr)
+        parse_supported_watch_failure(command_parts, &stdout_raw, &stderr_raw)
     };
+    let stdout = redact_secrets(&stdout_raw);
+    let stderr = redact_secrets(&stderr_raw);
 
     Ok(WatchCommandResult {
-        command: command.to_string(),
+        command: redact_secrets(&command_parts.join(" ")),
         success: output.status.success(),
         exit_code: output.status.code(),
         stdout,
@@ -1639,41 +2011,30 @@ fn run_watch_command(command: &str, working_dir: &Path) -> Result<WatchCommandRe
 }
 
 fn parse_supported_watch_failure(
-    command: &str,
+    command_parts: &[String],
     stdout: &str,
     stderr: &str,
 ) -> Option<mercury_cli::failure_parser::ParsedFailureReport> {
-    if failure_parser::contains_shell_composition(command) {
+    let command_kind = failure_parser::classify_verifier_command(command_parts);
+    if matches!(command_kind, failure_parser::VerifierCommandKind::Unknown) {
         return None;
     }
-    let parts = failure_parser::parse_command_parts(command);
-    let command_kind = failure_parser::classify_cargo_command(&parts);
-    if matches!(command_kind, CargoCommandKind::Unknown) {
-        return None;
-    }
-    Some(failure_parser::parse_cargo_failure(&parts, stdout, stderr))
+    Some(failure_parser::parse_verifier_failure(
+        &command_kind,
+        command_parts,
+        stdout,
+        stderr,
+    ))
 }
 
-fn run_watch_command_with_shell(
-    shell: &str,
-    command: &str,
-    working_dir: &Path,
-) -> Result<std::process::Output> {
-    Command::new(shell)
-        .arg("-lc")
-        .arg(command)
-        .current_dir(working_dir)
-        .output()
-        .with_context(|| format!("failed to execute watch command with shell `{shell}`"))
-}
-
-fn replay_watch_command_output(label: &str, result: &WatchCommandResult) {
+fn replay_watch_command_output(label: &str, result: &WatchCommandResult, noninteractive: bool) {
     let status = result
         .exit_code
         .map(|code| code.to_string())
         .unwrap_or_else(|| "signal".to_string());
+    let mode = if noninteractive { "ci" } else { "interactive" };
     println!(
-        "[watch:{label}] exit={status} success={}",
+        "[watch:{label}] mode={mode} exit={status} success={}",
         if result.success { "true" } else { "false" }
     );
     if !result.stdout.is_empty() {
@@ -1684,7 +2045,14 @@ fn replay_watch_command_output(label: &str, result: &WatchCommandResult) {
     }
 }
 
-fn print_watch_cycle_result(outcome: &WatchCycleOutcome) {
+fn print_watch_cycle_result(outcome: &WatchCycleOutcome, noninteractive: bool) {
+    if noninteractive {
+        println!(
+            "watch-cycle decision={} artifact={}",
+            outcome.record.decision,
+            outcome.artifact_root.display()
+        );
+    }
     println!("Decision: {}", outcome.record.decision);
     println!("Artifact bundle: {}", outcome.artifact_root.display());
     if let Some(repair) = outcome.record.repair.as_ref() {
@@ -1954,6 +2322,23 @@ mod tests {
     }
 
     #[test]
+    fn classify_rust_repair_command_parts_supports_direct_cargo_vectors() {
+        let parts = vec![
+            "env".to_string(),
+            "RUST_BACKTRACE=1".to_string(),
+            "cargo".to_string(),
+            "check".to_string(),
+            "--workspace".to_string(),
+        ];
+        let target = classify_rust_repair_command_parts(&parts).expect("command should classify");
+        assert_eq!(target.mode, RustRepairMode::TestLike);
+        assert_eq!(
+            target.verifier_command,
+            "env RUST_BACKTRACE=1 cargo check --workspace"
+        );
+    }
+
+    #[test]
     fn build_watch_verify_config_targets_only_the_requested_rust_verifier() {
         let config = sample_config();
         let clippy_target = classify_rust_repair_command("cargo clippy --workspace").unwrap();
@@ -1984,5 +2369,33 @@ mod tests {
         let after = capture_repo_watch_snapshot(temp.path()).unwrap();
 
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn verifier_allowlist_accepts_direct_rust_cargo_commands() {
+        assert!(verifier_command_allowlisted("cargo test"));
+        assert!(verifier_command_allowlisted(
+            "RUST_BACKTRACE=1 env RUSTFLAGS=-Dwarnings cargo +nightly clippy --workspace"
+        ));
+        assert!(verifier_command_allowlisted(
+            "env -i cargo check -p mercury-cli"
+        ));
+    }
+
+    #[test]
+    fn verifier_allowlist_rejects_shell_composition_and_non_cargo_commands() {
+        assert!(!verifier_command_allowlisted("cargo test && cargo clippy"));
+        assert!(!verifier_command_allowlisted("cargo test | tee out.txt"));
+        assert!(!verifier_command_allowlisted("pytest -q"));
+        assert!(!verifier_command_allowlisted(""));
+    }
+
+    #[test]
+    fn redact_secrets_scrubs_marker_lines() {
+        let input = "Authorization: Bearer abcdef\napi_key=12345\nnormal=value\n";
+        let output = redact_secrets(input);
+        assert!(output.contains("Authorization: [REDACTED]"));
+        assert!(output.contains("api_key=[REDACTED]"));
+        assert!(output.contains("normal=value"));
     }
 }

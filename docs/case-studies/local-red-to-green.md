@@ -64,6 +64,8 @@ mercury-cli init
 mercury-cli watch "cargo test -p your-crate" --repair
 ```
 
+For CI-safe log output, use `--noninteractive` (the GitHub workflow does this for `fix`).
+
 What to expect:
 
 - Mercury runs the watched command immediately.
@@ -97,7 +99,10 @@ Expected watch-level artifacts:
 - `watch.json`
 - `initial.stdout.txt`
 - `initial.stderr.txt`
+- `initial.failure.json` when a structured failure parse is available for the first run
 - `confirmation.stdout.txt` and `confirmation.stderr.txt` when Mercury reruns the verifier after repair
+- `confirmation.failure.json` when a structured failure parse is available for the confirmation rerun
+- `audit.log`
 
 Expected nested repair artifacts when the fix flow ran:
 
@@ -105,6 +110,7 @@ Expected nested repair artifacts when the fix flow ran:
 - `repair/execution-summary.json`
 - `repair/final-verification.json`
 - `repair/metadata.json`
+- `repair/plan.json` and `repair/grounded-context.json` when they exist in the source `fix` artifact root
 
 If the fix run produced its own artifact root, `watch.json` also records that source bundle path. Open that source bundle when you need the full `fix` evidence set:
 
@@ -117,6 +123,7 @@ If the fix run produced its own artifact root, `watch.json` also records that so
 - `metadata.json`
 - `diff.patch` when an accepted patch was produced
 - `swarm-state.json` when runtime state was captured
+- `audit.log`
 
 Minimum sanity check for a reproducible local handoff:
 
@@ -139,7 +146,7 @@ Expected outcomes:
 
 - green: the verifier passes and the accepted edits remain in the worktree
 - still red: inspect `watch.json` and the nested repair artifacts before deciding whether to keep iterating
-- unsupported repair target: `watch` still records the failure, but Mercury does not try to patch the repo
+- non-allowlisted watch command: the CLI rejects the command before running a watch cycle; rerun with a direct allowlisted verifier command
 
 ## Step 6: Promote the Result
 
@@ -154,6 +161,7 @@ If the local run is good enough to share, either commit the accepted change and 
 - `watch --repair` is Rust-first and only auto-repairs direct verifier commands.
 - Shell pipelines, chained commands, and wrapper tools are deliberately outside the current auto-repair target surface.
 - `--max-agents` should not be described as proof of real concurrent swarm execution yet.
+- TypeScript runtime support is still partial and should not be treated as a parity path for this case study yet.
 
 ## Cleanup
 

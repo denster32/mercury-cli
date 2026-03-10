@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       failure_command:
-        description: Shell command expected to fail before repair; workflow records whether it passes after repair.
+        description: Shell command expected to fail before repair; direct Rust cargo verifier commands are the primary repair target in current runtime behavior.
         required: true
         type: string
       repair_goal:
-        description: Optional higher-level repair goal passed to `mercury-cli fix`.
+        description: Optional higher-level repair goal passed to `mercury-cli fix` (advisory text, not a guarantee of broader language support).
         required: false
         type: string
       source_ref:
@@ -340,7 +340,8 @@ jobs:
                   max_cost = str(os.environ.get("MAX_COST") or "0.5")
                   repair_cmd = (
                       f"{shlex.quote(str(mercury_bin))} fix {shlex.quote(repair_goal)} "
-                      f"--max-agents {shlex.quote(max_agents)} --max-cost {shlex.quote(max_cost)}"
+                      f"--max-agents {shlex.quote(max_agents)} --max-cost {shlex.quote(max_cost)} "
+                      "--noninteractive"
                   )
                   repair = run_bash(repair_cmd, worktree_dir, env)
                   write_text(logs_dir / "repair.stdout.log", repair.stdout)
@@ -413,6 +414,7 @@ jobs:
                   "lint_command": (os.environ.get("LINT_COMMAND") or "").strip() or None,
                   "max_agents": os.environ.get("MAX_AGENTS"),
                   "max_cost": os.environ.get("MAX_COST"),
+                  "noninteractive_fix": True,
                   "worktree_dir": str(worktree_dir),
                   "mercury_run_dir": str(run_dir) if run_dir else None,
               }
@@ -443,10 +445,11 @@ jobs:
                   f"- Final bundle verified: `{str(final_bundle_verified).lower()}`",
                   f"- Patch applied: `{str(applied).lower()}`",
                   f"- Dry run: `{str(dry_run).lower()}`",
+                  "- Mercury fix invocation: `fix --noninteractive` (CI-safe log mode)",
                   f"- Post-repair verifier exit: `{post_verify_exit if post_verify_exit is not None else 'n/a'}`",
                   f"- Non-.mercury diff bytes: `{diff_bytes}`",
                   f"- Proposed branch: `{pr_branch}`",
-                  f"- Draft PR eligible: `{str(repair_verified).lower()}`",
+                  f"- Draft PR eligibility signal: `{str(repair_verified).lower()}`",
                   "- Draft PR mutation is only attempted after a verified repair when `dry_run=false` and the workflow can push to the same repository.",
                   f"- Mercury run directory: `{run_dir.name if run_dir else 'none'}`",
               ]

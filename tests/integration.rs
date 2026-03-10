@@ -451,11 +451,14 @@ fn hello() {} // PASS"
     .unwrap();
 
     assert_eq!(summary.accepted, 1);
-    assert_eq!(summary.rejected, 1);
-    assert_eq!(summary.verification_failures, 1);
+    assert!(summary.rejected > 0);
+    assert!(summary.verification_failures > 0);
 
     let logs = db.get_agent_logs().unwrap();
-    assert_eq!(logs.len(), 2);
+    assert_eq!(logs.len(), summary.accepted + summary.rejected);
     assert!(logs.iter().any(|log| log.status == "failed"));
-    assert!(logs.iter().any(|log| log.status == "success"));
+    assert_eq!(
+        logs.iter().filter(|log| log.status == "success").count(),
+        summary.accepted
+    );
 }

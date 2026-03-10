@@ -5,10 +5,14 @@
 //! - **Verifier**: tree-sitter parse → test → lint → optional Mercury 2 critique
 //! - **Scheduler**: tokio concurrency pool, budget tracking, thermal merge cycles
 
-use std::collections::BTreeMap;
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicI64, Ordering},
+    Arc,
+};
 use std::{collections::HashMap, path::PathBuf};
 
 use chrono::Utc;
@@ -23,11 +27,13 @@ use crate::api::{
 };
 use crate::db::{DbError, ThermalDb};
 use crate::failure_parser::{
-    classify_cargo_command, parse_cargo_failure, parse_command_parts, CargoCommandKind,
-    ParsedFailureReport,
+    classify_verifier_command, parse_command_parts, parse_verifier_failure, ParsedFailureReport,
+    VerifierCommandKind,
 };
-use crate::repo::RepoError;
+use crate::repo::{prepare_repair_workspace, RepoError};
+use crate::swarm::DensityController;
 use crate::thermal::{self, ThermalError};
+use crate::verification::build_allowlisted_verifier_command;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -322,7 +328,7 @@ impl<A: Mercury2Api> Verifier<A> {
 
         // Step 1: tree-sitter parse check
         if self.config.parse_before_write {
-            match self.check_parse(patched_content) {
+            match self.check_parse(file_path, patched_content) {
                 Ok(true) => {}
                 Ok(false) => {
                     result.parse_ok = false;
@@ -421,7 +427,7 @@ impl<A: Mercury2Api> Verifier<A> {
 
         if self.config.parse_before_write {
             for (relative_path, content) in accepted_states {
-                match self.check_parse(content) {
+                match self.check_parse(relative_path, content) {
                     Ok(true) => {}
                     Ok(false) => {
                         result.parse_ok = false;
@@ -506,7 +512,11 @@ impl<A: Mercury2Api> Verifier<A> {
         Ok(result)
     }
 
-    fn check_parse(&self, source: &str) -> Result<bool, EngineError> {
+    fn check_parse(&self, file_path: &Path, source: &str) -> Result<bool, EngineError> {
+        if file_path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            return Ok(true);
+        }
+
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -531,17 +541,24 @@ impl<A: Mercury2Api> Verifier<A> {
         }
 
         let command_parts = parse_command_parts(trimmed);
-        let output = Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(trimmed)
-            .arg("mercury-verifier")
-            .current_dir(working_dir)
-            .output()?;
+        let mut command = build_allowlisted_verifier_command(&command_parts, working_dir)
+            .map_err(|reason| EngineError::VerificationFailed { reason })?;
+        let output = command.output()?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let parsed_failure = if !output.status.success() {
-            parse_command_failure(&command_parts, &stdout, &stderr)
+            let kind = classify_verifier_command(&command_parts);
+            if matches!(kind, VerifierCommandKind::Unknown) {
+                None
+            } else {
+                Some(parse_verifier_failure(
+                    &kind,
+                    &command_parts,
+                    &stdout,
+                    &stderr,
+                ))
+            }
         } else {
             None
         };
@@ -643,6 +660,112 @@ impl StepExecutionSummary {
     }
 }
 
+struct ExecutionTelemetry {
+    swarm_id: i64,
+    agents_spawned: AtomicI64,
+    total_tokens: AtomicI64,
+    iterations: AtomicI64,
+}
+
+impl ExecutionTelemetry {
+    fn new(swarm_id: i64, agents_spawned: i64, total_tokens: i64, iterations: i64) -> Self {
+        Self {
+            swarm_id,
+            agents_spawned: AtomicI64::new(agents_spawned),
+            total_tokens: AtomicI64::new(total_tokens),
+            iterations: AtomicI64::new(iterations),
+        }
+    }
+
+    fn record_spawn(&self) -> i64 {
+        self.agents_spawned.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn record_usage(&self, tokens: i64) {
+        self.total_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    fn next_iteration(&self) -> i64 {
+        self.iterations.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn sync(
+        &self,
+        db: &ThermalDb,
+        scheduler: &Scheduler,
+        temperature: f64,
+        active_agents: i64,
+    ) -> Result<(), EngineError> {
+        db.update_swarm_state(
+            self.swarm_id,
+            self.agents_spawned.load(Ordering::Relaxed),
+            active_agents,
+            self.total_tokens.load(Ordering::Relaxed),
+            scheduler.current_cost(),
+            temperature,
+            self.iterations.load(Ordering::Relaxed),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ChangeFootprint {
+    touched_lines: usize,
+    byte_delta: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CandidateSource {
+    ApplyEdit,
+    CritiqueRetry,
+    ExploratoryNextEdit,
+}
+
+impl CandidateSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            CandidateSource::ApplyEdit => "apply_edit",
+            CandidateSource::CritiqueRetry => "critique_retry",
+            CandidateSource::ExploratoryNextEdit => "exploratory_next_edit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateFailureStage {
+    Generation,
+    Safety,
+    Verification,
+}
+
+impl CandidateFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            CandidateFailureStage::Generation => "generation",
+            CandidateFailureStage::Safety => "safety",
+            CandidateFailureStage::Verification => "verification",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CandidateOutcome {
+    agent_id: String,
+    log_id: i64,
+    sandbox_root: PathBuf,
+    source: CandidateSource,
+    candidate: Option<String>,
+    retry_attempts: usize,
+    total_tokens: i64,
+    total_cost: f64,
+    verification_errors: Vec<String>,
+    state_hash: Option<String>,
+    change_footprint: ChangeFootprint,
+    failure_stage: Option<CandidateFailureStage>,
+    reason: Option<String>,
+}
+
 /// Execute a plan's steps by patching and verifying each candidate edit.
 pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     plan: &ExecutionPlan,
@@ -654,6 +777,27 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
 ) -> Result<StepExecutionSummary, EngineError> {
     let run_root = create_run_root(project_root)?;
     let accepted_states = Arc::new(Mutex::new(HashMap::<PathBuf, String>::new()));
+    let swarm_state = db.get_swarm_state()?;
+    let swarm_id = swarm_state
+        .as_ref()
+        .map(|state| state.id)
+        .unwrap_or(db.init_swarm()?);
+    let telemetry = Arc::new(ExecutionTelemetry::new(
+        swarm_id,
+        swarm_state
+            .as_ref()
+            .map(|state| state.total_agents_spawned)
+            .unwrap_or_default(),
+        swarm_state
+            .as_ref()
+            .map(|state| state.total_tokens_used)
+            .unwrap_or_default(),
+        swarm_state
+            .as_ref()
+            .map(|state| state.iteration_count)
+            .unwrap_or_default(),
+    ));
+    telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
     let mut grouped_steps: BTreeMap<PathBuf, Vec<IndexedPlanStep>> = BTreeMap::new();
 
     for (index, step) in plan.steps.iter().cloned().enumerate() {
@@ -667,6 +811,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     let partials = stream::iter(grouped_steps.into_iter().map(|(relative_path, steps)| {
         let accepted_states = Arc::clone(&accepted_states);
         let run_root = run_root.clone();
+        let telemetry = Arc::clone(&telemetry);
         async move {
             execute_file_group(
                 relative_path,
@@ -678,6 +823,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
                 project_root,
                 &run_root,
                 accepted_states,
+                telemetry,
             )
             .await
         }
@@ -697,6 +843,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
 
     let accepted_snapshot = accepted_states.lock().await.clone();
     if accepted_snapshot.is_empty() {
+        telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
         return Ok(summary);
     }
 
@@ -718,6 +865,8 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     } else {
         summary.verification_failures += 1;
     }
+
+    telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
 
     Ok(summary)
 }
@@ -745,44 +894,48 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
     project_root: &Path,
     run_root: &Path,
     accepted_states: Arc<Mutex<HashMap<PathBuf, String>>>,
+    telemetry: Arc<ExecutionTelemetry>,
 ) -> Result<StepExecutionSummary, EngineError> {
-    let _permit = SchedulerPermit::new(scheduler.acquire().await?, scheduler);
     let mut summary = StepExecutionSummary::default();
+    let file_key = relative_path.to_string_lossy().to_string();
+    if db.is_file_locked(&file_key)? {
+        return Ok(summary);
+    }
+
+    ensure_file_aggregate(
+        db,
+        &file_key,
+        steps
+            .first()
+            .map(|indexed| indexed.step.priority)
+            .unwrap_or_default(),
+    )?;
+    let density_controller = DensityController::new(scheduler.config().max_concurrency as i32);
     let mut latest_state =
         read_latest_state(project_root, &accepted_states, &relative_path).await?;
+    let mut seen_hashes = HashSet::from([content_hash(&latest_state)]);
+    let total_steps = steps.len().max(1);
 
-    for indexed_step in steps {
-        let agent_id = format!("fix-step-{}", indexed_step.index + 1);
-        let log_id = db.log_agent_spawn(&agent_id, "fix", &indexed_step.step.file_path)?;
-        db.update_agent_status(log_id, "running", 0, 0.0, None)?;
-
-        let (candidate, initial_usage) = match patcher
-            .patch(&latest_state, &indexed_step.step.instruction)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                summary.rejected += 1;
-                let reason = format!("patch generation failed: {err}");
-                let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
-                db.update_agent_status(log_id, "failed", 0, 0.0, Some(&metadata.to_string()))?;
-                continue;
-            }
-        };
-
-        let mut total_tokens = initial_usage.tokens_used;
-        let mut total_cost = initial_usage.cost_usd;
-
-        if let Err(err) = scheduler.record_cost(initial_usage.cost_usd) {
-            summary.rejected += 1;
-            let reason = format!("budget rejected step: {err}");
-            let metadata = serde_json::json!({"outcome":"rejected", "reason": reason});
-            db.update_agent_status(
-                log_id,
-                "failed",
-                total_tokens,
-                total_cost,
-                Some(&metadata.to_string()),
+    for (position, indexed_step) in steps.into_iter().enumerate() {
+        let phase = thermal::phase_from_progress((position + 1) as i64, total_steps as i64);
+        let phase_temperature = phase_temperature(phase);
+        let aggregate_density = db
+            .get_aggregate(&file_key)?
+            .map(|aggregate| aggregate.agent_density)
+            .unwrap_or_default();
+        let fanout = candidate_fanout(
+            phase,
+            scheduler.config().max_concurrency.max(1),
+            indexed_step.step.priority,
+            aggregate_density,
+            &density_controller,
+        );
+        if fanout == 0 {
+            telemetry.sync(
+                db,
+                scheduler,
+                phase_temperature,
+                scheduler.active_count() as i64,
             )?;
             continue;
         }
@@ -793,9 +946,303 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
             sanitize_path_component(&indexed_step.step.file_path)
         ));
         let accepted_snapshot = accepted_states.lock().await.clone();
-        let attempt_one_root = step_root.join("attempt-1");
-        prepare_workspace(project_root, &attempt_one_root, &accepted_snapshot)?;
 
+        let outcomes = stream::iter((0..fanout).map(|candidate_index| {
+            execute_candidate_variant(
+                candidate_index,
+                &indexed_step,
+                phase,
+                &latest_state,
+                &accepted_snapshot,
+                patcher,
+                verifier,
+                scheduler,
+                db,
+                project_root,
+                &step_root,
+                &telemetry,
+            )
+        }))
+        .buffer_unordered(fanout)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut verified_candidates = Vec::new();
+        for outcome in outcomes {
+            let outcome = outcome?;
+            summary.retry_attempts += outcome.retry_attempts;
+            if outcome.candidate.is_some() {
+                verified_candidates.push(outcome);
+            } else {
+                summary.rejected += 1;
+                if matches!(
+                    outcome.failure_stage,
+                    Some(CandidateFailureStage::Verification)
+                ) {
+                    summary.verification_failures += 1;
+                }
+                let metadata = serde_json::json!({
+                    "outcome":"rejected",
+                    "reason": outcome.reason,
+                    "sandbox_root": outcome.sandbox_root.display().to_string(),
+                    "candidate_source": outcome.source.as_str(),
+                    "failure_stage": outcome.failure_stage.map(CandidateFailureStage::as_str),
+                    "retry_attempts": outcome.retry_attempts,
+                    "phase": phase.to_string(),
+                });
+                db.update_agent_status(
+                    outcome.log_id,
+                    "failed",
+                    outcome.total_tokens,
+                    outcome.total_cost,
+                    Some(&metadata.to_string()),
+                )?;
+            }
+        }
+
+        let mut ranked_candidates = Vec::new();
+        for mut outcome in verified_candidates {
+            if outcome
+                .state_hash
+                .as_ref()
+                .is_some_and(|hash| seen_hashes.contains(hash))
+            {
+                summary.rejected += 1;
+                outcome.reason = Some(
+                    "oscillation suppressed: candidate matches a previously accepted file state"
+                        .to_string(),
+                );
+                let metadata = serde_json::json!({
+                    "outcome":"rejected",
+                    "reason": outcome.reason,
+                    "sandbox_root": outcome.sandbox_root.display().to_string(),
+                    "candidate_source": outcome.source.as_str(),
+                    "retry_attempts": outcome.retry_attempts,
+                    "phase": phase.to_string(),
+                });
+                db.update_agent_status(
+                    outcome.log_id,
+                    "failed",
+                    outcome.total_tokens,
+                    outcome.total_cost,
+                    Some(&metadata.to_string()),
+                )?;
+            } else {
+                ranked_candidates.push(outcome);
+            }
+        }
+
+        rank_candidate_outcomes(&mut ranked_candidates);
+        let (ranked_candidates, duplicate_candidates) =
+            split_duplicate_state_candidates(ranked_candidates);
+        for duplicate in duplicate_candidates {
+            summary.rejected += 1;
+            let metadata = serde_json::json!({
+                "outcome":"rejected",
+                "reason":"duplicate verified candidate output",
+                "sandbox_root": duplicate.sandbox_root.display().to_string(),
+                "candidate_source": duplicate.source.as_str(),
+                "retry_attempts": duplicate.retry_attempts,
+                "phase": phase.to_string(),
+                "fanout": fanout,
+                "temperature": phase_temperature,
+                "touched_lines": duplicate.change_footprint.touched_lines,
+                "byte_delta": duplicate.change_footprint.byte_delta,
+            });
+            db.update_agent_status(
+                duplicate.log_id,
+                "failed",
+                duplicate.total_tokens,
+                duplicate.total_cost,
+                Some(&metadata.to_string()),
+            )?;
+        }
+
+        let mut ranked_iter = ranked_candidates.into_iter();
+        if let Some(winner) = ranked_iter.next() {
+            let accepted = winner
+                .candidate
+                .as_ref()
+                .cloned()
+                .expect("verified candidate must carry content");
+            latest_state = accepted.clone();
+            if let Some(hash) = winner.state_hash.as_ref() {
+                seen_hashes.insert(hash.clone());
+            }
+            accepted_states
+                .lock()
+                .await
+                .insert(relative_path.clone(), accepted.clone());
+            summary.accepted += 1;
+            write_cool_lock(db, &file_key, &accepted, &winner.agent_id)?;
+            db.lock_aggregate(&file_key)?;
+
+            let winner_metadata = serde_json::json!({
+                "outcome":"accepted",
+                "sandbox_root": winner.sandbox_root.display().to_string(),
+                "candidate_source": winner.source.as_str(),
+                "retry_attempts": winner.retry_attempts,
+                "phase": phase.to_string(),
+                "fanout": fanout,
+                "temperature": phase_temperature,
+                "touched_lines": winner.change_footprint.touched_lines,
+                "byte_delta": winner.change_footprint.byte_delta,
+            });
+            db.update_agent_status(
+                winner.log_id,
+                "success",
+                winner.total_tokens,
+                winner.total_cost,
+                Some(&winner_metadata.to_string()),
+            )?;
+
+            for loser in ranked_iter {
+                summary.rejected += 1;
+                let metadata = serde_json::json!({
+                    "outcome":"rejected",
+                    "reason":"lower-ranked competing candidate",
+                    "sandbox_root": loser.sandbox_root.display().to_string(),
+                    "candidate_source": loser.source.as_str(),
+                    "retry_attempts": loser.retry_attempts,
+                    "phase": phase.to_string(),
+                    "fanout": fanout,
+                    "temperature": phase_temperature,
+                    "touched_lines": loser.change_footprint.touched_lines,
+                    "byte_delta": loser.change_footprint.byte_delta,
+                });
+                db.update_agent_status(
+                    loser.log_id,
+                    "failed",
+                    loser.total_tokens,
+                    loser.total_cost,
+                    Some(&metadata.to_string()),
+                )?;
+            }
+        } else {
+            telemetry.sync(
+                db,
+                scheduler,
+                phase_temperature,
+                scheduler.active_count() as i64,
+            )?;
+        }
+    }
+
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
+    candidate_index: usize,
+    indexed_step: &IndexedPlanStep,
+    phase: thermal::ExecutionPhase,
+    latest_state: &str,
+    accepted_snapshot: &HashMap<PathBuf, String>,
+    patcher: &Patcher<E>,
+    verifier: &Verifier<A>,
+    scheduler: &Scheduler,
+    db: &ThermalDb,
+    project_root: &Path,
+    step_root: &Path,
+    telemetry: &ExecutionTelemetry,
+) -> Result<CandidateOutcome, EngineError> {
+    let agent_id = format!(
+        "fix-step-{:04}-candidate-{:02}",
+        indexed_step.index + 1,
+        candidate_index + 1
+    );
+    let log_id = db.log_agent_spawn(
+        &agent_id,
+        &format!("fix:{}", phase),
+        &indexed_step.step.file_path,
+    )?;
+    db.update_agent_status(log_id, "running", 0, 0.0, None)?;
+    telemetry.record_spawn();
+    telemetry.next_iteration();
+
+    let permit = SchedulerPermit::new(scheduler.acquire().await?, scheduler);
+    db.increment_density(&indexed_step.step.file_path)?;
+    telemetry.sync(
+        db,
+        scheduler,
+        phase_temperature(phase),
+        scheduler.active_count() as i64,
+    )?;
+
+    let result = async {
+        let mut total_tokens = 0i64;
+        let mut total_cost = 0.0;
+        let sandbox_root = step_root.join(format!("candidate-{:02}", candidate_index + 1));
+        let seed_history = build_seed_history(indexed_step, phase, candidate_index);
+
+        let primary = if candidate_index == 0 {
+            patcher
+                .patch(latest_state, &indexed_step.step.instruction)
+                .await
+        } else {
+            patcher
+                .next_edit_with_path(&indexed_step.step.file_path, latest_state, &seed_history)
+                .await
+        };
+
+        let (candidate, initial_usage) = match primary {
+            Ok(result) => result,
+            Err(err) => {
+                return Ok(CandidateOutcome {
+                    agent_id,
+                    log_id,
+                    sandbox_root: sandbox_root.join("attempt-1"),
+                    source: candidate_source(candidate_index, false),
+                    candidate: None,
+                    retry_attempts: 0,
+                    total_tokens,
+                    total_cost,
+                    verification_errors: Vec::new(),
+                    state_hash: None,
+                    change_footprint: ChangeFootprint {
+                        touched_lines: 0,
+                        byte_delta: 0,
+                    },
+                    failure_stage: Some(CandidateFailureStage::Generation),
+                    reason: Some(format!("patch generation failed: {err}")),
+                });
+            }
+        };
+
+        total_tokens += initial_usage.tokens_used;
+        total_cost += initial_usage.cost_usd;
+        telemetry.record_usage(initial_usage.tokens_used);
+        scheduler.record_cost(initial_usage.cost_usd)?;
+        telemetry.sync(
+            db,
+            scheduler,
+            phase_temperature(phase),
+            scheduler.active_count() as i64,
+        )?;
+
+        if let Some(reason) = unsafe_candidate_reason(latest_state, &candidate) {
+            return Ok(CandidateOutcome {
+                agent_id,
+                log_id,
+                sandbox_root: sandbox_root.join("attempt-1"),
+                source: candidate_source(candidate_index, false),
+                candidate: None,
+                retry_attempts: 0,
+                total_tokens,
+                total_cost,
+                verification_errors: Vec::new(),
+                state_hash: None,
+                change_footprint: change_footprint(latest_state, &candidate),
+                failure_stage: Some(CandidateFailureStage::Safety),
+                reason: Some(format!(
+                    "{} candidate rejected: {reason}",
+                    candidate_source(candidate_index, false).as_str()
+                )),
+            });
+        }
+
+        let attempt_one_root = sandbox_root.join("attempt-1");
+        prepare_workspace(project_root, &attempt_one_root, accepted_snapshot)?;
         let verify = verifier
             .verify(
                 &attempt_one_root.join(&indexed_step.step.file_path),
@@ -805,48 +1252,83 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
             .await?;
 
         if verify.is_ok() {
-            latest_state = candidate.clone();
-            accepted_states
-                .lock()
-                .await
-                .insert(relative_path.clone(), candidate);
-            summary.accepted += 1;
-            let metadata = serde_json::json!({
-                "outcome":"accepted",
-                "sandbox_root": attempt_one_root.display().to_string(),
-                "retry_attempts": 0,
-            });
-            db.update_agent_status(
+            return Ok(CandidateOutcome {
+                agent_id,
                 log_id,
-                "success",
+                sandbox_root: attempt_one_root,
+                source: candidate_source(candidate_index, false),
+                candidate: Some(candidate.clone()),
+                retry_attempts: 0,
                 total_tokens,
                 total_cost,
-                Some(&metadata.to_string()),
-            )?;
-            continue;
+                verification_errors: verify.errors,
+                state_hash: Some(content_hash(&candidate)),
+                change_footprint: change_footprint(latest_state, &candidate),
+                failure_stage: None,
+                reason: None,
+            });
         }
 
-        let mut rejection_reason = verify.errors.join("; ");
-        let mut rejection_root = attempt_one_root.clone();
-        let mut accepted_candidate: Option<(String, PathBuf)> = None;
+        if candidate_index == 0 {
+            if let Some(critique) = verify.critique.as_deref() {
+                let retry_history = format!(
+                    "{}\n\n{}",
+                    seed_history,
+                    build_retry_history(&indexed_step.step.instruction, &verify, critique)
+                );
+                db.update_agent_status(
+                    log_id,
+                    "retrying",
+                    total_tokens,
+                    total_cost,
+                    Some(
+                        &serde_json::json!({
+                            "phase": phase.to_string(),
+                            "sandbox_root": attempt_one_root.display().to_string(),
+                        })
+                        .to_string(),
+                    ),
+                )?;
+                match patcher
+                    .next_edit_with_path(&indexed_step.step.file_path, &candidate, &retry_history)
+                    .await
+                {
+                    Ok((retry_candidate, retry_usage)) => {
+                        total_tokens += retry_usage.tokens_used;
+                        total_cost += retry_usage.cost_usd;
+                        telemetry.record_usage(retry_usage.tokens_used);
+                        scheduler.record_cost(retry_usage.cost_usd)?;
+                        telemetry.sync(
+                            db,
+                            scheduler,
+                            phase_temperature(phase),
+                            scheduler.active_count() as i64,
+                        )?;
 
-        if let Some(critique) = verify.critique.as_deref() {
-            summary.retry_attempts += 1;
-            let retry_history =
-                build_retry_history(&indexed_step.step.instruction, &verify, critique);
-            match patcher
-                .next_edit_with_path(&indexed_step.step.file_path, &candidate, &retry_history)
-                .await
-            {
-                Ok((retry_candidate, retry_usage)) => {
-                    total_tokens += retry_usage.tokens_used;
-                    total_cost += retry_usage.cost_usd;
+                        if let Some(reason) = unsafe_candidate_reason(&candidate, &retry_candidate)
+                        {
+                            return Ok(CandidateOutcome {
+                                agent_id,
+                                log_id,
+                                sandbox_root: sandbox_root.join("attempt-2"),
+                                source: candidate_source(candidate_index, true),
+                                candidate: None,
+                                retry_attempts: 1,
+                                total_tokens,
+                                total_cost,
+                                verification_errors: Vec::new(),
+                                state_hash: None,
+                                change_footprint: change_footprint(latest_state, &retry_candidate),
+                                failure_stage: Some(CandidateFailureStage::Safety),
+                                reason: Some(format!(
+                                    "{} candidate rejected: {reason}",
+                                    candidate_source(candidate_index, true).as_str()
+                                )),
+                            });
+                        }
 
-                    if let Err(err) = scheduler.record_cost(retry_usage.cost_usd) {
-                        rejection_reason = format!("budget rejected retry: {err}");
-                    } else {
-                        let attempt_two_root = step_root.join("attempt-2");
-                        prepare_workspace(project_root, &attempt_two_root, &accepted_snapshot)?;
+                        let attempt_two_root = sandbox_root.join("attempt-2");
+                        prepare_workspace(project_root, &attempt_two_root, accepted_snapshot)?;
                         let retry_verify = verifier
                             .verify_internal(
                                 &attempt_two_root.join(&indexed_step.step.file_path),
@@ -857,59 +1339,96 @@ async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
                             .await?;
 
                         if retry_verify.is_ok() {
-                            accepted_candidate = Some((retry_candidate, attempt_two_root.clone()));
-                        } else {
-                            rejection_reason = retry_verify.errors.join("; ");
-                            rejection_root = attempt_two_root;
+                            return Ok(CandidateOutcome {
+                                agent_id,
+                                log_id,
+                                sandbox_root: attempt_two_root,
+                                source: candidate_source(candidate_index, true),
+                                candidate: Some(retry_candidate.clone()),
+                                retry_attempts: 1,
+                                total_tokens,
+                                total_cost,
+                                verification_errors: retry_verify.errors,
+                                state_hash: Some(content_hash(&retry_candidate)),
+                                change_footprint: change_footprint(latest_state, &retry_candidate),
+                                failure_stage: None,
+                                reason: None,
+                            });
                         }
+
+                        return Ok(CandidateOutcome {
+                            agent_id,
+                            log_id,
+                            sandbox_root: attempt_two_root,
+                            source: candidate_source(candidate_index, true),
+                            candidate: None,
+                            retry_attempts: 1,
+                            total_tokens,
+                            total_cost,
+                            verification_errors: retry_verify.errors.clone(),
+                            state_hash: None,
+                            change_footprint: ChangeFootprint {
+                                touched_lines: 0,
+                                byte_delta: 0,
+                            },
+                            failure_stage: Some(CandidateFailureStage::Verification),
+                            reason: Some(join_verification_errors(&retry_verify.errors)),
+                        });
                     }
-                }
-                Err(err) => {
-                    rejection_reason = format!("retry generation failed: {err}");
+                    Err(err) => {
+                        return Ok(CandidateOutcome {
+                            agent_id,
+                            log_id,
+                            sandbox_root: attempt_one_root,
+                            source: candidate_source(candidate_index, true),
+                            candidate: None,
+                            retry_attempts: 1,
+                            total_tokens,
+                            total_cost,
+                            verification_errors: verify.errors.clone(),
+                            state_hash: None,
+                            change_footprint: ChangeFootprint {
+                                touched_lines: 0,
+                                byte_delta: 0,
+                            },
+                            failure_stage: Some(CandidateFailureStage::Generation),
+                            reason: Some(format!("retry generation failed: {err}")),
+                        });
+                    }
                 }
             }
         }
 
-        if let Some((accepted, sandbox_root)) = accepted_candidate {
-            latest_state = accepted.clone();
-            accepted_states
-                .lock()
-                .await
-                .insert(relative_path.clone(), accepted);
-            summary.accepted += 1;
-            let metadata = serde_json::json!({
-                "outcome":"accepted",
-                "sandbox_root": sandbox_root.display().to_string(),
-                "retry_attempts": 1,
-            });
-            db.update_agent_status(
-                log_id,
-                "success",
-                total_tokens,
-                total_cost,
-                Some(&metadata.to_string()),
-            )?;
-            continue;
-        }
-
-        summary.rejected += 1;
-        summary.verification_failures += 1;
-        let metadata = serde_json::json!({
-            "outcome":"rejected",
-            "reason": rejection_reason,
-            "sandbox_root": rejection_root.display().to_string(),
-            "retry_attempts": usize::from(verify.critique.is_some()),
-        });
-        db.update_agent_status(
+        Ok(CandidateOutcome {
+            agent_id,
             log_id,
-            "failed",
+            sandbox_root: attempt_one_root,
+            source: candidate_source(candidate_index, false),
+            candidate: None,
+            retry_attempts: 0,
             total_tokens,
             total_cost,
-            Some(&metadata.to_string()),
-        )?;
+            verification_errors: verify.errors.clone(),
+            state_hash: None,
+            change_footprint: ChangeFootprint {
+                touched_lines: 0,
+                byte_delta: 0,
+            },
+            failure_stage: Some(CandidateFailureStage::Verification),
+            reason: Some(join_verification_errors(&verify.errors)),
+        })
     }
+    .await;
 
-    Ok(summary)
+    db.decrement_density(&indexed_step.step.file_path)?;
+    drop(permit);
+    telemetry.sync(
+        db,
+        scheduler,
+        phase_temperature(phase),
+        scheduler.active_count() as i64,
+    )?;
+    result
 }
 
 async fn read_latest_state(
@@ -941,20 +1460,7 @@ fn prepare_workspace(
     workspace_root: &Path,
     accepted_states: &HashMap<PathBuf, String>,
 ) -> Result<(), EngineError> {
-    if workspace_root.exists() {
-        std::fs::remove_dir_all(workspace_root)?;
-    }
-    std::fs::create_dir_all(workspace_root)?;
-    copy_project_tree(project_root, workspace_root, project_root)?;
-
-    for (relative_path, content) in accepted_states {
-        let destination = workspace_root.join(relative_path);
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(destination, content)?;
-    }
-
+    prepare_repair_workspace(project_root, workspace_root, accepted_states)?;
     Ok(())
 }
 
@@ -986,47 +1492,6 @@ fn write_bundle_diff(
 
     std::fs::write(run_root.join("accepted.patch"), output.stdout)?;
     Ok(())
-}
-
-fn copy_project_tree(source: &Path, destination: &Path, root: &Path) -> Result<(), EngineError> {
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let relative = source_path
-            .strip_prefix(root)
-            .unwrap_or(source_path.as_path());
-
-        if should_skip_copy(relative) {
-            continue;
-        }
-
-        let destination_path = destination.join(relative);
-        let metadata = entry.metadata()?;
-
-        if metadata.is_dir() {
-            std::fs::create_dir_all(&destination_path)?;
-            copy_project_tree(&source_path, destination, root)?;
-        } else if metadata.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&source_path, &destination_path)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn should_skip_copy(relative: &Path) -> bool {
-    let relative = relative.to_string_lossy();
-    relative == ".git"
-        || relative.starts_with(".git/")
-        || relative == "target"
-        || relative.starts_with("target/")
-        || relative == ".mercury/worktrees"
-        || relative.starts_with(".mercury/worktrees/")
-        || relative == ".mercury/runs"
-        || relative.starts_with(".mercury/runs/")
 }
 
 fn apply_changes_atomically(
@@ -1155,16 +1620,214 @@ fn build_retry_history(instruction: &str, verify: &VerifyResult, critique: &str)
     sections.join("\n\n")
 }
 
-fn parse_command_failure(
-    command_parts: &[String],
-    stdout: &str,
-    stderr: &str,
-) -> Option<ParsedFailureReport> {
-    if classify_cargo_command(command_parts) == CargoCommandKind::Unknown {
-        return None;
+fn ensure_file_aggregate(db: &ThermalDb, file_key: &str, priority: f64) -> Result<(), EngineError> {
+    let score = priority.clamp(0.0, 1.0);
+    if let Some(existing) = db.get_aggregate(file_key)? {
+        db.upsert_aggregate(
+            file_key,
+            existing.composite_score.max(score),
+            existing.max_score.max(score),
+            existing.agent_density,
+        )?;
+    } else {
+        db.upsert_aggregate(file_key, score, score, 0)?;
+    }
+    Ok(())
+}
+
+fn content_hash(source: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn change_footprint(before: &str, after: &str) -> ChangeFootprint {
+    let before_lines = before.lines().collect::<Vec<_>>();
+    let after_lines = after.lines().collect::<Vec<_>>();
+    let shared_prefix = before_lines
+        .iter()
+        .zip(after_lines.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let shared_suffix = before_lines[shared_prefix..]
+        .iter()
+        .rev()
+        .zip(after_lines[shared_prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let removed = before_lines
+        .len()
+        .saturating_sub(shared_prefix + shared_suffix);
+    let added = after_lines
+        .len()
+        .saturating_sub(shared_prefix + shared_suffix);
+
+    ChangeFootprint {
+        touched_lines: removed + added,
+        byte_delta: after.len().abs_diff(before.len()),
+    }
+}
+
+fn unsafe_candidate_reason(before: &str, after: &str) -> Option<&'static str> {
+    if !before.trim().is_empty() && after.trim().is_empty() {
+        return Some("blank rewrite would erase a non-empty file");
     }
 
-    Some(parse_cargo_failure(command_parts, stdout, stderr))
+    None
+}
+
+fn candidate_source(candidate_index: usize, retry: bool) -> CandidateSource {
+    if retry {
+        CandidateSource::CritiqueRetry
+    } else if candidate_index == 0 {
+        CandidateSource::ApplyEdit
+    } else {
+        CandidateSource::ExploratoryNextEdit
+    }
+}
+
+fn rank_candidate_outcomes(candidates: &mut [CandidateOutcome]) {
+    candidates.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.retry_attempts.cmp(&right.retry_attempts))
+            .then_with(|| left.change_footprint.cmp(&right.change_footprint))
+            .then_with(|| {
+                left.verification_errors
+                    .len()
+                    .cmp(&right.verification_errors.len())
+            })
+            .then_with(|| {
+                left.total_cost
+                    .partial_cmp(&right.total_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.agent_id.cmp(&right.agent_id))
+    });
+}
+
+fn split_duplicate_state_candidates(
+    candidates: Vec<CandidateOutcome>,
+) -> (Vec<CandidateOutcome>, Vec<CandidateOutcome>) {
+    let mut unique_candidates = Vec::with_capacity(candidates.len());
+    let mut duplicate_candidates = Vec::new();
+    let mut seen_hashes = HashSet::new();
+
+    for candidate in candidates {
+        let Some(state_hash) = candidate.state_hash.as_ref() else {
+            unique_candidates.push(candidate);
+            continue;
+        };
+        if seen_hashes.insert(state_hash.clone()) {
+            unique_candidates.push(candidate);
+        } else {
+            duplicate_candidates.push(candidate);
+        }
+    }
+
+    (unique_candidates, duplicate_candidates)
+}
+
+fn phase_temperature(phase: thermal::ExecutionPhase) -> f64 {
+    match phase {
+        thermal::ExecutionPhase::Scaffolding => 0.20,
+        thermal::ExecutionPhase::Resolution => 0.65,
+        thermal::ExecutionPhase::Annealing => 0.35,
+    }
+}
+
+fn candidate_fanout(
+    phase: thermal::ExecutionPhase,
+    max_concurrency: usize,
+    priority: f64,
+    current_density: i32,
+    density_controller: &DensityController,
+) -> usize {
+    let bounded_priority = priority.clamp(0.0, 1.0);
+    let max_density = density_controller
+        .max_density_for_score(bounded_priority)
+        .max(1) as usize;
+    let current_density = current_density.max(0) as usize;
+    if current_density >= max_density {
+        return 0;
+    }
+
+    let remaining_capacity = max_density.saturating_sub(current_density);
+    let phase_cap = match phase {
+        thermal::ExecutionPhase::Scaffolding => 1,
+        thermal::ExecutionPhase::Resolution => max_density,
+        thermal::ExecutionPhase::Annealing => max_density.div_ceil(2),
+    };
+
+    remaining_capacity
+        .min(phase_cap.max(1))
+        .min(max_concurrency.max(1))
+}
+
+fn write_cool_lock(
+    db: &ThermalDb,
+    file_key: &str,
+    content: &str,
+    agent_id: &str,
+) -> Result<(), EngineError> {
+    for lock in db
+        .get_all_locks()?
+        .into_iter()
+        .filter(|lock| lock.file_path == file_key)
+    {
+        db.remove_cool_lock(&lock.file_path, lock.line_start, lock.line_end)?;
+    }
+
+    let line_end = content.lines().count().max(1) as u32;
+    db.insert_cool_lock(file_key, 1, line_end, &content_hash(content), agent_id)?;
+    Ok(())
+}
+
+fn build_seed_history(
+    indexed_step: &IndexedPlanStep,
+    phase: thermal::ExecutionPhase,
+    candidate_index: usize,
+) -> String {
+    let instruction = indexed_step
+        .step
+        .instruction
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("+ {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instruction = if instruction.is_empty() {
+        "+ (no explicit instruction provided)".to_string()
+    } else {
+        instruction
+    };
+
+    format!(
+        concat!(
+            "--- a/{path}\n",
+            "+++ b/{path}\n",
+            "@@ -0,0 +1,5 @@\n",
+            "+ phase: {phase}\n",
+            "+ candidate: {candidate}\n",
+            "+ priority: {priority:.3}\n",
+            "+ file: {path}\n",
+            "{instruction}\n"
+        ),
+        path = indexed_step.step.file_path,
+        phase = phase,
+        candidate = candidate_index + 1,
+        priority = indexed_step.step.priority,
+        instruction = instruction,
+    )
+}
+
+fn join_verification_errors(errors: &[String]) -> String {
+    if errors.is_empty() {
+        return "verification failed without structured errors".to_string();
+    }
+
+    errors.join("\n")
 }
 
 struct SchedulerPermit<'a> {
@@ -1354,6 +2017,31 @@ mod tests {
         usage: ApiUsage,
     }
 
+    fn candidate_outcome(
+        agent_id: &str,
+        source: CandidateSource,
+        retry_attempts: usize,
+        total_cost: f64,
+        state_hash: Option<&str>,
+        change_footprint: ChangeFootprint,
+    ) -> CandidateOutcome {
+        CandidateOutcome {
+            agent_id: agent_id.to_string(),
+            log_id: 1,
+            sandbox_root: PathBuf::from("/tmp/candidate"),
+            source,
+            candidate: Some("candidate".to_string()),
+            retry_attempts,
+            total_tokens: 0,
+            total_cost,
+            verification_errors: Vec::new(),
+            state_hash: state_hash.map(ToString::to_string),
+            change_footprint,
+            failure_stage: None,
+            reason: None,
+        }
+    }
+
     impl crate::api::Mercury2Api for MockPlannerApi {
         async fn chat(
             &self,
@@ -1450,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_command_uses_shell_for_quoted_pipeline_commands() {
+    fn test_run_command_rejects_shell_composition() {
         let verifier = Verifier::new(
             VerifyConfig {
                 parse_before_write: false,
@@ -1464,19 +2152,17 @@ mod tests {
         );
         let temp = tempfile::tempdir().unwrap();
 
-        let output = verifier
-            .run_command("printf '%s' 'hello shell' | cat", temp.path())
-            .unwrap();
+        let err = match verifier.run_command("printf '%s' 'hello shell' | cat", temp.path()) {
+            Ok(output) => panic!(
+                "expected shell-composition rejection, got success={} command={}",
+                output.success, output.command
+            ),
+            Err(err) => err,
+        };
 
-        assert!(output.success);
-        assert_eq!(output.stdout, "hello shell");
-        assert_eq!(
-            output.command_parts,
-            vec![
-                "printf".to_string(),
-                "%s".to_string(),
-                "hello shell".to_string()
-            ]
+        assert!(
+            err.to_string().contains("command not allowlisted"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1503,7 +2189,9 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&cargo_script, permissions).unwrap();
 
-        let test_command = format!("PATH='{}:$PATH' cargo test", bin_dir.display());
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        let combined_path = format!("{}:{existing_path}", bin_dir.display());
+        let test_command = format!("PATH={combined_path} cargo test");
         let verifier = Verifier::new(
             VerifyConfig {
                 parse_before_write: true,
@@ -1572,5 +2260,141 @@ mod tests {
 
         let aggs = db.get_all_aggregates().unwrap();
         assert_eq!(aggs.len(), 2);
+    }
+
+    #[test]
+    fn test_change_footprint_prefers_localized_edit_over_full_rewrite() {
+        let baseline = "fn main() {\n    alpha();\n    beta();\n    gamma();\n}\n";
+        let localized = "fn main() {\n    alpha();\n    beta_fixed();\n    gamma();\n}\n";
+        let rewrite = "use std::process::ExitCode;\n\nfn main() -> ExitCode {\n    beta_fixed();\n    ExitCode::SUCCESS\n}\n";
+
+        assert!(change_footprint(baseline, localized) < change_footprint(baseline, rewrite));
+    }
+
+    #[test]
+    fn test_rank_candidate_outcomes_prefers_lower_churn_before_agent_id() {
+        let mut candidates = vec![
+            candidate_outcome(
+                "agent-z",
+                CandidateSource::ApplyEdit,
+                0,
+                0.01,
+                Some("hash-z"),
+                ChangeFootprint {
+                    touched_lines: 8,
+                    byte_delta: 12,
+                },
+            ),
+            candidate_outcome(
+                "agent-a",
+                CandidateSource::ApplyEdit,
+                0,
+                0.01,
+                Some("hash-a"),
+                ChangeFootprint {
+                    touched_lines: 2,
+                    byte_delta: 3,
+                },
+            ),
+        ];
+
+        rank_candidate_outcomes(&mut candidates);
+
+        assert_eq!(candidates[0].agent_id, "agent-a");
+        assert_eq!(candidates[1].agent_id, "agent-z");
+    }
+
+    #[test]
+    fn test_rank_candidate_outcomes_prefers_apply_edit_lineage_over_exploration() {
+        let mut candidates = vec![
+            candidate_outcome(
+                "agent-explore",
+                CandidateSource::ExploratoryNextEdit,
+                0,
+                0.001,
+                Some("explore-hash"),
+                ChangeFootprint {
+                    touched_lines: 1,
+                    byte_delta: 1,
+                },
+            ),
+            candidate_outcome(
+                "agent-apply",
+                CandidateSource::ApplyEdit,
+                0,
+                0.01,
+                Some("apply-hash"),
+                ChangeFootprint {
+                    touched_lines: 3,
+                    byte_delta: 4,
+                },
+            ),
+        ];
+
+        rank_candidate_outcomes(&mut candidates);
+
+        assert_eq!(candidates[0].agent_id, "agent-apply");
+        assert_eq!(candidates[1].agent_id, "agent-explore");
+    }
+
+    #[test]
+    fn test_unsafe_candidate_reason_rejects_blank_rewrite() {
+        assert_eq!(
+            unsafe_candidate_reason("fn keep() {}\n", ""),
+            Some("blank rewrite would erase a non-empty file")
+        );
+        assert_eq!(unsafe_candidate_reason("", ""), None);
+    }
+
+    #[test]
+    fn test_split_duplicate_state_candidates_keeps_best_ranked_output_once() {
+        let mut candidates = vec![
+            candidate_outcome(
+                "agent-duplicate-expensive",
+                CandidateSource::ApplyEdit,
+                0,
+                0.05,
+                Some("same-hash"),
+                ChangeFootprint {
+                    touched_lines: 3,
+                    byte_delta: 4,
+                },
+            ),
+            candidate_outcome(
+                "agent-unique",
+                CandidateSource::ApplyEdit,
+                0,
+                0.03,
+                Some("unique-hash"),
+                ChangeFootprint {
+                    touched_lines: 2,
+                    byte_delta: 2,
+                },
+            ),
+            candidate_outcome(
+                "agent-duplicate-cheap",
+                CandidateSource::ApplyEdit,
+                0,
+                0.01,
+                Some("same-hash"),
+                ChangeFootprint {
+                    touched_lines: 3,
+                    byte_delta: 4,
+                },
+            ),
+        ];
+
+        rank_candidate_outcomes(&mut candidates);
+        let (unique, duplicates) = split_duplicate_state_candidates(candidates);
+
+        assert_eq!(unique.len(), 2);
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].agent_id, "agent-duplicate-expensive");
+        assert!(unique
+            .iter()
+            .any(|candidate| candidate.agent_id == "agent-duplicate-cheap"));
+        assert!(unique
+            .iter()
+            .any(|candidate| candidate.agent_id == "agent-unique"));
     }
 }

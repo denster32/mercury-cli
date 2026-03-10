@@ -1,6 +1,7 @@
 use mercury_cli::failure_parser::{
-    classify_cargo_command, contains_shell_composition, parse_cargo_failure, parse_command_parts,
-    repo_native_tool_surface, CargoCommandKind, FailureStage,
+    classify_cargo_command, classify_verifier_command, contains_shell_composition,
+    parse_cargo_failure, parse_command_parts, parse_verifier_failure, repo_native_tool_surface,
+    CargoCommandKind, FailureStage, VerifierCommandKind,
 };
 
 #[test]
@@ -514,4 +515,122 @@ fn classify_cargo_command_handles_parsed_env_prefixed_toolchain_strings() {
         classify_cargo_command(&isolated_clippy_parts),
         CargoCommandKind::Clippy
     );
+}
+
+#[test]
+fn classify_verifier_command_supports_env_prefixed_typescript_commands() {
+    let npm_test = parse_command_parts("CI=1 env NODE_ENV=test npm run test -- --runInBand");
+    assert_eq!(
+        classify_verifier_command(&npm_test),
+        VerifierCommandKind::TypeScriptTest
+    );
+
+    let npx_lint = parse_command_parts("env -i npx --yes eslint src");
+    assert_eq!(
+        classify_verifier_command(&npx_lint),
+        VerifierCommandKind::TypeScriptLint
+    );
+
+    let pnpm_check = parse_command_parts("env NODE_ENV=ci pnpm exec tsc --noEmit");
+    assert_eq!(
+        classify_verifier_command(&pnpm_check),
+        VerifierCommandKind::TypeScriptCheck
+    );
+
+    let npx_with_package = parse_command_parts("npx -p typescript tsc --noEmit");
+    assert_eq!(
+        classify_verifier_command(&npx_with_package),
+        VerifierCommandKind::TypeScriptCheck
+    );
+}
+
+#[test]
+fn classify_verifier_command_rejects_unsupported_wrappers() {
+    let unknown_tool = parse_command_parts("npm run build");
+    assert_eq!(
+        classify_verifier_command(&unknown_tool),
+        VerifierCommandKind::Unknown
+    );
+
+    let unsupported_env_option = parse_command_parts("env -x cargo test");
+    assert_eq!(
+        classify_verifier_command(&unsupported_env_option),
+        VerifierCommandKind::Unknown
+    );
+}
+
+#[test]
+fn parse_verifier_failure_extracts_typescript_compile_targets() {
+    let command = parse_command_parts("pnpm exec tsc --noEmit");
+    let stdout = r#"
+src/util/math.ts(12,18): error TS2322: Type 'string' is not assignable to type 'number'.
+src/app.ts(20,7): error TS2304: Cannot find name 'missingHelper'.
+"#;
+    let stderr = "";
+    let report = parse_verifier_failure(
+        &VerifierCommandKind::TypeScriptCheck,
+        &command,
+        stdout,
+        stderr,
+    );
+
+    assert_eq!(report.command, CargoCommandKind::Unknown);
+    assert_eq!(report.stage, FailureStage::Compile);
+    assert_eq!(report.failures.len(), 2);
+    assert_eq!(report.failures[0].error_class, "compile.type_mismatch");
+    assert_eq!(
+        report.failures[0].target.file_path.as_deref(),
+        Some("src/util/math.ts")
+    );
+    assert_eq!(report.failures[0].target.line, Some(12));
+    assert_eq!(report.failures[0].target.column, Some(18));
+    assert_eq!(report.failures[1].error_class, "compile.missing_symbol");
+    assert_eq!(
+        report.failures[1].target.symbol.as_deref(),
+        Some("missingHelper")
+    );
+}
+
+#[test]
+fn parse_verifier_failure_extracts_typescript_test_and_lint_targets() {
+    let test_command = parse_command_parts("npm test -- --runInBand");
+    let test_stdout = r#"
+FAIL src/app.test.ts > user-service > returns cached result
+Error: Expected: 42
+at src/app.test.ts:31:11
+"#;
+    let test_report = parse_verifier_failure(
+        &VerifierCommandKind::TypeScriptTest,
+        &test_command,
+        test_stdout,
+        "",
+    );
+    assert_eq!(test_report.stage, FailureStage::Test);
+    assert_eq!(test_report.failures.len(), 1);
+    assert_eq!(test_report.failures[0].error_class, "test.assertion");
+    assert_eq!(
+        test_report.failures[0].target.file_path.as_deref(),
+        Some("src/app.test.ts")
+    );
+    assert_eq!(
+        test_report.failures[0].target.symbol.as_deref(),
+        Some("user-service::returns cached result")
+    );
+
+    let lint_command = parse_command_parts("npx eslint src");
+    let lint_stderr = "src/index.ts:14:9 error no-console";
+    let lint_report = parse_verifier_failure(
+        &VerifierCommandKind::TypeScriptLint,
+        &lint_command,
+        "",
+        lint_stderr,
+    );
+    assert_eq!(lint_report.stage, FailureStage::Lint);
+    assert_eq!(lint_report.failures.len(), 1);
+    assert_eq!(
+        lint_report.failures[0].target.file_path.as_deref(),
+        Some("src/index.ts")
+    );
+    assert_eq!(lint_report.failures[0].target.line, Some(14));
+    assert_eq!(lint_report.failures[0].target.column, Some(9));
 }

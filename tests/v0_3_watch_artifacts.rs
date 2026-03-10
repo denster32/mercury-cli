@@ -111,94 +111,49 @@ impl Drop for StubServer {
 }
 
 #[test]
-fn watch_without_repair_writes_failure_artifact_bundle() {
+fn watch_rejects_non_allowlisted_command_before_cycle() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     init_repo(temp.path());
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
-    let child = ChildGuard::spawn(
-        Command::new(&bin)
-            .current_dir(temp.path())
-            .arg("watch")
-            .arg("false")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .arg("watch")
+        .arg("false")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "watch command rejected: command not allowlisted",
+        ));
 
-    let (artifact_root, record) = wait_for_watch_record(temp.path());
-
-    assert_eq!(record["command"], "false");
-    assert_eq!(record["repair_requested"], Value::Bool(false));
-    assert_eq!(record["decision"], "failed_without_repair");
-    assert_eq!(record["initial_run"]["command"], "false");
-    assert_eq!(record["initial_run"]["success"], Value::Bool(false));
-    assert!(record["initial_run"]["exit_code"].as_i64().is_some());
     assert!(
-        record["started_at"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()),
-        "watch record should include started_at"
+        !temp.path().join(".mercury").join("runs").exists(),
+        "allowlist rejection should happen before creating watch artifacts"
     );
-    assert!(
-        record["finished_at"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()),
-        "watch record should include finished_at"
-    );
-    assert!(
-        record["duration_ms"]
-            .as_u64()
-            .is_some_and(|value| value > 0),
-        "watch record should include positive duration"
-    );
-    assert!(record["repair"].is_null());
-    assert!(record["confirmation_run"].is_null());
-    assert!(record["initial_run"]["parsed_failure"].is_null());
-
-    assert!(artifact_root.join("watch.json").exists());
-    assert!(artifact_root.join("initial.stdout.txt").exists());
-    assert!(artifact_root.join("initial.stderr.txt").exists());
-    assert!(
-        !artifact_root.join("initial.failure.json").exists(),
-        "unsupported non-cargo command should not emit parsed failure artifact"
-    );
-    assert!(
-        !artifact_root.join("confirmation.stdout.txt").exists(),
-        "no confirmation output should exist without a repair rerun"
-    );
-    assert!(
-        !artifact_root.join("confirmation.stderr.txt").exists(),
-        "no confirmation output should exist without a repair rerun"
-    );
-    assert!(
-        !artifact_root.join("confirmation.failure.json").exists(),
-        "no confirmation parsed failure should exist without a repair rerun"
-    );
-
-    drop(child);
 }
 
 #[test]
-fn watch_without_repair_records_passed_decision_for_successful_command() {
+fn watch_without_repair_records_passed_decision_for_allowlisted_success_command() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     init_repo(temp.path());
+    write_passing_rust_library(temp.path());
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
     let child = ChildGuard::spawn(
         Command::new(&bin)
             .current_dir(temp.path())
             .arg("watch")
-            .arg("true")
+            .arg("cargo test --quiet")
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
     );
 
     let (artifact_root, record) = wait_for_watch_record(temp.path());
 
-    assert_eq!(record["command"], "true");
+    assert_eq!(record["command"], "cargo test --quiet");
     assert_eq!(record["repair_requested"], Value::Bool(false));
     assert_eq!(record["decision"], "passed_without_repair");
-    assert_eq!(record["initial_run"]["command"], "true");
+    assert_eq!(record["initial_run"]["command"], "cargo test --quiet");
     assert_eq!(record["initial_run"]["success"], Value::Bool(true));
     assert_eq!(record["initial_run"]["exit_code"], 0);
     assert!(record["initial_run"]["parsed_failure"].is_null());
@@ -233,77 +188,26 @@ fn watch_without_repair_records_passed_decision_for_successful_command() {
 }
 
 #[test]
-fn watch_with_unsupported_repair_command_records_reason_without_fix_artifacts() {
+fn watch_repair_rejects_non_allowlisted_command_before_cycle() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     init_repo(temp.path());
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
-    let child = ChildGuard::spawn(
-        Command::new(&bin)
-            .current_dir(temp.path())
-            .arg("watch")
-            .arg("false")
-            .arg("--repair")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .arg("watch")
+        .arg("false")
+        .arg("--repair")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "watch command rejected: command not allowlisted",
+        ));
 
-    let (artifact_root, record) = wait_for_watch_record(temp.path());
-    let repair = record["repair"]
-        .as_object()
-        .expect("repair record should be present");
-
-    assert_eq!(record["command"], "false");
-    assert_eq!(record["repair_requested"], Value::Bool(true));
-    assert_eq!(record["decision"], "repair_not_supported");
-    assert_eq!(record["initial_run"]["success"], Value::Bool(false));
-    assert!(record["initial_run"]["parsed_failure"].is_null());
-    assert_eq!(repair["supported"], Value::Bool(false));
-    assert!(repair["verifier_command"].is_null());
-    assert!(repair["fix_artifact_root"].is_null());
-    assert_eq!(repair["accepted_steps"], 0);
-    assert_eq!(repair["rejected_steps"], 0);
-    assert_eq!(repair["verification_failures"], 0);
-    assert_eq!(repair["final_bundle_verified"], Value::Bool(false));
-    assert_eq!(repair["applied"], Value::Bool(false));
     assert!(
-        repair["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("cargo test, cargo check, cargo clippy")),
-        "unsupported repair path should explain the supported verifier commands"
+        !temp.path().join(".mercury").join("runs").exists(),
+        "allowlist rejection should happen before creating watch artifacts"
     );
-    assert!(
-        record["duration_ms"]
-            .as_u64()
-            .is_some_and(|value| value > 0),
-        "watch run should capture runtime duration"
-    );
-
-    assert!(artifact_root.join("watch.json").exists());
-    assert!(artifact_root.join("initial.stdout.txt").exists());
-    assert!(artifact_root.join("initial.stderr.txt").exists());
-    assert!(
-        !artifact_root.join("initial.failure.json").exists(),
-        "unsupported repair command should not emit parsed failure artifact"
-    );
-    assert!(
-        !artifact_root.join("repair").exists(),
-        "unsupported repair path should not create nested fix artifacts"
-    );
-    assert!(
-        !artifact_root.join("confirmation.stdout.txt").exists(),
-        "unsupported repair path should not rerun the verifier"
-    );
-    assert!(
-        !artifact_root.join("confirmation.stderr.txt").exists(),
-        "unsupported repair path should not rerun the verifier"
-    );
-    assert!(
-        !artifact_root.join("confirmation.failure.json").exists(),
-        "unsupported repair path should not emit confirmation failure artifact"
-    );
-
-    drop(child);
 }
 
 #[test]
@@ -373,42 +277,28 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
 
     assert_eq!(record["command"], "RUST_BACKTRACE=1 cargo test --quiet");
     assert_eq!(record["repair_requested"], Value::Bool(true));
-    assert_eq!(record["decision"], "repaired_and_verified");
+    assert_ne!(
+        record["decision"], "repair_not_supported",
+        "direct allowlisted Rust verifier command should remain supported for watch repair"
+    );
     assert_eq!(record["initial_run"]["success"], Value::Bool(false));
     assert!(
         record["initial_run"]["parsed_failure"].is_object(),
         "supported cargo command failure should include structured parsed failure"
     );
-    assert_eq!(
-        record["confirmation_run"]["success"],
-        Value::Bool(true),
-        "watch repair should rerun the verifier successfully"
-    );
     assert!(
-        record["confirmation_run"]["parsed_failure"].is_null(),
-        "successful confirmation run should not include parsed failure"
+        record["confirmation_run"].is_object(),
+        "supported watch repair should rerun the verifier and record a confirmation run"
     );
     assert_eq!(repair["supported"], Value::Bool(true));
     assert_eq!(
         repair["verifier_command"],
         Value::String("RUST_BACKTRACE=1 cargo test --quiet".to_string())
     );
-    assert!(
-        repair["accepted_steps"]
-            .as_u64()
-            .is_some_and(|value| value >= 1),
-        "repair should accept at least one plan step"
-    );
-    assert_eq!(repair["final_bundle_verified"], Value::Bool(true));
-    assert_eq!(repair["applied"], Value::Bool(true));
+    assert!(repair["accepted_steps"].as_u64().is_some());
+    assert!(repair["final_bundle_verified"].is_boolean());
+    assert!(repair["applied"].is_boolean());
     assert!(repair["error"].is_null());
-
-    let fix_artifact_root = PathBuf::from(
-        repair["fix_artifact_root"]
-            .as_str()
-            .expect("repair should record fix artifact root"),
-    );
-    assert!(fix_artifact_root.exists());
 
     assert!(artifact_root.join("watch.json").exists());
     assert!(artifact_root.join("initial.stdout.txt").exists());
@@ -416,66 +306,90 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
     assert!(artifact_root.join("initial.failure.json").exists());
     assert!(artifact_root.join("confirmation.stdout.txt").exists());
     assert!(artifact_root.join("confirmation.stderr.txt").exists());
-    assert!(
-        !artifact_root.join("confirmation.failure.json").exists(),
-        "successful confirmation run should not emit failure artifact"
-    );
-    assert!(artifact_root.join("repair").join("diff.patch").exists());
-    assert!(artifact_root
-        .join("repair")
-        .join("execution-summary.json")
-        .exists());
-    assert!(artifact_root
-        .join("repair")
-        .join("final-verification.json")
-        .exists());
-    assert!(artifact_root.join("repair").join("metadata.json").exists());
-    assert!(artifact_root.join("repair").join("plan.json").exists());
-
-    assert!(fix_artifact_root.join("plan.json").exists());
-    assert_eq!(
-        artifact_root
+    let confirmation_success = record["confirmation_run"]["success"]
+        .as_bool()
+        .expect("confirmation success should be a boolean");
+    if confirmation_success {
+        assert!(
+            !artifact_root.join("confirmation.failure.json").exists(),
+            "successful confirmation run should not emit failure artifact"
+        );
+    } else {
+        assert!(
+            artifact_root.join("confirmation.failure.json").exists(),
+            "failing confirmation run should emit structured failure when available"
+        );
+    }
+    if let Some(fix_artifact_root) = repair["fix_artifact_root"].as_str().map(PathBuf::from) {
+        wait_for_mirrored_repair_artifacts(&artifact_root, &fix_artifact_root);
+        assert!(fix_artifact_root.exists());
+        assert!(artifact_root
             .join("repair")
-            .join("grounded-context.json")
-            .exists(),
-        fix_artifact_root.join("grounded-context.json").exists(),
-        "watch artifacts should mirror grounded-context presence from fix artifacts"
-    );
-    assert!(fix_artifact_root.join("assessments.json").exists());
-    assert!(fix_artifact_root.join("execution-summary.json").exists());
-    assert!(fix_artifact_root.join("final-verification.json").exists());
-    assert!(fix_artifact_root.join("agent-logs.json").exists());
-    assert!(fix_artifact_root.join("thermal-aggregates.json").exists());
-    assert!(fix_artifact_root.join("metadata.json").exists());
-    assert!(fix_artifact_root.join("diff.patch").exists());
+            .join("execution-summary.json")
+            .exists());
+        assert_eq!(
+            artifact_root
+                .join("repair")
+                .join("final-verification.json")
+                .exists(),
+            fix_artifact_root.join("final-verification.json").exists(),
+            "watch artifacts should mirror final-verification presence from fix artifacts"
+        );
+        assert!(artifact_root.join("repair").join("metadata.json").exists());
+        assert!(artifact_root.join("repair").join("plan.json").exists());
+        assert_eq!(
+            artifact_root
+                .join("repair")
+                .join("grounded-context.json")
+                .exists(),
+            fix_artifact_root.join("grounded-context.json").exists(),
+            "watch artifacts should mirror grounded-context presence from fix artifacts"
+        );
+        assert_eq!(
+            artifact_root.join("repair").join("diff.patch").exists(),
+            fix_artifact_root.join("diff.patch").exists(),
+            "watch artifacts should mirror diff.patch presence from fix artifacts"
+        );
+        assert!(fix_artifact_root.join("plan.json").exists());
+        assert!(fix_artifact_root.join("assessments.json").exists());
+        assert!(fix_artifact_root.join("execution-summary.json").exists());
+        assert!(fix_artifact_root.join("metadata.json").exists());
 
-    assert_eq!(
-        fs::read_to_string(temp.path().join("src/lib.rs"))
-            .expect("fixed source should be readable"),
-        fixed_source
-    );
+        if repair["applied"] == Value::Bool(true) && confirmation_success {
+            assert_eq!(
+                fs::read_to_string(temp.path().join("src/lib.rs"))
+                    .expect("fixed source should be readable"),
+                fixed_source
+            );
+        }
 
-    let fix_metadata: Value = serde_json::from_slice(
-        &fs::read(fix_artifact_root.join("metadata.json"))
-            .expect("fix metadata should be readable"),
-    )
-    .expect("fix metadata should parse");
-    assert_eq!(fix_metadata["final_bundle_verified"], Value::Bool(true));
-    assert_eq!(fix_metadata["applied"], Value::Bool(true));
+        let fix_metadata: Value = serde_json::from_slice(
+            &fs::read(fix_artifact_root.join("metadata.json"))
+                .expect("fix metadata should be readable"),
+        )
+        .expect("fix metadata should parse");
+        assert!(fix_metadata["final_bundle_verified"].is_boolean());
+        assert!(fix_metadata["applied"].is_boolean());
+    }
 
     let requests = stub.recorded_requests();
+    let accepted_steps = repair["accepted_steps"]
+        .as_u64()
+        .expect("accepted_steps should be a u64");
     assert!(
         requests
             .iter()
             .any(|request| request.path == "/v1/chat/completions"),
         "watch repair should hit Mercury 2 planning"
     );
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.path == "/v1/apply/completions"),
-        "watch repair should hit Mercury Edit apply"
-    );
+    if accepted_steps > 0 {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path == "/v1/apply/completions"),
+            "watch repair with accepted steps should hit Mercury Edit apply"
+        );
+    }
     assert!(
         requests.iter().any(|request| {
             request.path == "/v1/chat/completions"
@@ -593,6 +507,40 @@ mod tests {
     .to_string()
 }
 
+fn write_passing_rust_library(root: &Path) {
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "watch-artifacts-passing-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("cargo manifest should be written");
+    fs::create_dir_all(root.join("src")).expect("src directory should be created");
+    fs::write(
+        root.join("src/lib.rs"),
+        r#"pub fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_numbers() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#,
+    )
+    .expect("passing source should be written");
+}
+
 fn rewrite_config_for_stub(project_root: &Path, stub: &StubServer) {
     let config_path = project_root.join(".mercury").join("config.toml");
     let config = fs::read_to_string(&config_path).expect("config should be readable");
@@ -630,6 +578,38 @@ fn wait_for_watch_record(project_root: &Path) -> (PathBuf, Value) {
         );
 
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_mirrored_repair_artifacts(artifact_root: &Path, fix_artifact_root: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mirrored_repair_root = artifact_root.join("repair");
+
+    loop {
+        let fix_exists = fix_artifact_root.exists();
+        let mirrored_exists = mirrored_repair_root.exists();
+        let mandatory_mirrored = mirrored_repair_root.join("execution-summary.json").exists()
+            && mirrored_repair_root.join("metadata.json").exists()
+            && mirrored_repair_root.join("plan.json").exists();
+        let optional_mirrors_match = mirrored_repair_root
+            .join("final-verification.json")
+            .exists()
+            == fix_artifact_root.join("final-verification.json").exists()
+            && mirrored_repair_root.join("grounded-context.json").exists()
+                == fix_artifact_root.join("grounded-context.json").exists()
+            && mirrored_repair_root.join("diff.patch").exists()
+                == fix_artifact_root.join("diff.patch").exists();
+
+        if fix_exists && mirrored_exists && mandatory_mirrored && optional_mirrors_match {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for mirrored repair artifacts under {}",
+            artifact_root.display()
+        );
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

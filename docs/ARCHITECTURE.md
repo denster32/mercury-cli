@@ -1,6 +1,6 @@
-# Mercury CLI Architecture (v0.3 Alpha)
+# Mercury CLI Architecture (v1.0 In Progress, Rust-First Runtime)
 
-This document describes the current runtime and trust boundaries for Mercury CLI as a v0.3 CI auto-repair alpha.
+This document describes the current runtime and trust boundaries for Mercury CLI in the v1.0-in-progress lane, with Rust-first repair behavior and implemented observability/hardening surfaces.
 
 Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
@@ -25,7 +25,15 @@ Mercury CLI is not a generic autonomous coding shell. The implemented product we
 - `cargo clippy ...`
 - optional env-prefix variants that still resolve directly to those commands
 
-Composed shell commands (`&&`, pipes, redirection, shell wrappers like `make test` or `just test`) are observed but marked `repair_not_supported`.
+Composed shell commands (`&&`, pipes, redirection, shell wrappers like `make test` or `just test`) are rejected at watch command parsing time and do not start a watch cycle.
+
+### Live Observability
+
+`mercury-cli status --live` provides a terminal-streaming summary dashboard for heatmap, agent, and budget views with configurable refresh (`--interval-ms`).
+
+It is not yet a candidate-level event stream or conflict-alert console.
+
+For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI workflow invokes `fix --noninteractive`.
 
 ### CI Draft PR Workflow
 
@@ -63,7 +71,11 @@ No patch is considered CI draft-PR eligible unless all are true:
 
 ### Reproducible artifacts
 
-Runs are expected to emit inspectable evidence for replay and audit.
+Runs are expected to emit inspectable evidence for replay and audit for the execution path that actually ran.
+
+Every run bundle now includes `audit.log` with JSONL event records (run start, plan readiness, execution result, completion, and watch-cycle milestones).
+
+Runtime output written into artifacts is redacted for known API-key markers and configured API-key env names.
 
 ## Evidence Bundle Contract
 
@@ -88,10 +100,19 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 - Eval harness (`evals/v0`) is manifest-driven and emits schema/version metadata in reports.
 - Planner critique text remains advisory prose and should not be treated as a strict machine contract.
 
+## Enterprise Hardening Baselines
+
+- Verifier allowlist enforces direct Rust cargo verifier commands and selected direct TypeScript verifier invocations by default (including supported env-prefix forms).
+- Shell composition in verifier commands is blocked unless `MERCURY_ALLOW_UNSAFE_VERIFIER_COMMANDS=1` is set explicitly.
+- Noninteractive mode is available for CI-oriented output surfaces.
+- End-to-end repair targeting remains Rust-first even though verification surfaces are broader.
+
 ## Known v0.3 Alpha Limits
 
 - Rust-first scope only for auto-repair targeting.
-- `--max-agents` currently configures budget/scheduler surfaces; do not treat it as proven runtime swarm speedup.
+- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but the repo does not yet publish benchmark-backed speedup claims or broad overlapping-edit convergence claims from that setting.
+- TypeScript lane support is partial: repo mapping/parser and selected verifier support exist, but end-to-end repair execution remains Rust-first and incomplete for TypeScript.
+- Live observability is summary-oriented today, not a full per-candidate trace or conflict-telemetry surface.
 - CI automation is draft-PR oriented, not autonomous merge.
 - Public benchmark reporting is still behind corpus/harness readiness.
 

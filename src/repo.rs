@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use git2::Repository;
 use thiserror::Error;
@@ -32,6 +33,10 @@ pub enum RepoError {
     /// A libgit2 error.
     #[error("git error: {0}")]
     Git(#[from] git2::Error),
+
+    /// A git command failed while preparing an isolated workspace.
+    #[error("git command failed (`{command}`): {stderr}")]
+    GitCommandFailed { command: String, stderr: String },
 }
 
 /// Convenience alias used throughout this module.
@@ -68,7 +73,7 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
-/// A single code symbol extracted from a Rust source file.
+/// A single code symbol extracted from a supported source file.
 #[derive(Debug, Clone)]
 pub struct Symbol {
     /// The identifier (e.g. function name, struct name).
@@ -109,7 +114,10 @@ pub struct ChurnScore {
 /// suitable for injection into Mercury 2's context window.
 #[derive(Debug, Clone)]
 pub struct RepoMap {
-    /// All symbols extracted from Rust source files.
+    /// All symbols extracted from indexed source files.
+    ///
+    /// Rust symbols come from tree-sitter parsing; TypeScript symbols are
+    /// collected with token-aware source scanning.
     pub symbols: Vec<Symbol>,
     /// Per-file git churn scores.
     pub churn_scores: Vec<ChurnScore>,
@@ -136,7 +144,7 @@ impl Language {
         match ext {
             "rs" => Some(Self::Rust),
             "py" => Some(Self::Python),
-            "ts" => Some(Self::TypeScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
             "go" => Some(Self::Go),
             "java" => Some(Self::Java),
             _ => None,
@@ -199,6 +207,151 @@ impl RepoLanguages {
             Language::Java => self.java,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace isolation
+// ---------------------------------------------------------------------------
+
+/// Prepare an isolated repair workspace rooted at `workspace_root`.
+///
+/// When `project_root` is a git repository, this creates a detached git
+/// worktree to avoid repository copies and guarantee candidate isolation from
+/// the user's primary working directory.
+///
+/// If the project is not a git repo, this falls back to a filtered copy so
+/// local tests and non-git fixtures still work.
+pub fn prepare_repair_workspace(
+    project_root: &Path,
+    workspace_root: &Path,
+    accepted_states: &HashMap<PathBuf, String>,
+) -> Result<()> {
+    if workspace_root.exists() {
+        let _ = cleanup_repair_workspace(project_root, workspace_root);
+    }
+    if let Some(parent) = workspace_root.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if Repository::discover(project_root).is_ok() {
+        create_detached_worktree(project_root, workspace_root)?;
+    } else {
+        fs::create_dir_all(workspace_root)?;
+        copy_workspace_tree(project_root, workspace_root, project_root)?;
+    }
+
+    for (relative_path, content) in accepted_states {
+        let destination = workspace_root.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(destination, content)?;
+    }
+
+    Ok(())
+}
+
+/// Remove an isolated repair workspace if it exists.
+///
+/// For git-backed workspaces this first unregisters the worktree from git,
+/// then removes any remaining on-disk directory.
+pub fn cleanup_repair_workspace(project_root: &Path, workspace_root: &Path) -> Result<()> {
+    if !workspace_root.exists() {
+        return Ok(());
+    }
+
+    if Repository::discover(project_root).is_ok() {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(workspace_root)
+            .output()?;
+        if !output.status.success() && workspace_root.exists() {
+            fs::remove_dir_all(workspace_root)?;
+        }
+
+        // Keep `.git/worktrees` metadata tidy for short-lived candidate roots.
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .arg("worktree")
+            .arg("prune")
+            .arg("--expire")
+            .arg("now")
+            .status();
+    } else {
+        fs::remove_dir_all(workspace_root)?;
+    }
+
+    Ok(())
+}
+
+fn create_detached_worktree(project_root: &Path, workspace_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg("--force")
+        .arg(workspace_root)
+        .arg("HEAD")
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let command = format!(
+        "git -C {} worktree add --detach --force {} HEAD",
+        project_root.display(),
+        workspace_root.display()
+    );
+    Err(RepoError::GitCommandFailed { command, stderr })
+}
+
+fn copy_workspace_tree(source: &Path, destination: &Path, root: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path
+            .strip_prefix(root)
+            .unwrap_or(source_path.as_path());
+
+        if should_skip_workspace_copy(relative) {
+            continue;
+        }
+
+        let destination_path = destination.join(relative);
+        let metadata = entry.metadata()?;
+
+        if metadata.is_dir() {
+            fs::create_dir_all(&destination_path)?;
+            copy_workspace_tree(&source_path, destination, root)?;
+        } else if metadata.is_file() {
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_workspace_copy(relative: &Path) -> bool {
+    let relative = relative.to_string_lossy();
+    relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative == ".mercury/worktrees"
+        || relative.starts_with(".mercury/worktrees/")
+        || relative == ".mercury/runs"
+        || relative.starts_with(".mercury/runs/")
 }
 
 // ---------------------------------------------------------------------------
@@ -317,16 +470,739 @@ pub fn parse_directory_with_languages(
 ) -> Result<Vec<Symbol>> {
     let mut all_symbols = Vec::new();
     walk_source_files(Path::new(dir_path), languages, &mut |path, language| {
-        if parser_for_language(language).is_none() {
-            return Ok(());
-        }
         let source = fs::read_to_string(path)?;
         let path_str = path.to_string_lossy().to_string();
-        let syms = parse_file(&path_str, &source)?;
+        let syms = parse_file_for_language(&path_str, &source, language)?;
         all_symbols.extend(syms);
         Ok(())
     })?;
+    sort_symbols(&mut all_symbols);
     Ok(all_symbols)
+}
+
+fn parse_file_for_language(path: &str, source: &str, language: Language) -> Result<Vec<Symbol>> {
+    match language {
+        Language::Rust => parse_file(path, source),
+        Language::TypeScript => Ok(parse_typescript_file(path, source)),
+        Language::Python | Language::Go | Language::Java => Ok(Vec::new()),
+    }
+}
+
+fn parse_typescript_file(path: &str, source: &str) -> Vec<Symbol> {
+    let masked = mask_typescript_non_code(source);
+    let tokens = tokenize_typescript(&masked);
+    let mut symbols = collect_typescript_symbols(path, &tokens);
+    sort_symbols(&mut symbols);
+    symbols
+}
+
+fn new_symbol_with_lines(
+    path: &str,
+    name: String,
+    kind: SymbolKind,
+    line_start: u32,
+    line_end: u32,
+) -> Symbol {
+    Symbol {
+        name,
+        kind,
+        file_path: path.to_string(),
+        line_start,
+        line_end: line_end.max(line_start),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TsTokenKind {
+    Identifier(String),
+    Punct(char),
+    Arrow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TsToken {
+    kind: TsTokenKind,
+    line: u32,
+}
+
+const TYPESCRIPT_DECLARATION_MODIFIERS: &[&str] =
+    &["export", "default", "declare", "async", "abstract"];
+
+fn mask_typescript_non_code(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut masked = String::with_capacity(source.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            masked.push(' ');
+            masked.push(' ');
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                masked.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i..].starts_with(b"/*") {
+            masked.push(' ');
+            masked.push(' ');
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"*/") {
+                    masked.push(' ');
+                    masked.push(' ');
+                    i += 2;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    masked.push('\n');
+                } else {
+                    masked.push(' ');
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if matches!(bytes[i], b'\'' | b'"' | b'`') {
+            let quote = bytes[i];
+            masked.push(' ');
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                if byte == b'\n' {
+                    masked.push('\n');
+                    escaped = false;
+                    i += 1;
+                    continue;
+                }
+
+                masked.push(' ');
+                i += 1;
+
+                if !escaped && byte == quote {
+                    break;
+                }
+
+                escaped = !escaped && byte == b'\\';
+            }
+            continue;
+        }
+
+        masked.push(bytes[i] as char);
+        i += 1;
+    }
+
+    masked
+}
+
+fn tokenize_typescript(source: &str) -> Vec<TsToken> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let mut line = 1_u32;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                line += 1;
+                i += 1;
+            }
+            b if b.is_ascii_whitespace() => i += 1,
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                tokens.push(TsToken {
+                    kind: TsTokenKind::Arrow,
+                    line,
+                });
+                i += 2;
+            }
+            b if is_typescript_identifier_start(b) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_typescript_identifier_continue(bytes[i]) {
+                    i += 1;
+                }
+                tokens.push(TsToken {
+                    kind: TsTokenKind::Identifier(source[start..i].to_string()),
+                    line,
+                });
+            }
+            b if matches!(
+                b as char,
+                '{' | '}'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | ';'
+                    | ','
+                    | ':'
+                    | '='
+                    | '<'
+                    | '>'
+                    | '?'
+                    | '!'
+                    | '*'
+                    | '.'
+            ) =>
+            {
+                tokens.push(TsToken {
+                    kind: TsTokenKind::Punct(b as char),
+                    line,
+                });
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    tokens
+}
+
+fn is_typescript_identifier_start(byte: u8) -> bool {
+    byte == b'_' || byte == b'$' || byte.is_ascii_alphabetic()
+}
+
+fn is_typescript_identifier_continue(byte: u8) -> bool {
+    is_typescript_identifier_start(byte) || byte.is_ascii_digit()
+}
+
+fn collect_typescript_symbols(path: &str, tokens: &[TsToken]) -> Vec<Symbol> {
+    let mut symbols = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        if token_is_punct(tokens, i, '{') {
+            if let Some(end) = find_matching_punct(tokens, i, '{', '}') {
+                i = end + 1;
+                continue;
+            }
+            break;
+        }
+
+        let decl_idx = skip_typescript_modifiers(tokens, i, TYPESCRIPT_DECLARATION_MODIFIERS);
+        let next = match identifier_at(tokens, decl_idx) {
+            Some("function") => parse_function_declaration(path, tokens, decl_idx, "default")
+                .map(|symbol| {
+                    symbols.push(symbol);
+                    advance_past_body_or_semicolon(tokens, decl_idx)
+                })
+                .unwrap_or(decl_idx + 1),
+            Some("class") => {
+                let (class_symbol, next_idx) =
+                    parse_declaration_with_body(path, tokens, decl_idx, SymbolKind::Struct);
+                if let Some(symbol) = class_symbol {
+                    symbols.push(symbol);
+                }
+                next_idx
+            }
+            Some("interface") => {
+                let (trait_symbol, next_idx) =
+                    parse_declaration_with_body(path, tokens, decl_idx, SymbolKind::Trait);
+                if let Some(symbol) = trait_symbol {
+                    symbols.push(symbol);
+                }
+                next_idx
+            }
+            Some("enum") => {
+                let (enum_symbol, next_idx) =
+                    parse_declaration_with_body(path, tokens, decl_idx, SymbolKind::Enum);
+                if let Some(symbol) = enum_symbol {
+                    symbols.push(symbol);
+                }
+                next_idx
+            }
+            Some("const" | "let" | "var") => {
+                let (statement_symbols, next_idx) =
+                    parse_variable_statement(path, tokens, decl_idx);
+                symbols.extend(statement_symbols);
+                next_idx
+            }
+            _ => i + 1,
+        };
+
+        i = next.max(i + 1);
+    }
+
+    symbols
+}
+
+fn parse_function_declaration(
+    path: &str,
+    tokens: &[TsToken],
+    function_idx: usize,
+    anonymous_name: &str,
+) -> Option<Symbol> {
+    let line_start = tokens.get(function_idx)?.line;
+    let mut cursor = function_idx + 1;
+    if token_is_punct(tokens, cursor, '*') {
+        cursor += 1;
+    }
+
+    let name = identifier_at(tokens, cursor)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| anonymous_name.to_string());
+    let line_end = find_body_or_semicolon_line_end(tokens, function_idx).unwrap_or(line_start);
+    Some(new_symbol_with_lines(
+        path,
+        name,
+        SymbolKind::Function,
+        line_start,
+        line_end,
+    ))
+}
+
+fn parse_declaration_with_body(
+    path: &str,
+    tokens: &[TsToken],
+    decl_idx: usize,
+    kind: SymbolKind,
+) -> (Option<Symbol>, usize) {
+    let line_start = tokens.get(decl_idx).map(|token| token.line).unwrap_or(1);
+    let name = identifier_at(tokens, decl_idx + 1)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "default".to_string());
+    let line_end = find_body_or_semicolon_line_end(tokens, decl_idx).unwrap_or(line_start);
+    let next_idx = advance_past_body_or_semicolon(tokens, decl_idx);
+    (
+        Some(new_symbol_with_lines(
+            path, name, kind, line_start, line_end,
+        )),
+        next_idx,
+    )
+}
+
+fn parse_variable_statement(
+    path: &str,
+    tokens: &[TsToken],
+    start_idx: usize,
+) -> (Vec<Symbol>, usize) {
+    let stmt_end = find_statement_end(tokens, start_idx).unwrap_or(tokens.len().saturating_sub(1));
+    let mut cursor = start_idx + 1;
+    let mut symbols = Vec::new();
+
+    while cursor <= stmt_end && cursor < tokens.len() {
+        cursor = skip_until_identifier_or_delimiter(tokens, cursor, stmt_end);
+        if cursor > stmt_end || token_is_punct(tokens, cursor, ';') {
+            break;
+        }
+
+        let Some(name) = identifier_at(tokens, cursor).map(ToOwned::to_owned) else {
+            cursor += 1;
+            continue;
+        };
+        let line_start = tokens[cursor].line;
+        cursor += 1;
+
+        while token_is_punct(tokens, cursor, '?') || token_is_punct(tokens, cursor, '!') {
+            cursor += 1;
+        }
+
+        if token_is_punct(tokens, cursor, ':') {
+            cursor = skip_type_annotation(tokens, cursor + 1, stmt_end);
+        }
+
+        if !token_is_punct(tokens, cursor, '=') {
+            cursor = advance_to_next_declarator(tokens, cursor, stmt_end);
+            continue;
+        }
+
+        let init_start = cursor + 1;
+        let decl_end = find_declarator_end(tokens, init_start, stmt_end);
+        if let Some((kind, line_end)) = classify_variable_initializer(tokens, init_start, decl_end)
+        {
+            symbols.push(new_symbol_with_lines(
+                path, name, kind, line_start, line_end,
+            ));
+        }
+        cursor = decl_end.saturating_add(1);
+    }
+
+    (symbols, stmt_end.saturating_add(1))
+}
+
+fn classify_variable_initializer(
+    tokens: &[TsToken],
+    init_start: usize,
+    decl_end: usize,
+) -> Option<(SymbolKind, u32)> {
+    if init_start > decl_end || init_start >= tokens.len() {
+        return None;
+    }
+
+    let cursor = skip_typescript_modifiers(tokens, init_start, &["async"]);
+    if matches!(identifier_at(tokens, cursor), Some("function")) {
+        return Some((
+            SymbolKind::Function,
+            find_body_or_semicolon_line_end(tokens, cursor).unwrap_or(tokens[cursor].line),
+        ));
+    }
+
+    if matches!(identifier_at(tokens, cursor), Some("class")) {
+        return Some((
+            SymbolKind::Struct,
+            find_body_or_semicolon_line_end(tokens, cursor).unwrap_or(tokens[cursor].line),
+        ));
+    }
+
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+    for idx in init_start..=decl_end.min(tokens.len().saturating_sub(1)) {
+        match &tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('{') => brace_depth += 1,
+            TsTokenKind::Punct('}') => brace_depth = brace_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Arrow
+                if paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
+                let line_end = find_arrow_initializer_line_end(tokens, idx + 1, decl_end)
+                    .unwrap_or(tokens[idx].line);
+                return Some((SymbolKind::Function, line_end));
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_arrow_initializer_line_end(
+    tokens: &[TsToken],
+    start_idx: usize,
+    decl_end: usize,
+) -> Option<u32> {
+    if start_idx > decl_end || start_idx >= tokens.len() {
+        return None;
+    }
+
+    if token_is_punct(tokens, start_idx, '{') {
+        return find_matching_punct(tokens, start_idx, '{', '}').map(|idx| tokens[idx].line);
+    }
+
+    Some(tokens[decl_end.min(tokens.len().saturating_sub(1))].line)
+}
+
+fn skip_until_identifier_or_delimiter(tokens: &[TsToken], mut idx: usize, end_idx: usize) -> usize {
+    while idx <= end_idx && idx < tokens.len() {
+        if matches!(tokens[idx].kind, TsTokenKind::Identifier(_))
+            || token_is_punct(tokens, idx, ';')
+            || token_is_punct(tokens, idx, ',')
+        {
+            break;
+        }
+
+        if token_is_punct(tokens, idx, '{') || token_is_punct(tokens, idx, '[') {
+            idx = skip_balanced_block(tokens, idx, end_idx).unwrap_or(idx + 1);
+            continue;
+        }
+
+        idx += 1;
+    }
+    idx
+}
+
+fn skip_type_annotation(tokens: &[TsToken], mut idx: usize, end_idx: usize) -> usize {
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+
+    while idx <= end_idx && idx < tokens.len() {
+        match &tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('{') => brace_depth += 1,
+            TsTokenKind::Punct('}') => brace_depth = brace_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Punct('=' | ',' | ';')
+                if paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    idx
+}
+
+fn find_statement_end(tokens: &[TsToken], start_idx: usize) -> Option<usize> {
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+    let mut idx = start_idx;
+
+    while idx < tokens.len() {
+        match tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('{') => brace_depth += 1,
+            TsTokenKind::Punct('}') => brace_depth = brace_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Punct(';')
+                if paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn find_declarator_end(tokens: &[TsToken], start_idx: usize, stmt_end: usize) -> usize {
+    find_terminator_with_limit(tokens, start_idx, stmt_end, true).unwrap_or(stmt_end)
+}
+
+fn advance_to_next_declarator(tokens: &[TsToken], mut idx: usize, stmt_end: usize) -> usize {
+    while idx <= stmt_end && idx < tokens.len() {
+        if token_is_punct(tokens, idx, ',') || token_is_punct(tokens, idx, ';') {
+            return idx + 1;
+        }
+        idx += 1;
+    }
+    stmt_end.saturating_add(1)
+}
+
+fn find_body_or_semicolon_line_end(tokens: &[TsToken], start_idx: usize) -> Option<u32> {
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+    let mut idx = start_idx;
+
+    while idx < tokens.len() {
+        match tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Punct('{')
+                if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+            {
+                return find_matching_punct(tokens, idx, '{', '}').map(|end| tokens[end].line);
+            }
+            TsTokenKind::Punct(';')
+                if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+            {
+                return Some(tokens[idx].line);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    tokens.last().map(|token| token.line)
+}
+
+fn advance_past_body_or_semicolon(tokens: &[TsToken], start_idx: usize) -> usize {
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+    let mut idx = start_idx;
+
+    while idx < tokens.len() {
+        match tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Punct('{')
+                if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+            {
+                return find_matching_punct(tokens, idx, '{', '}')
+                    .map(|end| end + 1)
+                    .unwrap_or(tokens.len());
+            }
+            TsTokenKind::Punct(';')
+                if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 =>
+            {
+                return idx + 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    tokens.len()
+}
+
+fn find_terminator(tokens: &[TsToken], start_idx: usize, stop_on_semicolon: bool) -> Option<usize> {
+    find_terminator_with_limit(
+        tokens,
+        start_idx,
+        tokens.len().saturating_sub(1),
+        stop_on_semicolon,
+    )
+}
+
+fn find_terminator_with_limit(
+    tokens: &[TsToken],
+    start_idx: usize,
+    end_idx: usize,
+    stop_on_semicolon: bool,
+) -> Option<usize> {
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    let mut angle_depth = 0_u32;
+    let mut idx = start_idx;
+
+    while idx <= end_idx && idx < tokens.len() {
+        match tokens[idx].kind {
+            TsTokenKind::Punct('(') => paren_depth += 1,
+            TsTokenKind::Punct(')') => paren_depth = paren_depth.saturating_sub(1),
+            TsTokenKind::Punct('[') => bracket_depth += 1,
+            TsTokenKind::Punct(']') => bracket_depth = bracket_depth.saturating_sub(1),
+            TsTokenKind::Punct('{') => brace_depth += 1,
+            TsTokenKind::Punct('}') => brace_depth = brace_depth.saturating_sub(1),
+            TsTokenKind::Punct('<') => angle_depth += 1,
+            TsTokenKind::Punct('>') => angle_depth = angle_depth.saturating_sub(1),
+            TsTokenKind::Punct(',')
+                if paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
+                return Some(idx);
+            }
+            TsTokenKind::Punct(';')
+                if stop_on_semicolon
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                    && brace_depth == 0
+                    && angle_depth == 0 =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn skip_balanced_block(tokens: &[TsToken], start_idx: usize, end_idx: usize) -> Option<usize> {
+    match &tokens.get(start_idx)?.kind {
+        TsTokenKind::Punct('{') => {
+            find_matching_punct(tokens, start_idx, '{', '}').map(|idx| idx + 1)
+        }
+        TsTokenKind::Punct('[') => {
+            find_matching_punct(tokens, start_idx, '[', ']').map(|idx| idx + 1)
+        }
+        _ => {
+            let _ = end_idx;
+            None
+        }
+    }
+}
+
+fn find_matching_punct(
+    tokens: &[TsToken],
+    start_idx: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
+    if !token_is_punct(tokens, start_idx, open) {
+        return None;
+    }
+
+    let mut depth = 0_u32;
+    for (idx, token) in tokens.iter().enumerate().skip(start_idx) {
+        match token.kind {
+            TsTokenKind::Punct(ch) if ch == open => depth += 1,
+            TsTokenKind::Punct(ch) if ch == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn skip_typescript_modifiers(tokens: &[TsToken], mut idx: usize, modifiers: &[&str]) -> usize {
+    while matches!(identifier_at(tokens, idx), Some(name) if modifiers.contains(&name)) {
+        idx += 1;
+    }
+    idx
+}
+
+fn identifier_at(tokens: &[TsToken], idx: usize) -> Option<&str> {
+    match &tokens.get(idx)?.kind {
+        TsTokenKind::Identifier(name) => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn token_is_punct(tokens: &[TsToken], idx: usize, punct: char) -> bool {
+    matches!(tokens.get(idx).map(|token| &token.kind), Some(TsTokenKind::Punct(ch)) if *ch == punct)
+}
+
+fn sort_symbols(symbols: &mut Vec<Symbol>) {
+    symbols.sort_by(cmp_symbols);
+    symbols.dedup_by(|left, right| {
+        left.file_path == right.file_path
+            && left.line_start == right.line_start
+            && left.line_end == right.line_end
+            && left.kind == right.kind
+            && left.name == right.name
+    });
+}
+
+fn cmp_symbols(left: &Symbol, right: &Symbol) -> std::cmp::Ordering {
+    left.file_path
+        .cmp(&right.file_path)
+        .then(left.line_start.cmp(&right.line_start))
+        .then(left.line_end.cmp(&right.line_end))
+        .then(symbol_kind_order(&left.kind).cmp(&symbol_kind_order(&right.kind)))
+        .then(left.name.cmp(&right.name))
+}
+
+fn symbol_kind_order(kind: &SymbolKind) -> u8 {
+    match kind {
+        SymbolKind::Function => 0,
+        SymbolKind::Struct => 1,
+        SymbolKind::Impl => 2,
+        SymbolKind::Trait => 3,
+        SymbolKind::Enum => 4,
+    }
 }
 
 fn should_skip_directory(path: &Path) -> bool {
@@ -537,6 +1413,9 @@ pub fn format_repo_map(map: &RepoMap) -> String {
     for sym in &map.symbols {
         by_file.entry(&sym.file_path).or_default().push(sym);
     }
+    for syms in by_file.values_mut() {
+        syms.sort_by(|left, right| cmp_symbols(left, right));
+    }
 
     // Sort file keys for deterministic output.
     let mut file_keys: Vec<&&str> = by_file.keys().collect();
@@ -579,6 +1458,8 @@ pub fn format_repo_map(map: &RepoMap) -> String {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
+    use std::process::Command;
 
     /// A small Rust source snippet used by multiple tests.
     const SAMPLE_SOURCE: &str = r#"
@@ -834,6 +1715,218 @@ impl Point {
     }
 
     #[test]
+    fn test_build_repo_map_includes_typescript_symbols_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("index.ts"),
+            r#"
+export function add(a: number, b: number): number { return a + b; }
+export class Calculator {}
+interface MathOps { add(a: number, b: number): number; }
+const handler = () => 42;
+"#,
+        )
+        .expect("write index.ts");
+
+        let languages = RepoLanguages {
+            rust: false,
+            python: false,
+            typescript: true,
+            go: false,
+            java: false,
+        };
+
+        let map = build_repo_map_with_languages(&dir.path().to_string_lossy(), &languages)
+            .expect("build repo map");
+
+        assert_eq!(map.indexed_file_count, 1);
+        assert_eq!(map.language_file_counts.get("typescript"), Some(&1));
+        assert!(map
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Function && s.name == "add"));
+        assert!(map
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Struct && s.name == "Calculator"));
+        assert!(map
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Trait && s.name == "MathOps"));
+        assert!(map
+            .symbols
+            .iter()
+            .any(|s| s.kind == SymbolKind::Function && s.name == "handler"));
+    }
+
+    #[test]
+    fn test_parse_typescript_tracks_multiline_symbols_and_ignores_false_positives() {
+        let source = r#"const docs = "function fake() {}";
+// class CommentOnly {}
+/*
+interface Hidden {}
+*/
+export async function loadThing<T>(
+  value: T,
+): Promise<T> {
+  return value;
+}
+
+const handler: (
+  input: string,
+) => Promise<string> = async (
+  input: string,
+) => {
+  return input;
+};
+
+const helper = function namedHelper() {
+  return 1;
+};
+
+const ViewModel = class InternalViewModel {};
+"#;
+
+        let symbols = parse_typescript_file("index.ts", source);
+        let summary = symbols
+            .iter()
+            .map(|symbol| {
+                (
+                    symbol.name.as_str(),
+                    symbol.kind.clone(),
+                    symbol.line_start,
+                    symbol.line_end,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            summary,
+            vec![
+                ("loadThing", SymbolKind::Function, 6, 10),
+                ("handler", SymbolKind::Function, 12, 18),
+                ("helper", SymbolKind::Function, 20, 22),
+                ("ViewModel", SymbolKind::Struct, 24, 24),
+            ]
+        );
+        assert!(
+            !symbols
+                .iter()
+                .any(|symbol| matches!(symbol.name.as_str(), "fake" | "CommentOnly" | "Hidden")),
+            "comments and string literals should not produce symbols"
+        );
+    }
+
+    #[test]
+    fn test_build_repo_map_extracts_typescript_symbols_from_module_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("view.tsx"),
+            r#"const first = () => 1,
+  second: () => number = () => 2,
+  third = function namedThird() {
+    return 3;
+  },
+  Widget = class Widget {};
+"#,
+        )
+        .expect("write view.tsx");
+        fs::write(
+            dir.path().join("server.mts"),
+            "export default function renderServer() {\n  return null;\n}\n",
+        )
+        .expect("write server.mts");
+        fs::write(
+            dir.path().join("legacy.cts"),
+            "export interface LegacyShape {\n  value: string;\n}\n",
+        )
+        .expect("write legacy.cts");
+
+        let languages = RepoLanguages {
+            rust: false,
+            python: false,
+            typescript: true,
+            go: false,
+            java: false,
+        };
+
+        let map = build_repo_map_with_languages(&dir.path().to_string_lossy(), &languages)
+            .expect("build repo map");
+        let symbol_names = map
+            .symbols
+            .iter()
+            .map(|symbol| format!("{}:{}:{}", symbol.file_path, symbol.kind, symbol.name))
+            .collect::<Vec<_>>();
+
+        assert_eq!(map.indexed_file_count, 3);
+        assert_eq!(map.language_file_counts.get("typescript"), Some(&3));
+        assert_eq!(
+            symbol_names,
+            vec![
+                format!(
+                    "{}:trait:LegacyShape",
+                    dir.path().join("legacy.cts").to_string_lossy()
+                ),
+                format!(
+                    "{}:fn:renderServer",
+                    dir.path().join("server.mts").to_string_lossy()
+                ),
+                format!("{}:fn:first", dir.path().join("view.tsx").to_string_lossy()),
+                format!(
+                    "{}:fn:second",
+                    dir.path().join("view.tsx").to_string_lossy()
+                ),
+                format!("{}:fn:third", dir.path().join("view.tsx").to_string_lossy()),
+                format!(
+                    "{}:struct:Widget",
+                    dir.path().join("view.tsx").to_string_lossy()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_format_repo_map_sorts_symbols_within_each_file() {
+        let map = RepoMap {
+            symbols: vec![
+                Symbol {
+                    name: "late".to_string(),
+                    kind: SymbolKind::Function,
+                    file_path: "src/app.ts".to_string(),
+                    line_start: 20,
+                    line_end: 22,
+                },
+                Symbol {
+                    name: "ViewModel".to_string(),
+                    kind: SymbolKind::Struct,
+                    file_path: "src/app.ts".to_string(),
+                    line_start: 3,
+                    line_end: 8,
+                },
+                Symbol {
+                    name: "early".to_string(),
+                    kind: SymbolKind::Function,
+                    file_path: "src/app.ts".to_string(),
+                    line_start: 10,
+                    line_end: 12,
+                },
+            ],
+            churn_scores: vec![],
+            indexed_file_count: 1,
+            language_file_counts: HashMap::from([("typescript".to_string(), 1)]),
+            total_lines: 30,
+        };
+
+        let output = format_repo_map(&map);
+        let view_model_idx = output.find("struct ViewModel").expect("ViewModel entry");
+        let early_idx = output.find("fn early").expect("early entry");
+        let late_idx = output.find("fn late").expect("late entry");
+
+        assert!(view_model_idx < early_idx);
+        assert!(early_idx < late_idx);
+    }
+
+    #[test]
     fn test_walk_source_files_skips_common_large_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join("target")).expect("mkdir target");
@@ -878,5 +1971,93 @@ impl Point {
         .expect("walk files");
 
         assert_eq!(visited, vec!["x.rs".to_string()]);
+    }
+
+    #[test]
+    fn test_prepare_repair_workspace_uses_git_worktree_not_repo_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_git_repo(dir.path());
+
+        fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+        fs::write(dir.path().join("src").join("lib.rs"), "fn original() {}\n").expect("write lib");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "init"]);
+
+        fs::write(dir.path().join("scratch.txt"), "untracked\n").expect("write scratch");
+
+        let workspace_root = dir
+            .path()
+            .join(".mercury")
+            .join("worktrees")
+            .join("candidate-01");
+
+        let mut accepted = HashMap::new();
+        accepted.insert(PathBuf::from("src/lib.rs"), "fn patched() {}\n".to_string());
+        prepare_repair_workspace(dir.path(), &workspace_root, &accepted)
+            .expect("prepare workspace");
+
+        let git_marker =
+            fs::read_to_string(workspace_root.join(".git")).expect("worktree .git file");
+        assert!(
+            git_marker.starts_with("gitdir: "),
+            "expected linked worktree .git marker"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("src/lib.rs")).expect("read patched file"),
+            "fn patched() {}\n"
+        );
+        assert!(
+            !workspace_root.join("scratch.txt").exists(),
+            "untracked files should not appear in detached worktree snapshots"
+        );
+    }
+
+    #[test]
+    fn test_prepare_repair_workspace_falls_back_when_not_git_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+        fs::write(dir.path().join("src").join("lib.rs"), "fn fallback() {}\n").expect("write lib");
+
+        let workspace_root = dir
+            .path()
+            .join(".mercury")
+            .join("worktrees")
+            .join("fallback");
+        let accepted = HashMap::new();
+        prepare_repair_workspace(dir.path(), &workspace_root, &accepted)
+            .expect("prepare workspace");
+
+        assert!(workspace_root.join("src/lib.rs").exists());
+        assert!(
+            !workspace_root.join(".git").exists(),
+            "fallback copy mode should not synthesize git metadata"
+        );
+    }
+
+    fn init_git_repo(path: &Path) {
+        run_git(path, &["init", "-q"]);
+        run_git(path, &["config", "user.email", "mercury@example.com"]);
+        run_git(path, &["config", "user.name", "Mercury Tests"]);
+    }
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Mercury Tests")
+            .env("GIT_AUTHOR_EMAIL", "mercury@example.com")
+            .env("GIT_COMMITTER_NAME", "Mercury Tests")
+            .env("GIT_COMMITTER_EMAIL", "mercury@example.com")
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git command failed: git -C {} {} stderr={}",
+            path.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

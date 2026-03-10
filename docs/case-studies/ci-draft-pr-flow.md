@@ -59,8 +59,9 @@ Workflow behavior:
 
 - creates an isolated detached worktree on the runner
 - reproduces the baseline failure first
-- runs `target/release/mercury-cli fix ...` only when baseline is red and API key is present
+- runs `target/release/mercury-cli fix ... --noninteractive` only when baseline is red and API key is present
 - repair targeting remains Rust-only (`cargo test`, `cargo check`, `cargo clippy` direct forms); unsupported command shapes may still produce artifacts but will not produce a verified repair
+- TypeScript support in v1.0 lane is still partial until full engine integration lands; do not treat this workflow as TypeScript-parity repair yet
 - uploads an evidence bundle and run summary for every terminal state
 - only attempts branch push and draft-PR mutation when repair is verified, the diff is non-empty, and `dry_run != true`
 - with `dry_run=true`, uploads evidence and run summary but skips branch push and PR mutation entirely
@@ -96,6 +97,8 @@ For the workflow path, download the uploaded artifact bundle from the Actions ru
 - `logs/mercury-init.stdout.log` and `logs/mercury-init.stderr.log` when the workflow ran init
 - copied `mercury-run/` when the workflow captured a nested `fix` run
 
+When `mercury-run/` exists, it includes the normal `fix` evidence set (for example `plan.json`, `execution-summary.json`, `metadata.json`, `diff.patch` when present, and `audit.log`).
+
 Minimum contract that must exist in every run artifact:
 
 - `summary.md`
@@ -117,6 +120,7 @@ For the manual path, archive:
 - `.mercury/runs/<run-id>/metadata.json`
 - `.mercury/runs/<run-id>/diff.patch` when present
 - `.mercury/runs/<run-id>/swarm-state.json` when present
+- `.mercury/runs/<run-id>/audit.log`
 
 If eval corpus checks are part of the branch gate, include:
 
