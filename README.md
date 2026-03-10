@@ -304,4 +304,10 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting guidance.
 
 ## License
 
-Custom non-commercial license. Personal, educational, research, and other non-commercial use is permitted. Commercial or revenue-generating use requires a separate license with the author. See [LICENSE](LICENSE).
+Mercury CLI is source-available under a custom non-commercial license.
+
+- You can use, modify, and share it for personal, educational, research, evaluation, and other non-commercial purposes.
+- You cannot profit from it, use it in commercial operations, or deploy derivative works commercially without Dennis Palucki's prior written permission.
+- Commercial terms are handled separately and may include revenue sharing or other negotiated terms.
+
+See [LICENSE](LICENSE) for the binding terms and [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for the plain-English summary and contact path.

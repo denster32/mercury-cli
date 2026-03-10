@@ -1,31 +1,35 @@
-Mercury CLI License
+Mercury CLI Non-Commercial License
 
 Copyright (c) 2026 Dennis Palucki
 
-Permission is granted to any person to use, copy, modify, and distribute this software for personal, educational, research, and non-commercial purposes, free of charge, subject to the following conditions:
+Permission is granted to any person to use, copy, modify, and distribute this software for personal, educational, research, evaluation, and other non-commercial purposes, free of charge, subject to the conditions below.
 
-1. Non-Commercial Use
+1. Permitted Non-Commercial Use
 
-You may freely use, modify, and share this software for any purpose that does not generate revenue. This includes personal projects, academic research, open-source contributions, and learning.
+You may freely use, modify, and share this software for non-commercial purposes only. Permitted examples include personal projects, academic research, classroom use, evaluation, learning, and non-commercial open-source collaboration.
 
-2. Commercial Use Requires a License
+2. Commercial Use Requires Prior Written Permission
 
-Any use of this software, its architecture, or derivative works that generates revenue, including but not limited to:
+You may not use this software, its architecture, or derivative works for any Commercial Use without prior written permission from the author.
+
+For purposes of this license, "Commercial Use" includes any use primarily intended for or directed toward commercial advantage, private monetary compensation, business operations, or revenue generation, including but not limited to:
 
 - Selling products or services built with this software
 - Integrating this software into commercial products
 - Using this software to provide paid services
+- Offering hosted, managed, or SaaS access based on this software
+- Using this software internally in connection with a business, client engagement, consulting engagement, or paid contract
 - Incorporating the thermal field architecture, stigmergic coordination patterns, or other novel methods described in this project into revenue-generating products
 
-requires a separate commercial license agreement with the author.
+If you want to make Commercial Use of this software, you must first enter into a separate written commercial license agreement with the author.
 
 3. Revenue Sharing
 
-Commercial licensees shall negotiate a revenue sharing arrangement with the author prior to any commercial deployment.
+Commercial licensees must negotiate commercial terms, which may include revenue sharing, before any commercial deployment.
 
 4. Attribution
 
-All copies or substantial portions of this software must include this license notice and the above copyright notice.
+All copies or substantial portions of this software, including modified versions and redistributed derivative works, must include this license notice and the above copyright notice.
 
 5. No Warranty
 
