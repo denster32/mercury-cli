@@ -1,0 +1,11 @@
+{
+  "name": "fixture",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "check": "node scripts/check.js",
+    "test": "node scripts/test.js",
+    "lint": "node scripts/lint.js"
+  }
+}

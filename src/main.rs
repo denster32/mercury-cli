@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use mercury_cli::api::{self, Mercury2Client, MercuryEditClient};
@@ -250,7 +251,7 @@ enum Commands {
         /// Render the thermal heatmap.
         #[arg(long)]
         heatmap: bool,
-        /// Stream status updates continuously until Ctrl-C.
+        /// Stream status updates continuously in a TTY until Ctrl-C.
         #[arg(long)]
         live: bool,
         /// Live refresh interval in milliseconds.
@@ -289,19 +290,19 @@ enum Commands {
         /// Maximum cost in USD.
         #[arg(long, default_value = "0.50")]
         max_cost: f64,
-        /// Enforce non-interactive output intended for CI logs.
+        /// Emit compact CI-safe runtime events instead of interactive progress output.
         #[arg(long)]
         noninteractive: bool,
     },
 
-    /// Watch a shell command and auto-repair failures.
+    /// Watch an allowlisted verifier command and auto-repair failures.
     Watch {
-        /// The allowlisted verifier command to watch.
+        /// The direct allowlisted verifier command to watch.
         command: String,
         /// Auto-repair failures.
         #[arg(long)]
         repair: bool,
-        /// Enforce non-interactive output intended for CI logs.
+        /// Run a single CI-safe watch cycle with compact runtime events.
         #[arg(long)]
         noninteractive: bool,
     },
@@ -413,6 +414,8 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "password",
     "secret",
 ];
+const SANDBOX_POLICY: &str = "repo_isolated_worktree_copy";
+const EXECUTION_SANDBOX_ENFORCED: bool = false;
 
 fn running_in_ci() -> bool {
     env::var("CI")
@@ -427,15 +430,25 @@ fn is_noninteractive_mode(explicit: bool) -> bool {
     explicit || running_in_ci() || !std::io::stdout().is_terminal()
 }
 
+fn allowlist_override_active() -> bool {
+    env::var(VERIFIER_ALLOWLIST_OVERRIDE_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn verifier_command_allowlisted(command: &str) -> bool {
     verification::verifier_command_allowlisted(command)
 }
 
 fn enforce_verifier_allowlist(verify_config: &VerifyConfig) -> Result<()> {
-    let override_enabled = env::var(VERIFIER_ALLOWLIST_OVERRIDE_ENV)
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let override_enabled = allowlist_override_active();
     if override_enabled {
+        if running_in_ci() {
+            anyhow::bail!(
+                "verifier allowlist override via {} is disabled in CI",
+                VERIFIER_ALLOWLIST_OVERRIDE_ENV
+            );
+        }
         eprintln!(
             "WARNING: verifier command allowlist bypass enabled via {}",
             VERIFIER_ALLOWLIST_OVERRIDE_ENV
@@ -508,16 +521,45 @@ fn redact_secrets(text: &str) -> String {
     joined
 }
 
+fn redact_json_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_secrets(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, redact_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn event_payload(event: &str, details: Value) -> Value {
+    serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "event": event,
+        "details": redact_json_value(details),
+    })
+}
+
+fn emit_runtime_event(noninteractive: bool, event: &str, details: Value) {
+    if !noninteractive {
+        return;
+    }
+
+    let payload = event_payload(event, details);
+    match serde_json::to_string(&payload) {
+        Ok(line) => println!("{line}"),
+        Err(err) => eprintln!("failed to serialize runtime event {event}: {err}"),
+    }
+}
+
 fn write_audit_event(artifact_root: &Path, event: &str, details: serde_json::Value) -> Result<()> {
     let path = artifact_root.join("audit.log");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let payload = serde_json::json!({
-        "timestamp": Utc::now().to_rfc3339(),
-        "event": event,
-        "details": details,
-    });
+    let payload = event_payload(event, details);
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(&mut file, &payload)?;
     file.write_all(b"\n")?;
@@ -813,6 +855,7 @@ struct WatchRepairRecord {
     supported: bool,
     verifier_command: Option<String>,
     fix_artifact_root: Option<String>,
+    sandbox_run_root: Option<String>,
     accepted_steps: usize,
     rejected_steps: usize,
     verification_failures: usize,
@@ -826,6 +869,7 @@ struct WatchRunRecord {
     command: String,
     repair_requested: bool,
     decision: String,
+    security: SecurityRuntimeContext,
     initial_run: WatchCommandResult,
     confirmation_run: Option<WatchCommandResult>,
     repair: Option<WatchRepairRecord>,
@@ -900,14 +944,27 @@ async fn cmd_fix_with_verify_config(
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
     let description_redacted = redact_secrets(description);
+    let start_security = security_runtime_context(noninteractive, None);
 
     if let Err(err) = enforce_verifier_allowlist(&verify_config) {
+        let error = redact_secrets(&err.to_string());
         let _ = write_audit_event(
             &artifact_root,
             "fix_run_rejected_allowlist",
             serde_json::json!({
                 "description": description_redacted,
-                "error": redact_secrets(&err.to_string()),
+                "error": error,
+                "security": start_security.clone(),
+            }),
+        );
+        emit_runtime_event(
+            noninteractive,
+            "fix_run_rejected_allowlist",
+            serde_json::json!({
+                "description": description_redacted,
+                "artifact_root": artifact_root.display().to_string(),
+                "error": error,
+                "security": start_security.clone(),
             }),
         );
         return Err(err);
@@ -919,36 +976,64 @@ async fn cmd_fix_with_verify_config(
             "description": description_redacted,
             "max_agents": max_agents,
             "max_cost": max_cost,
-            "noninteractive": noninteractive,
-            "ci": running_in_ci(),
-            "allowlist_override": env::var(VERIFIER_ALLOWLIST_OVERRIDE_ENV).ok(),
+            "artifact_root": artifact_root.display().to_string(),
+            "security": start_security.clone(),
         }),
     )?;
+    emit_runtime_event(
+        noninteractive,
+        "fix_run_started",
+        serde_json::json!({
+            "description": description_redacted,
+            "max_agents": max_agents,
+            "max_cost": max_cost,
+            "artifact_root": artifact_root.display().to_string(),
+            "security": start_security.clone(),
+        }),
+    );
 
-    println!("Mercury Fix: {}", description_redacted);
-    println!("  Max agents: {max_agents}");
-    println!("  Max cost: ${max_cost:.2}");
-    println!("  Artifact bundle: {}", artifact_root.display());
-    if noninteractive {
-        println!("  Mode: noninteractive");
+    if !noninteractive {
+        println!("Mercury Fix: {}", description_redacted);
+        println!("  Max agents: {max_agents}");
+        println!("  Max cost: ${max_cost:.2}");
+        println!("  Artifact bundle: {}", artifact_root.display());
+        println!();
     }
-    println!();
 
     // Step 1: Init swarm session
     let _swarm_id = db.init_swarm()?;
 
     // Step 2: Index
-    println!("[1/7] Indexing repository...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "index_repository",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[1/7] Indexing repository...");
+    }
     let repo_languages = config.repo_languages();
     let repo_map =
         repo::build_repo_map_with_languages(&project_root.to_string_lossy(), &repo_languages)?;
     let repo_map_str = repo::format_repo_map(&repo_map);
 
     // Step 3: Plan
-    println!("[2/7] Planning with Mercury 2...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "plan_repair",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[2/7] Planning with Mercury 2...");
+        println!("  Grounding repair context...");
+    }
     let api_key = api::resolve_api_key(&config.api.api_key_env)?;
-
-    println!("  Grounding repair context...");
     let grounding_client = Mercury2Client::new(api_key.clone())
         .with_base_url(config.api.mercury2_endpoint.clone())
         .with_retries(
@@ -979,16 +1064,20 @@ async fn cmd_fix_with_verify_config(
 
     let planner = engine::Planner::new(planner_client, config.constitutional_prompt());
     let (plan, assessments) = planner.plan(&planner_description, &repo_map_str).await?;
-    println!(
-        "  Plan estimate: ${:.4}{}",
-        plan.estimated_cost,
-        plan.estimated_tokens
-            .map(|tokens| format!(" | tokens: {tokens}"))
-            .unwrap_or_default()
-    );
+    if !noninteractive {
+        println!(
+            "  Plan estimate: ${:.4}{}",
+            plan.estimated_cost,
+            plan.estimated_tokens
+                .map(|tokens| format!(" | tokens: {tokens}"))
+                .unwrap_or_default()
+        );
+    }
 
     store_assessments(db, &plan.steps, &assessments, "fix")?;
-    print_assessment_summary(&plan.steps, &assessments);
+    if !noninteractive {
+        print_assessment_summary(&plan.steps, &assessments);
+    }
     write_audit_event(
         &artifact_root,
         "fix_plan_ready",
@@ -996,8 +1085,19 @@ async fn cmd_fix_with_verify_config(
             "plan_steps": plan.steps.len(),
             "estimated_cost_usd": plan.estimated_cost,
             "estimated_tokens": plan.estimated_tokens,
+            "security": start_security.clone(),
         }),
     )?;
+    emit_runtime_event(
+        noninteractive,
+        "fix_plan_ready",
+        serde_json::json!({
+            "plan_steps": plan.steps.len(),
+            "estimated_cost_usd": plan.estimated_cost,
+            "estimated_tokens": plan.estimated_tokens,
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
 
     // Run initial merge
     let mut sched_config = config.to_scheduler_config();
@@ -1007,17 +1107,51 @@ async fn cmd_fix_with_verify_config(
     scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
 
     // Step 4: Scaffold (cool zones)
-    println!("[3/7] Scaffolding cool zones...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "scaffold_cool_zones",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[3/7] Scaffolding cool zones...");
+    }
     let cool_zones = db.zones_below(config.thermal.cool_threshold)?;
-    println!("  {} cool zone files identified", cool_zones.len());
+    if !noninteractive {
+        println!("  {} cool zone files identified", cool_zones.len());
+    }
 
     // Step 5: Resolve (hot zones)
-    println!("[4/7] Resolving hot zones...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "resolve_hot_zones",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[4/7] Resolving hot zones...");
+    }
     let hot_zones = db.zones_above(config.thermal.hot_threshold)?;
-    println!("  {} hot zone files identified", hot_zones.len());
+    if !noninteractive {
+        println!("  {} hot zone files identified", hot_zones.len());
+    }
 
     // Step 6: Execute planned edits with verification gating
-    println!("[5/7] Patching and verifying plan steps...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "patch_and_verify",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[5/7] Patching and verifying plan steps...");
+    }
     let edit_client =
         MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
             .with_retries(
@@ -1043,6 +1177,8 @@ async fn cmd_fix_with_verify_config(
     let execution_summary: StepExecutionSummary =
         engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
             .await?;
+    let final_security =
+        security_runtime_context(noninteractive, execution_summary.run_root.as_deref());
     write_audit_event(
         &artifact_root,
         "fix_execution_complete",
@@ -1052,33 +1188,61 @@ async fn cmd_fix_with_verify_config(
             "verification_failures": execution_summary.verification_failures,
             "applied": execution_summary.applied,
             "final_bundle_verified": execution_summary.final_bundle_verified,
+            "security": final_security.clone(),
         }),
     )?;
+    emit_runtime_event(
+        noninteractive,
+        "fix_execution_complete",
+        serde_json::json!({
+            "accepted_steps": execution_summary.accepted,
+            "rejected_steps": execution_summary.rejected,
+            "verification_failures": execution_summary.verification_failures,
+            "applied": execution_summary.applied,
+            "final_bundle_verified": execution_summary.final_bundle_verified,
+            "artifact_root": artifact_root.display().to_string(),
+            "security": final_security.clone(),
+        }),
+    );
 
     // Step 7: Anneal + report
-    println!("[6/7] Annealing...");
+    emit_runtime_event(
+        noninteractive,
+        "fix_stage",
+        serde_json::json!({
+            "stage": "anneal_and_report",
+            "artifact_root": artifact_root.display().to_string(),
+        }),
+    );
+    if !noninteractive {
+        println!("[6/7] Annealing...");
+    }
     scheduler.run_decay_cycle(db, config.thermal.decay_half_life_seconds)?;
     scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
 
-    println!("[7/7] Complete!");
+    if !noninteractive {
+        println!("[7/7] Complete!");
+    }
 
     let aggregates = db.get_all_aggregates()?;
-    if !aggregates.is_empty() {
+    if !noninteractive && !aggregates.is_empty() {
         let active = db.get_active_agents()?;
         println!("\nFinal Thermal Map:");
         println!("{}", render_heatmap_to_string(&aggregates, &active));
     }
 
-    println!("\nExecution summary:");
-    println!("  Accepted steps: {}", execution_summary.accepted);
-    println!("  Rejected steps: {}", execution_summary.rejected);
-    println!(
-        "  Verification failures: {}",
-        execution_summary.verification_failures
-    );
+    if !noninteractive {
+        println!("\nExecution summary:");
+        println!("  Accepted steps: {}", execution_summary.accepted);
+        println!("  Rejected steps: {}", execution_summary.rejected);
+        println!(
+            "  Verification failures: {}",
+            execution_summary.verification_failures
+        );
 
-    println!("\nCost: ${:.4}", scheduler.current_cost());
-    println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
+        println!("\nCost: ${:.4}", scheduler.current_cost());
+        println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
+    }
 
     let finished_at = Utc::now();
     write_json_artifact(&artifact_root.join("plan.json"), &plan)?;
@@ -1134,6 +1298,7 @@ async fn cmd_fix_with_verify_config(
                 .map(|path| path.display().to_string()),
             total_cost_usd,
             budget_remaining_usd,
+            security: final_security.clone(),
         },
     )?;
     if let Some(run_root) = execution_summary.run_root.as_ref() {
@@ -1150,9 +1315,23 @@ async fn cmd_fix_with_verify_config(
             "total_cost_usd": total_cost_usd,
             "budget_remaining_usd": budget_remaining_usd,
             "artifact_root": artifact_root.display().to_string(),
+            "security": final_security.clone(),
         }),
     )?;
-    println!("Artifacts written to {}", artifact_root.display());
+    emit_runtime_event(
+        noninteractive,
+        "fix_run_completed",
+        serde_json::json!({
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "total_cost_usd": total_cost_usd,
+            "budget_remaining_usd": budget_remaining_usd,
+            "artifact_root": artifact_root.display().to_string(),
+            "security": final_security,
+        }),
+    );
+    if !noninteractive {
+        println!("Artifacts written to {}", artifact_root.display());
+    }
 
     Ok(FixCommandOutcome {
         artifact_root,
@@ -1174,17 +1353,28 @@ async fn cmd_watch(
         .map_err(|err| anyhow::anyhow!("watch command rejected: {err}"))?;
     let normalized_watch_command = watch_parts.join(" ");
     let watch_command = redact_secrets(&normalized_watch_command);
-    println!("Watching: {watch_command}");
-    println!("Execution mode: direct allowlisted verifier command (no shell).");
-    if repair {
-        println!("Auto-repair enabled for supported Rust verifier commands.");
-    } else {
-        println!("Auto-repair disabled. Failures will be reported only.");
+    let continuous_mode = !noninteractive;
+    emit_runtime_event(
+        noninteractive,
+        "watch_started",
+        serde_json::json!({
+            "command": watch_command,
+            "continuous": continuous_mode,
+            "repair_requested": repair,
+            "repair_supported": classify_rust_repair_command_parts(&watch_parts).is_some(),
+            "security": security_runtime_context(noninteractive, None),
+        }),
+    );
+    if !noninteractive {
+        println!("Watching: {watch_command}");
+        println!("Execution mode: direct allowlisted verifier command (no shell).");
+        if repair {
+            println!("Auto-repair enabled for supported Rust verifier commands.");
+        } else {
+            println!("Auto-repair disabled. Failures will be reported only.");
+        }
+        println!("Press Ctrl-C to stop.\n");
     }
-    if noninteractive {
-        println!("Mode: noninteractive");
-    }
-    println!("Press Ctrl-C to stop.\n");
 
     let mut snapshot = capture_repo_watch_snapshot(project_root)?;
     let mut cycle = 0usize;
@@ -1192,11 +1382,31 @@ async fn cmd_watch(
     loop {
         cycle += 1;
         if cycle > 1 {
-            println!("Waiting for repository changes...");
+            emit_runtime_event(
+                noninteractive,
+                "watch_waiting_for_changes",
+                serde_json::json!({
+                    "command": watch_command,
+                    "cycle": cycle,
+                }),
+            );
+            if !noninteractive {
+                println!("Waiting for repository changes...");
+            }
             if !wait_for_repo_change(project_root, &mut snapshot).await? {
                 return Ok(());
             }
-            println!("Change detected. Re-running watch cycle.\n");
+            emit_runtime_event(
+                noninteractive,
+                "watch_change_detected",
+                serde_json::json!({
+                    "command": watch_command,
+                    "cycle": cycle,
+                }),
+            );
+            if !noninteractive {
+                println!("Change detected. Re-running watch cycle.\n");
+            }
         }
 
         let outcome = execute_watch_cycle(
@@ -1209,8 +1419,35 @@ async fn cmd_watch(
         )
         .await?;
         print_watch_cycle_result(&outcome, noninteractive);
+
+        if !continuous_mode {
+            let success = watch_decision_succeeded(&outcome.record.decision);
+            emit_runtime_event(
+                noninteractive,
+                "watch_completed",
+                serde_json::json!({
+                    "command": watch_command,
+                    "continuous": false,
+                    "cycles": cycle,
+                    "decision": outcome.record.decision.clone(),
+                    "artifact_root": outcome.artifact_root.display().to_string(),
+                    "success": success,
+                }),
+            );
+            if success {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "watch cycle failed: decision={} artifact={}",
+                outcome.record.decision,
+                outcome.artifact_root.display()
+            );
+        }
+
         snapshot = capture_repo_watch_snapshot(project_root)?;
-        println!();
+        if !noninteractive {
+            println!();
+        }
     }
 }
 
@@ -1226,8 +1463,22 @@ async fn execute_watch_cycle(
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
     let command_display = command_parts.join(" ");
+    let command_display_redacted = redact_secrets(&command_display);
+    let watch_security = security_runtime_context(noninteractive, None);
 
-    println!("Running watch command...");
+    emit_runtime_event(
+        noninteractive,
+        "watch_cycle_started",
+        serde_json::json!({
+            "command": command_display_redacted,
+            "artifact_root": artifact_root.display().to_string(),
+            "repair_requested": repair,
+            "security": watch_security.clone(),
+        }),
+    );
+    if !noninteractive {
+        println!("Running watch command...");
+    }
     let initial_run = run_watch_command(command_parts, project_root)?;
     replay_watch_command_output("initial", &initial_run, noninteractive);
     write_audit_event(
@@ -1238,8 +1489,22 @@ async fn execute_watch_cycle(
             "success": initial_run.success,
             "exit_code": initial_run.exit_code,
             "repair_requested": repair,
+            "parsed_failure": initial_run.parsed_failure,
+            "security": watch_security.clone(),
         }),
     )?;
+    emit_runtime_event(
+        noninteractive,
+        "watch_cycle_initial_run",
+        serde_json::json!({
+            "command": initial_run.command,
+            "success": initial_run.success,
+            "exit_code": initial_run.exit_code,
+            "repair_requested": repair,
+            "artifact_root": artifact_root.display().to_string(),
+            "parsed_failure": initial_run.parsed_failure,
+        }),
+    );
 
     let mut decision = "passed_without_repair".to_string();
     let mut repair_record = None;
@@ -1251,10 +1516,21 @@ async fn execute_watch_cycle(
         } else if let Some(target) = classify_rust_repair_command_parts(command_parts) {
             let verify_config = build_watch_verify_config(config, &target);
             let description = build_watch_repair_description(&command_display, &initial_run);
-            println!(
-                "Watch repair targeting `{}` with Mercury fix...",
-                target.verifier_command
+            emit_runtime_event(
+                noninteractive,
+                "watch_cycle_repair_started",
+                serde_json::json!({
+                    "command": command_display_redacted,
+                    "target_verifier_command": redact_secrets(&target.verifier_command),
+                    "artifact_root": artifact_root.display().to_string(),
+                }),
             );
+            if !noninteractive {
+                println!(
+                    "Watch repair targeting `{}` with Mercury fix...",
+                    target.verifier_command
+                );
+            }
             match cmd_fix_with_verify_config(
                 config,
                 db,
@@ -1271,8 +1547,13 @@ async fn execute_watch_cycle(
                 Ok(outcome) => {
                     repair_record = Some(WatchRepairRecord {
                         supported: true,
-                        verifier_command: Some(target.verifier_command.clone()),
+                        verifier_command: Some(redact_secrets(&target.verifier_command)),
                         fix_artifact_root: Some(outcome.artifact_root.display().to_string()),
+                        sandbox_run_root: outcome
+                            .execution_summary
+                            .run_root
+                            .as_ref()
+                            .map(|path| path.display().to_string()),
                         accepted_steps: outcome.execution_summary.accepted,
                         rejected_steps: outcome.execution_summary.rejected,
                         verification_failures: outcome.execution_summary.verification_failures,
@@ -1305,11 +1586,73 @@ async fn execute_watch_cycle(
                         &artifact_root.join("repair").join("grounded-context.json"),
                     )?;
 
-                    println!(
-                        "Repair attempt cost: ${:.4} | budget remaining: ${:.4}",
-                        outcome.total_cost_usd, outcome.budget_remaining_usd
+                    let repair_security = security_runtime_context(
+                        noninteractive,
+                        outcome.execution_summary.run_root.as_deref(),
                     );
-                    println!("Re-running watch command after repair...");
+                    write_audit_event(
+                        &artifact_root,
+                        "watch_cycle_repair_completed",
+                        serde_json::json!({
+                            "target_verifier_command": redact_secrets(&target.verifier_command),
+                            "fix_artifact_root": outcome.artifact_root.display().to_string(),
+                            "sandbox_run_root": outcome
+                                .execution_summary
+                                .run_root
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "accepted_steps": outcome.execution_summary.accepted,
+                            "rejected_steps": outcome.execution_summary.rejected,
+                            "verification_failures": outcome.execution_summary.verification_failures,
+                            "applied": outcome.execution_summary.applied,
+                            "final_bundle_verified": outcome.execution_summary.final_bundle_verified,
+                            "security": repair_security.clone(),
+                        }),
+                    )?;
+                    emit_runtime_event(
+                        noninteractive,
+                        "watch_cycle_repair_completed",
+                        serde_json::json!({
+                            "target_verifier_command": redact_secrets(&target.verifier_command),
+                            "fix_artifact_root": outcome.artifact_root.display().to_string(),
+                            "sandbox_run_root": outcome
+                                .execution_summary
+                                .run_root
+                                .as_ref()
+                                .map(|path| path.display().to_string()),
+                            "accepted_steps": outcome.execution_summary.accepted,
+                            "rejected_steps": outcome.execution_summary.rejected,
+                            "verification_failures": outcome.execution_summary.verification_failures,
+                            "applied": outcome.execution_summary.applied,
+                            "final_bundle_verified": outcome.execution_summary.final_bundle_verified,
+                            "artifact_root": artifact_root.display().to_string(),
+                            "security": repair_security,
+                        }),
+                    );
+
+                    if !noninteractive {
+                        println!(
+                            "Repair attempt cost: ${:.4} | budget remaining: ${:.4}",
+                            outcome.total_cost_usd, outcome.budget_remaining_usd
+                        );
+                        println!("Re-running watch command after repair...");
+                    }
+                    write_audit_event(
+                        &artifact_root,
+                        "watch_cycle_confirmation_run",
+                        serde_json::json!({
+                            "command": command_display_redacted,
+                            "artifact_root": artifact_root.display().to_string(),
+                        }),
+                    )?;
+                    emit_runtime_event(
+                        noninteractive,
+                        "watch_cycle_confirmation_run",
+                        serde_json::json!({
+                            "command": command_display_redacted,
+                            "artifact_root": artifact_root.display().to_string(),
+                        }),
+                    );
                     let rerun = run_watch_command(command_parts, project_root)?;
                     replay_watch_command_output("confirmation", &rerun, noninteractive);
                     let rerun_success = rerun.success;
@@ -1325,14 +1668,15 @@ async fn execute_watch_cycle(
                 Err(err) => {
                     repair_record = Some(WatchRepairRecord {
                         supported: true,
-                        verifier_command: Some(target.verifier_command.clone()),
+                        verifier_command: Some(redact_secrets(&target.verifier_command)),
                         fix_artifact_root: None,
+                        sandbox_run_root: None,
                         accepted_steps: 0,
                         rejected_steps: 0,
                         verification_failures: 0,
                         final_bundle_verified: false,
                         applied: false,
-                        error: Some(err.to_string()),
+                        error: Some(redact_secrets(&err.to_string())),
                     });
                     decision = "repair_flow_failed".to_string();
                 }
@@ -1342,6 +1686,7 @@ async fn execute_watch_cycle(
                 supported: false,
                 verifier_command: None,
                 fix_artifact_root: None,
+                sandbox_run_root: None,
                 accepted_steps: 0,
                 rejected_steps: 0,
                 verification_failures: 0,
@@ -1358,9 +1703,10 @@ async fn execute_watch_cycle(
 
     let finished_at = Utc::now();
     let record = WatchRunRecord {
-        command: command_display,
+        command: command_display_redacted,
         repair_requested: repair,
         decision,
+        security: watch_security.clone(),
         initial_run,
         confirmation_run,
         repair: repair_record,
@@ -1375,11 +1721,23 @@ async fn execute_watch_cycle(
         &artifact_root,
         "watch_cycle_completed",
         serde_json::json!({
-            "decision": record.decision,
+            "decision": record.decision.clone(),
             "duration_ms": record.duration_ms,
             "repair_requested": record.repair_requested,
+            "security": watch_security,
         }),
     )?;
+    emit_runtime_event(
+        noninteractive,
+        "watch_cycle_completed",
+        serde_json::json!({
+            "decision": record.decision.clone(),
+            "artifact_root": artifact_root.display().to_string(),
+            "duration_ms": record.duration_ms,
+            "repair_requested": record.repair_requested,
+            "security": record.security.clone(),
+        }),
+    );
 
     Ok(WatchCycleOutcome {
         artifact_root,
@@ -1466,6 +1824,38 @@ fn print_assessment_summary(steps: &[engine::PlanStep], assessments: &[api::Ther
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct SecurityRuntimeContext {
+    ci: bool,
+    noninteractive: bool,
+    verifier_allowlist_override_requested: bool,
+    verifier_allowlist_override_applied: bool,
+    verifier_allowlist_enforced: bool,
+    secret_redaction_enabled: bool,
+    sandbox_policy: String,
+    execution_sandbox_enforced: bool,
+    sandbox_run_root: Option<String>,
+}
+
+fn security_runtime_context(
+    noninteractive: bool,
+    sandbox_run_root: Option<&Path>,
+) -> SecurityRuntimeContext {
+    let override_requested = allowlist_override_active();
+    let ci = running_in_ci();
+    SecurityRuntimeContext {
+        ci,
+        noninteractive,
+        verifier_allowlist_override_requested: override_requested,
+        verifier_allowlist_override_applied: override_requested && !ci,
+        verifier_allowlist_enforced: !override_requested || ci,
+        secret_redaction_enabled: true,
+        sandbox_policy: SANDBOX_POLICY.to_string(),
+        execution_sandbox_enforced: EXECUTION_SANDBOX_ENFORCED,
+        sandbox_run_root: sandbox_run_root.map(|path| path.display().to_string()),
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FixRunMetadata {
     description: String,
@@ -1486,6 +1876,7 @@ struct FixRunMetadata {
     sandbox_run_root: Option<String>,
     total_cost_usd: f64,
     budget_remaining_usd: f64,
+    security: SecurityRuntimeContext,
 }
 
 fn create_run_artifact_root(project_root: &Path) -> Result<PathBuf> {
@@ -2032,9 +2423,27 @@ fn replay_watch_command_output(label: &str, result: &WatchCommandResult, noninte
         .exit_code
         .map(|code| code.to_string())
         .unwrap_or_else(|| "signal".to_string());
-    let mode = if noninteractive { "ci" } else { "interactive" };
+    if noninteractive {
+        emit_runtime_event(
+            true,
+            "watch_command_output",
+            serde_json::json!({
+                "label": label,
+                "exit_code": result.exit_code,
+                "exit_status": status,
+                "success": result.success,
+                "stdout_bytes": result.stdout.len(),
+                "stderr_bytes": result.stderr.len(),
+                "stdout_preview": truncate_watch_output(&result.stdout, 1000),
+                "stderr_preview": truncate_watch_output(&result.stderr, 1000),
+                "parsed_failure": result.parsed_failure,
+            }),
+        );
+        return;
+    }
+
     println!(
-        "[watch:{label}] mode={mode} exit={status} success={}",
+        "[watch:{label}] mode=interactive exit={status} success={}",
         if result.success { "true" } else { "false" }
     );
     if !result.stdout.is_empty() {
@@ -2047,11 +2456,16 @@ fn replay_watch_command_output(label: &str, result: &WatchCommandResult, noninte
 
 fn print_watch_cycle_result(outcome: &WatchCycleOutcome, noninteractive: bool) {
     if noninteractive {
-        println!(
-            "watch-cycle decision={} artifact={}",
-            outcome.record.decision,
-            outcome.artifact_root.display()
+        emit_runtime_event(
+            true,
+            "watch_cycle_result",
+            serde_json::json!({
+                "decision": outcome.record.decision.clone(),
+                "artifact_root": outcome.artifact_root.display().to_string(),
+                "repair": outcome.record.repair.clone(),
+            }),
         );
+        return;
     }
     println!("Decision: {}", outcome.record.decision);
     println!("Artifact bundle: {}", outcome.artifact_root.display());
@@ -2066,6 +2480,10 @@ fn print_watch_cycle_result(outcome: &WatchCycleOutcome, noninteractive: bool) {
             println!("Repair note: {error}");
         }
     }
+}
+
+fn watch_decision_succeeded(decision: &str) -> bool {
+    matches!(decision, "passed_without_repair" | "repaired_and_verified")
 }
 
 fn write_watch_output_artifacts(artifact_root: &Path, record: &WatchRunRecord) -> Result<()> {
@@ -2397,5 +2815,41 @@ mod tests {
         assert!(output.contains("Authorization: [REDACTED]"));
         assert!(output.contains("api_key=[REDACTED]"));
         assert!(output.contains("normal=value"));
+    }
+
+    #[test]
+    fn event_payload_redacts_nested_values() {
+        let payload = event_payload(
+            "test_event",
+            serde_json::json!({
+                "token_line": "Authorization: Bearer secret-token",
+                "nested": {
+                    "api_key": "api_key=12345",
+                },
+                "items": [
+                    "normal=value",
+                    "password: hunter2",
+                ],
+            }),
+        );
+
+        let details = &payload["details"];
+        assert_eq!(payload["event"], Value::String("test_event".to_string()));
+        assert_eq!(
+            details["token_line"],
+            Value::String("Authorization: [REDACTED]".to_string())
+        );
+        assert_eq!(
+            details["nested"]["api_key"],
+            Value::String("api_key=[REDACTED]".to_string())
+        );
+        assert_eq!(
+            details["items"][1],
+            Value::String("password: [REDACTED]".to_string())
+        );
+        assert_eq!(
+            details["items"][0],
+            Value::String("normal=value".to_string())
+        );
     }
 }

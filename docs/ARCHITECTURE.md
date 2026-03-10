@@ -1,10 +1,10 @@
-# Mercury CLI Architecture (v1.0 In Progress, Rust-First Runtime)
+# Mercury CLI Architecture (v1.0 In Progress, Rust + TypeScript Runtime)
 
-This document describes the current runtime and trust boundaries for Mercury CLI in the v1.0-in-progress lane, with Rust-first repair behavior and implemented observability/hardening surfaces.
+This document describes the current runtime and trust boundaries for Mercury CLI in the v1.0-in-progress lane, with implemented repair behavior across Rust and selected TypeScript verifier paths plus current observability/hardening surfaces.
 
 Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
-- start from a failing Rust verifier command
+- start from a failing direct allowlisted Rust/TypeScript verifier command
 - attempt bounded repair with Mercury models
 - verify locally in isolation before acceptance
 - emit a reviewable evidence bundle
@@ -14,7 +14,7 @@ Mercury CLI is not a generic autonomous coding shell. The implemented product we
 
 ### Local `fix`
 
-`mercury-cli fix "<goal>"` runs a Rust-first repair loop with planning, candidate generation, verifier execution, and artifact emission under `.mercury/runs/<run-id>/`.
+`mercury-cli fix "<goal>"` runs a repair loop with planning, candidate generation, verifier execution, and artifact emission under `.mercury/runs/<run-id>/`.
 
 ### Local `watch --repair`
 
@@ -49,15 +49,15 @@ For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI 
 
 ## Safety Model
 
-The v0.3 alpha safety boundary is workflow-first and evidence-first.
+The v1.0-in-progress safety boundary is workflow-first and evidence-first.
 
 ### Candidate isolation
 
-Repair attempts run in disposable worktrees (`.mercury/worktrees/` locally, detached worktree in CI workflow).
+Repair attempts run in disposable repo-copy/worktree isolation (`.mercury/worktrees/` locally, detached worktree in CI workflow). This is not a container/VM sandbox claim.
 
 ### Atomic accept/reject path
 
-Rejected candidates are discarded with their sandbox. Accepted candidates are copied back after verification gates succeed.
+Rejected candidates are discarded with their isolated repo copy/worktree. Accepted candidates are copied back after verification gates succeed.
 
 ### Verification gates before promotion
 
@@ -97,7 +97,7 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 ## Structured Data Boundaries
 
 - Workflow decision/environment payloads are JSON with stable keys used by docs/tests.
-- Eval harness (`evals/v0`) is manifest-driven and emits schema/version metadata in reports.
+- Eval harnesses (`evals/v0` for Rust and `evals/v1_typescript` for TypeScript lane) are manifest-driven and emit schema/version metadata in reports.
 - Planner critique text remains advisory prose and should not be treated as a strict machine contract.
 
 ## Enterprise Hardening Baselines
@@ -105,16 +105,17 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 - Verifier allowlist enforces direct Rust cargo verifier commands and selected direct TypeScript verifier invocations by default (including supported env-prefix forms).
 - Shell composition in verifier commands is blocked unless `MERCURY_ALLOW_UNSAFE_VERIFIER_COMMANDS=1` is set explicitly.
 - Noninteractive mode is available for CI-oriented output surfaces.
-- End-to-end repair targeting remains Rust-first even though verification surfaces are broader.
+- End-to-end `fix` and CI repair targeting support allowlisted Rust/TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
 
-## Known v0.3 Alpha Limits
+## Known v1.0-In-Progress Limits
 
-- Rust-first scope only for auto-repair targeting.
+- Local `watch --repair` remains Rust-only.
 - `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but the repo does not yet publish benchmark-backed speedup claims or broad overlapping-edit convergence claims from that setting.
-- TypeScript lane support is partial: repo mapping/parser and selected verifier support exist, but end-to-end repair execution remains Rust-first and incomplete for TypeScript.
+- TypeScript support is intentionally scoped: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited.
 - Live observability is summary-oriented today, not a full per-candidate trace or conflict-telemetry surface.
 - CI automation is draft-PR oriented, not autonomous merge.
 - Public benchmark reporting is still behind corpus/harness readiness.
+- TypeScript harness fixtures currently validate deterministic expected-red script outputs; this is useful for corpus/reporter contract checks but not a replacement for full benchmark-backed repair reporting.
 
 ## Relationship to Case Studies
 

@@ -1,0 +1,1879 @@
+{
+  "schema_version": "mercury-evals-v0",
+  "suite_id": "typescript-v1.0-seeded",
+  "language": "typescript",
+  "version": 1,
+  "artifact_schema_version": "mercury-eval-report-v0",
+  "description": "TypeScript seeded baseline corpus for v1.0-in-progress second-language support",
+  "default_timeout_seconds": 60,
+  "supported_modes": [
+    "baseline"
+  ],
+  "cases": [
+    {
+      "id": "ts_parse_unclosed_delimiter",
+      "title": "ts parse unclosed delimiter",
+      "path": "cases/ts_parse_unclosed_delimiter",
+      "failure_class": "syntax_error",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS1005",
+        "expected"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:parse",
+        "failure:syntax_error",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_parse_unclosed_delimiter_v2",
+      "title": "ts parse unclosed delimiter v2",
+      "path": "cases/ts_parse_unclosed_delimiter",
+      "failure_class": "syntax_error",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS1005",
+        "expected"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:parse",
+        "failure:syntax_error",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_parse_unclosed_delimiter_v3",
+      "title": "ts parse unclosed delimiter v3",
+      "path": "cases/ts_parse_unclosed_delimiter",
+      "failure_class": "syntax_error",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS1005",
+        "expected"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:parse",
+        "failure:syntax_error",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_parse_unclosed_delimiter_v4",
+      "title": "ts parse unclosed delimiter v4",
+      "path": "cases/ts_parse_unclosed_delimiter",
+      "failure_class": "syntax_error",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS1005",
+        "expected"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:parse",
+        "failure:syntax_error",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_parse_unclosed_delimiter_v5",
+      "title": "ts parse unclosed delimiter v5",
+      "path": "cases/ts_parse_unclosed_delimiter",
+      "failure_class": "syntax_error",
+      "failure_stage": "parse",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS1005",
+        "expected"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:parse",
+        "failure:syntax_error",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_type_mismatch",
+      "title": "ts type mismatch",
+      "path": "cases/ts_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2322",
+        "not assignable"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:type_mismatch",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_type_mismatch_v2",
+      "title": "ts type mismatch v2",
+      "path": "cases/ts_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2322",
+        "not assignable"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:type_mismatch",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_type_mismatch_v3",
+      "title": "ts type mismatch v3",
+      "path": "cases/ts_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2322",
+        "not assignable"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:type_mismatch",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_type_mismatch_v4",
+      "title": "ts type mismatch v4",
+      "path": "cases/ts_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2322",
+        "not assignable"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:type_mismatch",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_type_mismatch_v5",
+      "title": "ts type mismatch v5",
+      "path": "cases/ts_type_mismatch",
+      "failure_class": "type_mismatch",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2322",
+        "not assignable"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:type_mismatch",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_missing_function_symbol",
+      "title": "ts missing function symbol",
+      "path": "cases/ts_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2304",
+        "Cannot find name"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:missing_symbol",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_missing_function_symbol_v2",
+      "title": "ts missing function symbol v2",
+      "path": "cases/ts_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2304",
+        "Cannot find name"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:missing_symbol",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_missing_function_symbol_v3",
+      "title": "ts missing function symbol v3",
+      "path": "cases/ts_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2304",
+        "Cannot find name"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:missing_symbol",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_missing_function_symbol_v4",
+      "title": "ts missing function symbol v4",
+      "path": "cases/ts_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2304",
+        "Cannot find name"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:missing_symbol",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_missing_function_symbol_v5",
+      "title": "ts missing function symbol v5",
+      "path": "cases/ts_missing_function_symbol",
+      "failure_class": "missing_symbol",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2304",
+        "Cannot find name"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:missing_symbol",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_unknown_property_access",
+      "title": "ts unknown property access",
+      "path": "cases/ts_unknown_property_access",
+      "failure_class": "unknown_property",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2339",
+        "does not exist on type"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:unknown_property",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_unknown_property_access_v2",
+      "title": "ts unknown property access v2",
+      "path": "cases/ts_unknown_property_access",
+      "failure_class": "unknown_property",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2339",
+        "does not exist on type"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:unknown_property",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_unknown_property_access_v3",
+      "title": "ts unknown property access v3",
+      "path": "cases/ts_unknown_property_access",
+      "failure_class": "unknown_property",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2339",
+        "does not exist on type"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:unknown_property",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_unknown_property_access_v4",
+      "title": "ts unknown property access v4",
+      "path": "cases/ts_unknown_property_access",
+      "failure_class": "unknown_property",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2339",
+        "does not exist on type"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:unknown_property",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_unknown_property_access_v5",
+      "title": "ts unknown property access v5",
+      "path": "cases/ts_unknown_property_access",
+      "failure_class": "unknown_property",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2339",
+        "does not exist on type"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:unknown_property",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_generic_constraint_missing",
+      "title": "ts generic constraint missing",
+      "path": "cases/ts_generic_constraint_missing",
+      "failure_class": "generic_constraint",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2344",
+        "does not satisfy the constraint"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:generic_constraint",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_generic_constraint_missing_v2",
+      "title": "ts generic constraint missing v2",
+      "path": "cases/ts_generic_constraint_missing",
+      "failure_class": "generic_constraint",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2344",
+        "does not satisfy the constraint"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:generic_constraint",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_generic_constraint_missing_v3",
+      "title": "ts generic constraint missing v3",
+      "path": "cases/ts_generic_constraint_missing",
+      "failure_class": "generic_constraint",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2344",
+        "does not satisfy the constraint"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:generic_constraint",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_generic_constraint_missing_v4",
+      "title": "ts generic constraint missing v4",
+      "path": "cases/ts_generic_constraint_missing",
+      "failure_class": "generic_constraint",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2344",
+        "does not satisfy the constraint"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:generic_constraint",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_generic_constraint_missing_v5",
+      "title": "ts generic constraint missing v5",
+      "path": "cases/ts_generic_constraint_missing",
+      "failure_class": "generic_constraint",
+      "failure_stage": "compile",
+      "verifier_command": [
+        "node",
+        "scripts/check.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "TS2344",
+        "does not satisfy the constraint"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:compile",
+        "failure:generic_constraint",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_assertion_failure",
+      "title": "ts runtime assertion failure",
+      "path": "cases/ts_runtime_assertion_failure",
+      "failure_class": "assertion_failure",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "AssertionError"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/math.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:assertion_failure",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_assertion_failure_v2",
+      "title": "ts runtime assertion failure v2",
+      "path": "cases/ts_runtime_assertion_failure",
+      "failure_class": "assertion_failure",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "AssertionError"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/math.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:assertion_failure",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_assertion_failure_v3",
+      "title": "ts runtime assertion failure v3",
+      "path": "cases/ts_runtime_assertion_failure",
+      "failure_class": "assertion_failure",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "AssertionError"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/math.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:assertion_failure",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_assertion_failure_v4",
+      "title": "ts runtime assertion failure v4",
+      "path": "cases/ts_runtime_assertion_failure",
+      "failure_class": "assertion_failure",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "AssertionError"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/math.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:assertion_failure",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_assertion_failure_v5",
+      "title": "ts runtime assertion failure v5",
+      "path": "cases/ts_runtime_assertion_failure",
+      "failure_class": "assertion_failure",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "AssertionError"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/math.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:assertion_failure",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_rejected_promise",
+      "title": "ts runtime rejected promise",
+      "path": "cases/ts_runtime_rejected_promise",
+      "failure_class": "rejected_promise",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "UnhandledPromiseRejection"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/async.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:rejected_promise",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_rejected_promise_v2",
+      "title": "ts runtime rejected promise v2",
+      "path": "cases/ts_runtime_rejected_promise",
+      "failure_class": "rejected_promise",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "UnhandledPromiseRejection"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/async.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:rejected_promise",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_rejected_promise_v3",
+      "title": "ts runtime rejected promise v3",
+      "path": "cases/ts_runtime_rejected_promise",
+      "failure_class": "rejected_promise",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "UnhandledPromiseRejection"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/async.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:rejected_promise",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_rejected_promise_v4",
+      "title": "ts runtime rejected promise v4",
+      "path": "cases/ts_runtime_rejected_promise",
+      "failure_class": "rejected_promise",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "UnhandledPromiseRejection"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/async.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:rejected_promise",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_rejected_promise_v5",
+      "title": "ts runtime rejected promise v5",
+      "path": "cases/ts_runtime_rejected_promise",
+      "failure_class": "rejected_promise",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "UnhandledPromiseRejection"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/async.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:rejected_promise",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_snapshot_mismatch",
+      "title": "ts runtime snapshot mismatch",
+      "path": "cases/ts_runtime_snapshot_mismatch",
+      "failure_class": "snapshot_mismatch",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "Snapshot name"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/snapshot.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:snapshot_mismatch",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_snapshot_mismatch_v2",
+      "title": "ts runtime snapshot mismatch v2",
+      "path": "cases/ts_runtime_snapshot_mismatch",
+      "failure_class": "snapshot_mismatch",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "Snapshot name"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/snapshot.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:snapshot_mismatch",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_snapshot_mismatch_v3",
+      "title": "ts runtime snapshot mismatch v3",
+      "path": "cases/ts_runtime_snapshot_mismatch",
+      "failure_class": "snapshot_mismatch",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "Snapshot name"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/snapshot.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:snapshot_mismatch",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_snapshot_mismatch_v4",
+      "title": "ts runtime snapshot mismatch v4",
+      "path": "cases/ts_runtime_snapshot_mismatch",
+      "failure_class": "snapshot_mismatch",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "Snapshot name"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/snapshot.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:snapshot_mismatch",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_runtime_snapshot_mismatch_v5",
+      "title": "ts runtime snapshot mismatch v5",
+      "path": "cases/ts_runtime_snapshot_mismatch",
+      "failure_class": "snapshot_mismatch",
+      "failure_stage": "test",
+      "verifier_command": [
+        "node",
+        "scripts/test.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "FAIL",
+        "Snapshot name"
+      ],
+      "source_files": [
+        "src/index.ts",
+        "tests/snapshot.test.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:test",
+        "failure:snapshot_mismatch",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_explicit_any",
+      "title": "ts lint explicit any",
+      "path": "cases/ts_lint_explicit_any",
+      "failure_class": "lint_explicit_any",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "Unexpected any",
+        "no-explicit-any"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_explicit_any",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_explicit_any_v2",
+      "title": "ts lint explicit any v2",
+      "path": "cases/ts_lint_explicit_any",
+      "failure_class": "lint_explicit_any",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "Unexpected any",
+        "no-explicit-any"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_explicit_any",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_explicit_any_v3",
+      "title": "ts lint explicit any v3",
+      "path": "cases/ts_lint_explicit_any",
+      "failure_class": "lint_explicit_any",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "Unexpected any",
+        "no-explicit-any"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_explicit_any",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_explicit_any_v4",
+      "title": "ts lint explicit any v4",
+      "path": "cases/ts_lint_explicit_any",
+      "failure_class": "lint_explicit_any",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "Unexpected any",
+        "no-explicit-any"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_explicit_any",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_explicit_any_v5",
+      "title": "ts lint explicit any v5",
+      "path": "cases/ts_lint_explicit_any",
+      "failure_class": "lint_explicit_any",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "Unexpected any",
+        "no-explicit-any"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_explicit_any",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_no_unused_vars",
+      "title": "ts lint no unused vars",
+      "path": "cases/ts_lint_no_unused_vars",
+      "failure_class": "lint_no_unused_vars",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "never used",
+        "no-unused-vars"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "seed",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_no_unused_vars",
+        "variant:seed",
+        "kind:seed"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_no_unused_vars_v2",
+      "title": "ts lint no unused vars v2",
+      "path": "cases/ts_lint_no_unused_vars",
+      "failure_class": "lint_no_unused_vars",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "never used",
+        "no-unused-vars"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v2",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_no_unused_vars",
+        "variant:v2",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_no_unused_vars_v3",
+      "title": "ts lint no unused vars v3",
+      "path": "cases/ts_lint_no_unused_vars",
+      "failure_class": "lint_no_unused_vars",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "never used",
+        "no-unused-vars"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v3",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_no_unused_vars",
+        "variant:v3",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_no_unused_vars_v4",
+      "title": "ts lint no unused vars v4",
+      "path": "cases/ts_lint_no_unused_vars",
+      "failure_class": "lint_no_unused_vars",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "never used",
+        "no-unused-vars"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v4",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_no_unused_vars",
+        "variant:v4",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    },
+    {
+      "id": "ts_lint_no_unused_vars_v5",
+      "title": "ts lint no unused vars v5",
+      "path": "cases/ts_lint_no_unused_vars",
+      "failure_class": "lint_no_unused_vars",
+      "failure_stage": "lint",
+      "verifier_command": [
+        "node",
+        "scripts/lint.js"
+      ],
+      "expected_exit_codes": [
+        1
+      ],
+      "expected_patterns": [
+        "never used",
+        "no-unused-vars"
+      ],
+      "source_files": [
+        "src/index.ts"
+      ],
+      "provenance": {
+        "origin": "seeded",
+        "suite": "typescript-v1.0-seeded",
+        "variant": "v5",
+        "generator": "manual-fixture"
+      },
+      "difficulty": "medium",
+      "tags": [
+        "language:typescript",
+        "stage:lint",
+        "failure:lint_no_unused_vars",
+        "variant:v5",
+        "kind:variant"
+      ],
+      "timeout_seconds": 60,
+      "demo_track": null
+    }
+  ]
+}

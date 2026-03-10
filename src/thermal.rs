@@ -7,7 +7,8 @@
 //! public function is pure (no interior I/O) except the ratatui rendering
 //! helpers, which write to a terminal backend.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
@@ -142,18 +143,277 @@ impl std::fmt::Display for ExecutionPhase {
     }
 }
 
+/// Coarse conflict pressure for a target file under the current swarm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentionState {
+    /// No active agents are working on the file.
+    Idle,
+    /// One or more agents are working on the file, but more may still join.
+    Shared,
+    /// The file has reached or exceeded the configured density cap.
+    Saturated,
+}
+
+/// Ranked target metadata for phase-aware global scheduling.
+///
+/// This is intentionally pure, self-contained state so higher layers can make
+/// dispatch decisions without re-deriving contention and fanout signals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RankedTarget {
+    /// Repo-relative file path.
+    pub file_path: String,
+    /// Current composite thermal score for the file.
+    pub composite_score: f64,
+    /// Number of currently active agents on the file.
+    pub active_agents: i32,
+    /// Historical density persisted in the thermal aggregate.
+    pub aggregate_density: i32,
+    /// Remaining scheduler capacity for the file under `max_density`.
+    pub remaining_capacity: i32,
+    /// Total desired number of agents for the file in this phase.
+    pub desired_agent_count: usize,
+    /// Additional agents worth assigning before the file is considered
+    /// "sufficiently staffed" for the current phase.
+    pub additional_agents_needed: usize,
+    /// Conflict pressure classification derived from `active_agents`.
+    pub contention: ContentionState,
+}
+
+/// Executor-facing readiness state for a ranked target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchReadiness {
+    /// The target should receive additional concurrent work now.
+    LaunchNow,
+    /// The target is eligible overall but already staffed to its desired density.
+    HoldAtDesiredDensity,
+}
+
+/// Phase-aware dispatch metadata derived from thermal ranking.
+///
+/// This is the bridge between pure thermal scoring and a real concurrent
+/// executor: it keeps the ranked order while making immediate launchability
+/// explicit for downstream schedulers and observability surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTargetMetadata {
+    /// Repo-relative file path.
+    pub file_path: String,
+    /// Execution phase used to rank the target.
+    pub phase: ExecutionPhase,
+    /// 0-based rank within the current phase ordering.
+    pub priority_rank: usize,
+    /// Current contention pressure on the file.
+    pub contention: ContentionState,
+    /// Number of active agents already on the file.
+    pub active_agents: i32,
+    /// Remaining file-level capacity under the global density cap.
+    pub remaining_capacity: i32,
+    /// Desired total concurrency for the file in the current phase.
+    pub desired_agent_count: usize,
+    /// Additional concurrent agents worth assigning before the file is
+    /// considered adequately staffed for the phase.
+    pub additional_agents_needed: usize,
+    /// Immediate launch budget for this dispatch cycle.
+    pub launchable_agents: usize,
+    /// Whether the executor should launch more agents now or hold.
+    pub readiness: DispatchReadiness,
+}
+
+/// Classify the current conflict pressure for a file.
+pub fn contention_state(active_agents: i32, max_density: i32) -> ContentionState {
+    if max_density <= 0 || active_agents >= max_density {
+        ContentionState::Saturated
+    } else if active_agents > 0 {
+        ContentionState::Shared
+    } else {
+        ContentionState::Idle
+    }
+}
+
+/// Estimate how many total agents are worth assigning to a file in the
+/// current phase.
+///
+/// This helper is designed for global scheduling:
+/// - `Scaffolding` keeps cool zones single-threaded.
+/// - `Resolution` allows hotter files to attract more competing agents.
+/// - `Annealing` remains conservative, only allowing a second agent for
+///   stubborn hot spots.
+pub fn desired_agent_count_for_target(
+    phase: ExecutionPhase,
+    composite_score: f64,
+    max_density: i32,
+) -> usize {
+    let max_density = max_density.max(0) as usize;
+    if max_density == 0 {
+        return 0;
+    }
+
+    let clamped_score = composite_score.clamp(0.0, 1.0);
+    let desired = match phase {
+        ExecutionPhase::Scaffolding => 1,
+        ExecutionPhase::Resolution => {
+            let expansion =
+                (clamped_score.powf(1.5) * (max_density.saturating_sub(1)) as f64).round() as usize;
+            1 + expansion
+        }
+        ExecutionPhase::Annealing => {
+            if clamped_score >= 0.70 && max_density > 1 {
+                2
+            } else {
+                1
+            }
+        }
+    };
+
+    desired.min(max_density)
+}
+
+/// Rank every eligible target for the requested phase.
+///
+/// This is the stronger scheduling primitive that a global executor can call.
+/// It preserves the existing lock and density filters while surfacing enough
+/// metadata for phase-aware routing and conflict arbitration.
+pub fn rank_targets(
+    aggregates: &[ThermalAggregate],
+    locks: &[CoolLock],
+    active_agents: &[AgentLogEntry],
+    phase: ExecutionPhase,
+    max_density: i32,
+) -> Vec<RankedTarget> {
+    if max_density <= 0 {
+        return Vec::new();
+    }
+
+    let locked_files: HashSet<&str> = locks.iter().map(|lock| lock.file_path.as_str()).collect();
+    let agent_file_counts = active_agent_counts(active_agents);
+
+    let mut candidates: Vec<RankedTarget> = aggregates
+        .iter()
+        .filter_map(|aggregate| {
+            let active_agents = *agent_file_counts
+                .get(aggregate.file_path.as_str())
+                .unwrap_or(&0);
+            if locked_files.contains(aggregate.file_path.as_str())
+                || aggregate.is_locked
+                || active_agents >= max_density
+            {
+                return None;
+            }
+
+            let desired_agent_count =
+                desired_agent_count_for_target(phase, aggregate.composite_score, max_density);
+            let remaining_capacity = max_density.saturating_sub(active_agents);
+            let additional_agents_needed = desired_agent_count
+                .saturating_sub(active_agents.max(0) as usize)
+                .min(remaining_capacity.max(0) as usize);
+
+            Some(RankedTarget {
+                file_path: aggregate.file_path.clone(),
+                composite_score: aggregate.composite_score,
+                active_agents,
+                aggregate_density: aggregate.agent_density.max(0),
+                remaining_capacity,
+                desired_agent_count,
+                additional_agents_needed,
+                contention: contention_state(active_agents, max_density),
+            })
+        })
+        .collect();
+
+    candidates.sort_by(|left, right| compare_ranked_targets(left, right, phase));
+    candidates
+}
+
+/// Convert ranked thermal targets into executor-facing dispatch metadata.
+///
+/// This keeps the phase ordering from [`rank_targets`] while surfacing which
+/// files should actively expand concurrency and by how many slots.
+pub fn dispatch_targets(
+    aggregates: &[ThermalAggregate],
+    locks: &[CoolLock],
+    active_agents: &[AgentLogEntry],
+    phase: ExecutionPhase,
+    max_density: i32,
+) -> Vec<DispatchTargetMetadata> {
+    rank_targets(aggregates, locks, active_agents, phase, max_density)
+        .into_iter()
+        .enumerate()
+        .map(|(priority_rank, target)| {
+            let launchable_agents = target
+                .additional_agents_needed
+                .min(target.remaining_capacity.max(0) as usize);
+            let readiness = if launchable_agents > 0 {
+                DispatchReadiness::LaunchNow
+            } else {
+                DispatchReadiness::HoldAtDesiredDensity
+            };
+
+            DispatchTargetMetadata {
+                file_path: target.file_path,
+                phase,
+                priority_rank,
+                contention: target.contention,
+                active_agents: target.active_agents,
+                remaining_capacity: target.remaining_capacity,
+                desired_agent_count: target.desired_agent_count,
+                additional_agents_needed: target.additional_agents_needed,
+                launchable_agents,
+                readiness,
+            }
+        })
+        .collect()
+}
+
+fn active_agent_counts(active_agents: &[AgentLogEntry]) -> HashMap<&str, i32> {
+    let mut counts = HashMap::new();
+    for agent in active_agents {
+        *counts.entry(agent.file_path.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn compare_ranked_targets(
+    left: &RankedTarget,
+    right: &RankedTarget,
+    phase: ExecutionPhase,
+) -> Ordering {
+    let by_path = left.file_path.cmp(&right.file_path);
+    match phase {
+        ExecutionPhase::Scaffolding => left
+            .active_agents
+            .cmp(&right.active_agents)
+            .then(left.aggregate_density.cmp(&right.aggregate_density))
+            .then_with(|| left.composite_score.total_cmp(&right.composite_score))
+            .then(by_path),
+        ExecutionPhase::Resolution => right
+            .additional_agents_needed
+            .cmp(&left.additional_agents_needed)
+            .then_with(|| right.composite_score.total_cmp(&left.composite_score))
+            .then(left.active_agents.cmp(&right.active_agents))
+            .then(left.aggregate_density.cmp(&right.aggregate_density))
+            .then(by_path),
+        ExecutionPhase::Annealing => right
+            .additional_agents_needed
+            .cmp(&left.additional_agents_needed)
+            .then(left.active_agents.cmp(&right.active_agents))
+            .then(left.aggregate_density.cmp(&right.aggregate_density))
+            .then_with(|| right.composite_score.total_cmp(&left.composite_score))
+            .then(by_path),
+    }
+}
+
 /// Select the next file target for an agent given the current thermal field.
 ///
 /// The selection strategy depends on the [`ExecutionPhase`]:
 ///
-/// | Phase        | Strategy                                                |
-/// |--------------|---------------------------------------------------------|
-/// | Scaffolding  | Pick the **coolest** unlocked file with no active agents|
-/// | Resolution   | Pick the **hottest** unlocked file                      |
-/// | Annealing    | Pick the file with the **lowest agent density**         |
+/// | Phase        | Strategy                                                        |
+/// |--------------|-----------------------------------------------------------------|
+/// | Scaffolding  | Prefer idle, low-density cool files to lock stable zones first  |
+/// | Resolution   | Prefer hot files that still want more competing agents          |
+/// | Annealing    | Prefer low-contention unresolved files and spread convergence   |
 ///
 /// Files that are locked (via `cool_locks`) or already at maximum agent
-/// density are excluded from consideration.
+/// density are excluded from consideration. For richer scheduler decisions,
+/// call [`rank_targets`] directly.
 ///
 /// Returns `None` when no eligible file exists.
 pub fn next_target(
@@ -163,67 +423,10 @@ pub fn next_target(
     phase: ExecutionPhase,
     max_density: i32,
 ) -> Option<String> {
-    // Build sets for O(1) lookup.
-    let locked_files: HashSet<&str> = locks.iter().map(|l| l.file_path.as_str()).collect();
-
-    let agent_file_counts: std::collections::HashMap<&str, i32> = {
-        let mut map = std::collections::HashMap::new();
-        for agent in active_agents {
-            *map.entry(agent.file_path.as_str()).or_insert(0) += 1;
-        }
-        map
-    };
-
-    // Filter to eligible candidates.
-    let candidates: Vec<&ThermalAggregate> = aggregates
-        .iter()
-        .filter(|a| {
-            !locked_files.contains(a.file_path.as_str())
-                && !a.is_locked
-                && *agent_file_counts.get(a.file_path.as_str()).unwrap_or(&0) < max_density
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let best = match phase {
-        ExecutionPhase::Scaffolding => {
-            // Coolest file first, prefer files with zero active agents.
-            candidates.iter().min_by(|a, b| {
-                let a_agents = agent_file_counts.get(a.file_path.as_str()).unwrap_or(&0);
-                let b_agents = agent_file_counts.get(b.file_path.as_str()).unwrap_or(&0);
-                a_agents.cmp(b_agents).then(
-                    a.composite_score
-                        .partial_cmp(&b.composite_score)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-            })
-        }
-        ExecutionPhase::Resolution => {
-            // Hottest file first.
-            candidates.iter().max_by(|a, b| {
-                a.composite_score
-                    .partial_cmp(&b.composite_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-        }
-        ExecutionPhase::Annealing => {
-            // Lowest agent density first, break ties by highest score.
-            candidates.iter().min_by(|a, b| {
-                let a_agents = agent_file_counts.get(a.file_path.as_str()).unwrap_or(&0);
-                let b_agents = agent_file_counts.get(b.file_path.as_str()).unwrap_or(&0);
-                a_agents.cmp(b_agents).then(
-                    b.composite_score
-                        .partial_cmp(&a.composite_score)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-            })
-        }
-    };
-
-    best.map(|a| a.file_path.clone())
+    rank_targets(aggregates, locks, active_agents, phase, max_density)
+        .into_iter()
+        .next()
+        .map(|target| target.file_path)
 }
 
 /// Determine the current [`ExecutionPhase`] from the global swarm state.
@@ -674,6 +877,99 @@ mod tests {
     fn next_target_returns_none_when_empty() {
         let target = next_target(&[], &[], &[], ExecutionPhase::Resolution, 5);
         assert!(target.is_none());
+    }
+
+    #[test]
+    fn rank_targets_scaffolding_prefers_idle_then_density_then_coolness() {
+        let aggs = vec![
+            make_aggregate("cool-but-busy.rs", 0.05, false),
+            make_aggregate("cool-idle-high-density.rs", 0.10, false),
+            make_aggregate("cool-idle-low-density.rs", 0.20, false),
+        ];
+        let agents = vec![make_agent("cool-but-busy.rs")];
+        let mut aggs = aggs;
+        aggs[1].agent_density = 2;
+        aggs[2].agent_density = 0;
+
+        let ranked = rank_targets(&aggs, &[], &agents, ExecutionPhase::Scaffolding, 3);
+
+        assert_eq!(ranked[0].file_path, "cool-idle-low-density.rs");
+        assert_eq!(ranked[1].file_path, "cool-idle-high-density.rs");
+        assert_eq!(ranked[2].file_path, "cool-but-busy.rs");
+    }
+
+    #[test]
+    fn rank_targets_resolution_keeps_hottest_file_ranked_until_hot_budget_is_met() {
+        let aggs = vec![
+            make_aggregate("hot.rs", 0.95, false),
+            make_aggregate("warm.rs", 0.60, false),
+            make_aggregate("cool.rs", 0.20, false),
+        ];
+
+        let ranked = rank_targets(&aggs, &[], &[], ExecutionPhase::Resolution, 4);
+        assert_eq!(ranked[0].file_path, "hot.rs");
+        assert_eq!(ranked[0].desired_agent_count, 4);
+        assert_eq!(ranked[0].additional_agents_needed, 4);
+
+        let contended_agents = vec![
+            make_agent("hot.rs"),
+            make_agent("hot.rs"),
+            make_agent("warm.rs"),
+        ];
+        let ranked = rank_targets(&aggs, &[], &contended_agents, ExecutionPhase::Resolution, 4);
+        assert_eq!(ranked[0].file_path, "hot.rs");
+        assert_eq!(ranked[0].contention, ContentionState::Shared);
+        assert_eq!(ranked[0].additional_agents_needed, 2);
+    }
+
+    #[test]
+    fn rank_targets_annealing_spreads_before_revisiting_busy_file() {
+        let aggs = vec![
+            make_aggregate("shared-hot.rs", 0.90, false),
+            make_aggregate("idle-warm.rs", 0.72, false),
+            make_aggregate("idle-cool.rs", 0.40, false),
+        ];
+        let agents = vec![make_agent("shared-hot.rs")];
+
+        let ranked = rank_targets(&aggs, &[], &agents, ExecutionPhase::Annealing, 3);
+
+        assert_eq!(ranked[0].file_path, "idle-warm.rs");
+        assert_eq!(ranked[0].desired_agent_count, 2);
+        assert_eq!(ranked[0].contention, ContentionState::Idle);
+        assert_eq!(ranked[1].file_path, "idle-cool.rs");
+        assert_eq!(ranked[2].file_path, "shared-hot.rs");
+    }
+
+    #[test]
+    fn contention_state_tracks_idle_shared_and_saturated() {
+        assert_eq!(contention_state(0, 3), ContentionState::Idle);
+        assert_eq!(contention_state(1, 3), ContentionState::Shared);
+        assert_eq!(contention_state(3, 3), ContentionState::Saturated);
+        assert_eq!(contention_state(0, 0), ContentionState::Saturated);
+    }
+
+    #[test]
+    fn desired_agent_count_is_phase_aware() {
+        assert_eq!(
+            desired_agent_count_for_target(ExecutionPhase::Scaffolding, 0.95, 4),
+            1
+        );
+        assert_eq!(
+            desired_agent_count_for_target(ExecutionPhase::Resolution, 0.95, 4),
+            4
+        );
+        assert_eq!(
+            desired_agent_count_for_target(ExecutionPhase::Resolution, 0.20, 4),
+            1
+        );
+        assert_eq!(
+            desired_agent_count_for_target(ExecutionPhase::Annealing, 0.72, 4),
+            2
+        );
+        assert_eq!(
+            desired_agent_count_for_target(ExecutionPhase::Annealing, 0.40, 4),
+            1
+        );
     }
 
     // -- phase_from_progress -------------------------------------------------

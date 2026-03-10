@@ -21,6 +21,7 @@ Corpus shape:
 - stage distribution is fixed in v0.3: parse=5, compile=20, test=15, lint=10
 - 10 unique fixture directories under `cases/`
 - each fixture family appears 5 times in the manifest: the seed case plus variants `v2` through `v5`
+- only ids ending in an explicit `_v<digits>` suffix count as variants; ids with embedded `_v` elsewhere are treated as seed ids
 - variants currently reuse the same on-disk crate path and are differentiated by case id, provenance metadata, and tags for selection/reporting
 
 Run bundle layout:
@@ -55,3 +56,4 @@ Notes:
 - it does not execute the full repair runtime; CI repair orchestration lives in `.github/workflows/repair.yml`
 - cases are currently 50 logical ids backed by 10 physical fixture crates; promote to 50 physical fixtures only if needed for future benchmarking
 - this harness should be treated as baseline-failure validation infrastructure, not as published repair-success benchmarking
+- the TypeScript lane has a parallel baseline harness at `evals/v1_typescript/`

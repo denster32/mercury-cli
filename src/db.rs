@@ -362,6 +362,15 @@ impl ThermalDb {
         Ok(())
     }
 
+    /// Unlock a file in the aggregate table.
+    pub fn unlock_aggregate(&self, file_path: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE thermal_aggregate SET is_locked = FALSE WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        Ok(())
+    }
+
     /// Increment the agent density counter for a file.
     pub fn increment_density(&self, file_path: &str) -> Result<(), DbError> {
         self.conn.execute(
@@ -452,12 +461,12 @@ impl ThermalDb {
         rows.collect::<SqlResult<Vec<_>>>().map_err(DbError::from)
     }
 
-    /// Get active agents (spawned or running).
+    /// Get active agents (spawned, running, or retrying).
     pub fn get_active_agents(&self) -> Result<Vec<AgentLogEntry>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_id, command, file_path, status, micro_heatmap,
                     started_at, completed_at, tokens_used, cost_usd
-             FROM agent_log WHERE status IN ('spawned', 'running') ORDER BY started_at",
+             FROM agent_log WHERE status IN ('spawned', 'running', 'retrying') ORDER BY started_at",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(AgentLogEntry {
@@ -480,7 +489,7 @@ impl ThermalDb {
     pub fn agent_density_at(&self, file_path: &str) -> Result<i32, DbError> {
         let count: i32 = self.conn.query_row(
             "SELECT COUNT(*) FROM agent_log
-             WHERE file_path = ?1 AND status IN ('spawned', 'running')",
+             WHERE file_path = ?1 AND status IN ('spawned', 'running', 'retrying')",
             params![file_path],
             |row| row.get(0),
         )?;
@@ -745,6 +754,20 @@ mod tests {
     }
 
     #[test]
+    fn test_lock_unlock_aggregate_roundtrip() {
+        let db = ThermalDb::in_memory().unwrap();
+        db.upsert_aggregate("src/lib.rs", 0.65, 0.9, 2).unwrap();
+
+        db.lock_aggregate("src/lib.rs").unwrap();
+        let locked = db.get_aggregate("src/lib.rs").unwrap().unwrap();
+        assert!(locked.is_locked);
+
+        db.unlock_aggregate("src/lib.rs").unwrap();
+        let unlocked = db.get_aggregate("src/lib.rs").unwrap().unwrap();
+        assert!(!unlocked.is_locked);
+    }
+
+    #[test]
     fn test_cool_lock_crud() {
         let db = ThermalDb::in_memory().unwrap();
         db.insert_cool_lock("src/lib.rs", 1, 100, "abc123", "agent-1")
@@ -774,6 +797,35 @@ mod tests {
         let logs = db.get_agent_logs().unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].status, "success");
+    }
+
+    #[test]
+    fn test_retrying_counts_as_active_and_density() {
+        let db = ThermalDb::in_memory().unwrap();
+        let retrying = db
+            .log_agent_spawn("agent-retry", "fix", "src/main.rs")
+            .unwrap();
+        let running = db
+            .log_agent_spawn("agent-run", "fix", "src/main.rs")
+            .unwrap();
+        let done = db
+            .log_agent_spawn("agent-done", "fix", "src/main.rs")
+            .unwrap();
+
+        db.update_agent_status(retrying, "retrying", 0, 0.0, None)
+            .unwrap();
+        db.update_agent_status(running, "running", 0, 0.0, None)
+            .unwrap();
+        db.update_agent_status(done, "success", 0, 0.0, None)
+            .unwrap();
+
+        let active = db.get_active_agents().unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|entry| entry.status == "retrying"));
+        assert!(active.iter().any(|entry| entry.status == "running"));
+
+        let density = db.agent_density_at("src/main.rs").unwrap();
+        assert_eq!(density, 2);
     }
 
     #[test]

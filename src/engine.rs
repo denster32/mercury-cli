@@ -5,7 +5,7 @@
 //! - **Verifier**: tree-sitter parse → test → lint → optional Mercury 2 critique
 //! - **Scheduler**: tokio concurrency pool, budget tracking, thermal merge cycles
 
-use std::collections::{hash_map::DefaultHasher, BTreeMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +19,7 @@ use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{
     planner_response_json_schema_v1, ApiError, ApiUsage, Mercury2Api, MercuryEditApi,
@@ -776,7 +776,6 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     project_root: &Path,
 ) -> Result<StepExecutionSummary, EngineError> {
     let run_root = create_run_root(project_root)?;
-    let accepted_states = Arc::new(Mutex::new(HashMap::<PathBuf, String>::new()));
     let swarm_state = db.get_swarm_state()?;
     let swarm_id = swarm_state
         .as_ref()
@@ -798,50 +797,101 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
             .unwrap_or_default(),
     ));
     telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
-    let mut grouped_steps: BTreeMap<PathBuf, Vec<IndexedPlanStep>> = BTreeMap::new();
+    let mut grouped_steps: BTreeMap<String, Vec<IndexedPlanStep>> = BTreeMap::new();
 
     for (index, step) in plan.steps.iter().cloned().enumerate() {
         grouped_steps
-            .entry(PathBuf::from(&step.file_path))
+            .entry(step.file_path.clone())
             .or_default()
             .push(IndexedPlanStep { index, step });
     }
 
-    let max_concurrency = scheduler.config().max_concurrency.max(1);
-    let partials = stream::iter(grouped_steps.into_iter().map(|(relative_path, steps)| {
-        let accepted_states = Arc::clone(&accepted_states);
-        let run_root = run_root.clone();
-        let telemetry = Arc::clone(&telemetry);
-        async move {
-            execute_file_group(
-                relative_path,
-                steps,
-                patcher,
-                verifier,
-                scheduler,
-                db,
-                project_root,
-                &run_root,
-                accepted_states,
-                telemetry,
-            )
-            .await
+    let mut file_states = BTreeMap::<String, FileExecutionState>::new();
+    for (file_key, steps) in grouped_steps {
+        if db.is_file_locked(&file_key)? {
+            continue;
         }
-    }))
-    .buffer_unordered(max_concurrency)
-    .collect::<Vec<_>>()
-    .await;
+
+        ensure_file_aggregate(
+            db,
+            &file_key,
+            steps
+                .first()
+                .map(|indexed| indexed.step.priority)
+                .unwrap_or_default(),
+        )?;
+        let relative_path = PathBuf::from(&file_key);
+        let latest_state = read_workspace_file(project_root, &relative_path)?;
+        file_states.insert(
+            file_key.clone(),
+            FileExecutionState::new(file_key, relative_path, steps, latest_state),
+        );
+    }
 
     let mut summary = StepExecutionSummary {
         run_root: Some(run_root.clone()),
         ..StepExecutionSummary::default()
     };
 
-    for partial in partials {
-        summary.merge(partial?);
+    let mut accepted_snapshot = HashMap::<PathBuf, String>::new();
+    let mut accepted_candidates = BTreeMap::<PathBuf, AcceptedCandidate>::new();
+    for phase in [
+        thermal::ExecutionPhase::Scaffolding,
+        thermal::ExecutionPhase::Resolution,
+        thermal::ExecutionPhase::Annealing,
+    ] {
+        loop {
+            let batch =
+                build_dispatch_batch(&file_states, &accepted_snapshot, scheduler, db, phase)?;
+            if batch.is_empty() {
+                break;
+            }
+
+            telemetry.sync(
+                db,
+                scheduler,
+                phase_temperature(phase),
+                scheduler.active_count() as i64,
+            )?;
+            let max_concurrency = scheduler.config().max_concurrency.max(1);
+            let partials = stream::iter(batch.into_iter().map(|work_item| {
+                let run_root = run_root.clone();
+                let telemetry = Arc::clone(&telemetry);
+                async move {
+                    execute_dispatch_work_item(
+                        work_item,
+                        patcher,
+                        verifier,
+                        scheduler,
+                        db,
+                        project_root,
+                        &run_root,
+                        &telemetry,
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(max_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+            for partial in partials {
+                let partial = partial?;
+                summary.merge(partial.summary);
+                let file_state = file_states
+                    .get_mut(&partial.file_key)
+                    .expect("dispatch result must map to a known file state");
+                let _ = file_state.steps.pop_front();
+                if let Some(winner) = partial.winner {
+                    file_state.latest_state = winner.content.clone();
+                    file_state.seen_hashes.insert(winner.state_hash.clone());
+                    accepted_snapshot.insert(winner.relative_path.clone(), winner.content.clone());
+                    accepted_candidates.insert(winner.relative_path.clone(), winner);
+                }
+            }
+        }
     }
 
-    let accepted_snapshot = accepted_states.lock().await.clone();
     if accepted_snapshot.is_empty() {
         telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
         return Ok(summary);
@@ -861,6 +911,15 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
 
     if final_verify.is_ok() {
         apply_changes_atomically(project_root, &accepted_snapshot)?;
+        for accepted in accepted_candidates.values() {
+            write_cool_lock(
+                db,
+                &accepted.file_key,
+                &accepted.content,
+                &accepted.agent_id,
+            )?;
+            db.lock_aggregate(&accepted.file_key)?;
+        }
         summary.applied = true;
     } else {
         summary.verification_failures += 1;
@@ -884,253 +943,382 @@ struct IndexedPlanStep {
     step: PlanStep,
 }
 
-async fn execute_file_group<E: MercuryEditApi, A: Mercury2Api>(
+#[derive(Debug)]
+struct FileExecutionState {
+    file_key: String,
     relative_path: PathBuf,
-    steps: Vec<IndexedPlanStep>,
+    steps: VecDeque<IndexedPlanStep>,
+    latest_state: String,
+    seen_hashes: HashSet<String>,
+}
+
+impl FileExecutionState {
+    fn new(
+        file_key: String,
+        relative_path: PathBuf,
+        steps: Vec<IndexedPlanStep>,
+        latest_state: String,
+    ) -> Self {
+        Self {
+            file_key,
+            relative_path,
+            steps: steps.into(),
+            latest_state: latest_state.clone(),
+            seen_hashes: HashSet::from([content_hash(&latest_state)]),
+        }
+    }
+
+    fn next_phase(&self) -> Option<thermal::ExecutionPhase> {
+        let total_steps = self.steps.len().max(1);
+        self.steps.front().map(|indexed_step| {
+            thermal::phase_from_progress((indexed_step.index + 1) as i64, total_steps as i64)
+        })
+    }
+
+    fn priority(&self) -> f64 {
+        self.steps
+            .front()
+            .map(|indexed_step| indexed_step.step.priority)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug)]
+struct DispatchWorkItem {
+    file_key: String,
+    relative_path: PathBuf,
+    indexed_step: IndexedPlanStep,
+    phase: thermal::ExecutionPhase,
+    fanout: usize,
+    latest_state: String,
+    seen_hashes: HashSet<String>,
+    accepted_snapshot: HashMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedCandidate {
+    file_key: String,
+    relative_path: PathBuf,
+    content: String,
+    agent_id: String,
+    state_hash: String,
+}
+
+#[derive(Debug)]
+struct StepDispatchResult {
+    file_key: String,
+    summary: StepExecutionSummary,
+    winner: Option<AcceptedCandidate>,
+}
+
+fn build_dispatch_batch(
+    file_states: &BTreeMap<String, FileExecutionState>,
+    accepted_snapshot: &HashMap<PathBuf, String>,
+    scheduler: &Scheduler,
+    db: &ThermalDb,
+    phase: thermal::ExecutionPhase,
+) -> Result<Vec<DispatchWorkItem>, EngineError> {
+    let eligible_files = file_states
+        .iter()
+        .filter_map(|(file_key, state)| {
+            (state.next_phase() == Some(phase)).then_some(file_key.as_str())
+        })
+        .collect::<HashSet<_>>();
+    if eligible_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_concurrency = scheduler.config().max_concurrency.max(1);
+    let density_controller = DensityController::new(max_concurrency as i32);
+    let dispatch_targets = thermal::dispatch_targets(
+        &db.get_all_aggregates()?,
+        &db.get_all_locks()?,
+        &db.get_active_agents()?,
+        phase,
+        max_concurrency as i32,
+    );
+
+    let mut batch = dispatch_targets
+        .into_iter()
+        .filter(|target| {
+            eligible_files.contains(target.file_path.as_str())
+                && matches!(target.readiness, thermal::DispatchReadiness::LaunchNow)
+        })
+        .filter_map(|target| {
+            let state = file_states.get(target.file_path.as_str())?;
+            let indexed_step = state.steps.front()?.clone();
+            let fanout = candidate_fanout(
+                phase,
+                max_concurrency,
+                state.priority(),
+                target.active_agents,
+                &density_controller,
+            )
+            .min(target.launchable_agents.max(1));
+            (fanout > 0).then(|| DispatchWorkItem {
+                file_key: state.file_key.clone(),
+                relative_path: state.relative_path.clone(),
+                indexed_step,
+                phase,
+                fanout,
+                latest_state: state.latest_state.clone(),
+                seen_hashes: state.seen_hashes.clone(),
+                accepted_snapshot: accepted_snapshot.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if batch.is_empty() {
+        let mut fallback = file_states
+            .values()
+            .filter(|state| state.next_phase() == Some(phase))
+            .collect::<Vec<_>>();
+        fallback.sort_by(|left, right| {
+            right
+                .priority()
+                .total_cmp(&left.priority())
+                .then_with(|| left.file_key.cmp(&right.file_key))
+        });
+        if let Some(state) = fallback.into_iter().next() {
+            if let Some(indexed_step) = state.steps.front().cloned() {
+                let fanout = candidate_fanout(
+                    phase,
+                    max_concurrency,
+                    state.priority(),
+                    0,
+                    &density_controller,
+                )
+                .max(1);
+                batch.push(DispatchWorkItem {
+                    file_key: state.file_key.clone(),
+                    relative_path: state.relative_path.clone(),
+                    indexed_step,
+                    phase,
+                    fanout,
+                    latest_state: state.latest_state.clone(),
+                    seen_hashes: state.seen_hashes.clone(),
+                    accepted_snapshot: accepted_snapshot.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(batch)
+}
+
+async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
+    work_item: DispatchWorkItem,
     patcher: &Patcher<E>,
     verifier: &Verifier<A>,
     scheduler: &Scheduler,
     db: &ThermalDb,
     project_root: &Path,
     run_root: &Path,
-    accepted_states: Arc<Mutex<HashMap<PathBuf, String>>>,
-    telemetry: Arc<ExecutionTelemetry>,
-) -> Result<StepExecutionSummary, EngineError> {
+    telemetry: &ExecutionTelemetry,
+) -> Result<StepDispatchResult, EngineError> {
     let mut summary = StepExecutionSummary::default();
-    let file_key = relative_path.to_string_lossy().to_string();
-    if db.is_file_locked(&file_key)? {
-        return Ok(summary);
+    let step_root = run_root.join("candidates").join(format!(
+        "step-{:04}-{}",
+        work_item.indexed_step.index + 1,
+        sanitize_path_component(&work_item.indexed_step.step.file_path)
+    ));
+    let phase_temperature = phase_temperature(work_item.phase);
+    let outcomes = stream::iter((0..work_item.fanout).map(|candidate_index| {
+        execute_candidate_variant(
+            candidate_index,
+            &work_item.indexed_step,
+            work_item.phase,
+            &work_item.latest_state,
+            &work_item.accepted_snapshot,
+            patcher,
+            verifier,
+            scheduler,
+            db,
+            project_root,
+            &step_root,
+            telemetry,
+        )
+    }))
+    .buffer_unordered(work_item.fanout)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut verified_candidates = Vec::new();
+    for outcome in outcomes {
+        let outcome = outcome?;
+        summary.retry_attempts += outcome.retry_attempts;
+        if outcome.candidate.is_some() {
+            verified_candidates.push(outcome);
+        } else {
+            summary.rejected += 1;
+            if matches!(
+                outcome.failure_stage,
+                Some(CandidateFailureStage::Verification)
+            ) {
+                summary.verification_failures += 1;
+            }
+            let metadata = serde_json::json!({
+                "outcome":"rejected",
+                "reason": outcome.reason,
+                "sandbox_root": outcome.sandbox_root.display().to_string(),
+                "candidate_source": outcome.source.as_str(),
+                "failure_stage": outcome.failure_stage.map(CandidateFailureStage::as_str),
+                "retry_attempts": outcome.retry_attempts,
+                "phase": work_item.phase.to_string(),
+            });
+            db.update_agent_status(
+                outcome.log_id,
+                "failed",
+                outcome.total_tokens,
+                outcome.total_cost,
+                Some(&metadata.to_string()),
+            )?;
+        }
     }
 
-    ensure_file_aggregate(
-        db,
-        &file_key,
-        steps
-            .first()
-            .map(|indexed| indexed.step.priority)
-            .unwrap_or_default(),
-    )?;
-    let density_controller = DensityController::new(scheduler.config().max_concurrency as i32);
-    let mut latest_state =
-        read_latest_state(project_root, &accepted_states, &relative_path).await?;
-    let mut seen_hashes = HashSet::from([content_hash(&latest_state)]);
-    let total_steps = steps.len().max(1);
-
-    for (position, indexed_step) in steps.into_iter().enumerate() {
-        let phase = thermal::phase_from_progress((position + 1) as i64, total_steps as i64);
-        let phase_temperature = phase_temperature(phase);
-        let aggregate_density = db
-            .get_aggregate(&file_key)?
-            .map(|aggregate| aggregate.agent_density)
-            .unwrap_or_default();
-        let fanout = candidate_fanout(
-            phase,
-            scheduler.config().max_concurrency.max(1),
-            indexed_step.step.priority,
-            aggregate_density,
-            &density_controller,
-        );
-        if fanout == 0 {
-            telemetry.sync(
-                db,
-                scheduler,
-                phase_temperature,
-                scheduler.active_count() as i64,
+    let mut ranked_candidates = Vec::new();
+    for mut outcome in verified_candidates {
+        if outcome
+            .state_hash
+            .as_ref()
+            .is_some_and(|hash| work_item.seen_hashes.contains(hash))
+        {
+            summary.rejected += 1;
+            outcome.reason = Some(
+                "oscillation suppressed: candidate matches a previously accepted file state"
+                    .to_string(),
+            );
+            let metadata = serde_json::json!({
+                "outcome":"rejected",
+                "reason": outcome.reason,
+                "sandbox_root": outcome.sandbox_root.display().to_string(),
+                "candidate_source": outcome.source.as_str(),
+                "retry_attempts": outcome.retry_attempts,
+                "phase": work_item.phase.to_string(),
+            });
+            db.update_agent_status(
+                outcome.log_id,
+                "failed",
+                outcome.total_tokens,
+                outcome.total_cost,
+                Some(&metadata.to_string()),
             )?;
-            continue;
+        } else {
+            ranked_candidates.push(outcome);
         }
+    }
 
-        let step_root = run_root.join("candidates").join(format!(
-            "step-{:04}-{}",
-            indexed_step.index + 1,
-            sanitize_path_component(&indexed_step.step.file_path)
-        ));
-        let accepted_snapshot = accepted_states.lock().await.clone();
+    rank_candidate_outcomes(&mut ranked_candidates);
+    let (ranked_candidates, duplicate_candidates) =
+        split_duplicate_state_candidates(ranked_candidates);
+    for duplicate in duplicate_candidates {
+        summary.rejected += 1;
+        let metadata = serde_json::json!({
+            "outcome":"rejected",
+            "reason":"duplicate verified candidate output",
+            "sandbox_root": duplicate.sandbox_root.display().to_string(),
+            "candidate_source": duplicate.source.as_str(),
+            "retry_attempts": duplicate.retry_attempts,
+            "phase": work_item.phase.to_string(),
+            "fanout": work_item.fanout,
+            "temperature": phase_temperature,
+            "touched_lines": duplicate.change_footprint.touched_lines,
+            "byte_delta": duplicate.change_footprint.byte_delta,
+        });
+        db.update_agent_status(
+            duplicate.log_id,
+            "failed",
+            duplicate.total_tokens,
+            duplicate.total_cost,
+            Some(&metadata.to_string()),
+        )?;
+    }
 
-        let outcomes = stream::iter((0..fanout).map(|candidate_index| {
-            execute_candidate_variant(
-                candidate_index,
-                &indexed_step,
-                phase,
-                &latest_state,
-                &accepted_snapshot,
-                patcher,
-                verifier,
-                scheduler,
-                db,
-                project_root,
-                &step_root,
-                &telemetry,
-            )
-        }))
-        .buffer_unordered(fanout)
-        .collect::<Vec<_>>()
-        .await;
+    let mut ranked_iter = ranked_candidates.into_iter();
+    let winner = if let Some(winner) = ranked_iter.next() {
+        let accepted = winner
+            .candidate
+            .as_ref()
+            .cloned()
+            .expect("verified candidate must carry content");
+        summary.accepted += 1;
 
-        let mut verified_candidates = Vec::new();
-        for outcome in outcomes {
-            let outcome = outcome?;
-            summary.retry_attempts += outcome.retry_attempts;
-            if outcome.candidate.is_some() {
-                verified_candidates.push(outcome);
-            } else {
-                summary.rejected += 1;
-                if matches!(
-                    outcome.failure_stage,
-                    Some(CandidateFailureStage::Verification)
-                ) {
-                    summary.verification_failures += 1;
-                }
-                let metadata = serde_json::json!({
-                    "outcome":"rejected",
-                    "reason": outcome.reason,
-                    "sandbox_root": outcome.sandbox_root.display().to_string(),
-                    "candidate_source": outcome.source.as_str(),
-                    "failure_stage": outcome.failure_stage.map(CandidateFailureStage::as_str),
-                    "retry_attempts": outcome.retry_attempts,
-                    "phase": phase.to_string(),
-                });
-                db.update_agent_status(
-                    outcome.log_id,
-                    "failed",
-                    outcome.total_tokens,
-                    outcome.total_cost,
-                    Some(&metadata.to_string()),
-                )?;
-            }
-        }
+        let winner_metadata = serde_json::json!({
+            "outcome":"accepted",
+            "sandbox_root": winner.sandbox_root.display().to_string(),
+            "candidate_source": winner.source.as_str(),
+            "retry_attempts": winner.retry_attempts,
+            "phase": work_item.phase.to_string(),
+            "fanout": work_item.fanout,
+            "temperature": phase_temperature,
+            "touched_lines": winner.change_footprint.touched_lines,
+            "byte_delta": winner.change_footprint.byte_delta,
+        });
+        db.update_agent_status(
+            winner.log_id,
+            "success",
+            winner.total_tokens,
+            winner.total_cost,
+            Some(&winner_metadata.to_string()),
+        )?;
 
-        let mut ranked_candidates = Vec::new();
-        for mut outcome in verified_candidates {
-            if outcome
-                .state_hash
-                .as_ref()
-                .is_some_and(|hash| seen_hashes.contains(hash))
-            {
-                summary.rejected += 1;
-                outcome.reason = Some(
-                    "oscillation suppressed: candidate matches a previously accepted file state"
-                        .to_string(),
-                );
-                let metadata = serde_json::json!({
-                    "outcome":"rejected",
-                    "reason": outcome.reason,
-                    "sandbox_root": outcome.sandbox_root.display().to_string(),
-                    "candidate_source": outcome.source.as_str(),
-                    "retry_attempts": outcome.retry_attempts,
-                    "phase": phase.to_string(),
-                });
-                db.update_agent_status(
-                    outcome.log_id,
-                    "failed",
-                    outcome.total_tokens,
-                    outcome.total_cost,
-                    Some(&metadata.to_string()),
-                )?;
-            } else {
-                ranked_candidates.push(outcome);
-            }
-        }
-
-        rank_candidate_outcomes(&mut ranked_candidates);
-        let (ranked_candidates, duplicate_candidates) =
-            split_duplicate_state_candidates(ranked_candidates);
-        for duplicate in duplicate_candidates {
+        for loser in ranked_iter {
             summary.rejected += 1;
             let metadata = serde_json::json!({
                 "outcome":"rejected",
-                "reason":"duplicate verified candidate output",
-                "sandbox_root": duplicate.sandbox_root.display().to_string(),
-                "candidate_source": duplicate.source.as_str(),
-                "retry_attempts": duplicate.retry_attempts,
-                "phase": phase.to_string(),
-                "fanout": fanout,
+                "reason":"lower-ranked competing candidate",
+                "sandbox_root": loser.sandbox_root.display().to_string(),
+                "candidate_source": loser.source.as_str(),
+                "retry_attempts": loser.retry_attempts,
+                "phase": work_item.phase.to_string(),
+                "fanout": work_item.fanout,
                 "temperature": phase_temperature,
-                "touched_lines": duplicate.change_footprint.touched_lines,
-                "byte_delta": duplicate.change_footprint.byte_delta,
+                "touched_lines": loser.change_footprint.touched_lines,
+                "byte_delta": loser.change_footprint.byte_delta,
             });
             db.update_agent_status(
-                duplicate.log_id,
+                loser.log_id,
                 "failed",
-                duplicate.total_tokens,
-                duplicate.total_cost,
+                loser.total_tokens,
+                loser.total_cost,
                 Some(&metadata.to_string()),
             )?;
         }
 
-        let mut ranked_iter = ranked_candidates.into_iter();
-        if let Some(winner) = ranked_iter.next() {
-            let accepted = winner
-                .candidate
-                .as_ref()
-                .cloned()
-                .expect("verified candidate must carry content");
-            latest_state = accepted.clone();
-            if let Some(hash) = winner.state_hash.as_ref() {
-                seen_hashes.insert(hash.clone());
-            }
-            accepted_states
-                .lock()
-                .await
-                .insert(relative_path.clone(), accepted.clone());
-            summary.accepted += 1;
-            write_cool_lock(db, &file_key, &accepted, &winner.agent_id)?;
-            db.lock_aggregate(&file_key)?;
+        Some(AcceptedCandidate {
+            file_key: work_item.file_key.clone(),
+            relative_path: work_item.relative_path.clone(),
+            content: accepted,
+            agent_id: winner.agent_id,
+            state_hash: winner
+                .state_hash
+                .expect("accepted winner must carry a state hash"),
+        })
+    } else {
+        telemetry.sync(
+            db,
+            scheduler,
+            phase_temperature,
+            scheduler.active_count() as i64,
+        )?;
+        None
+    };
 
-            let winner_metadata = serde_json::json!({
-                "outcome":"accepted",
-                "sandbox_root": winner.sandbox_root.display().to_string(),
-                "candidate_source": winner.source.as_str(),
-                "retry_attempts": winner.retry_attempts,
-                "phase": phase.to_string(),
-                "fanout": fanout,
-                "temperature": phase_temperature,
-                "touched_lines": winner.change_footprint.touched_lines,
-                "byte_delta": winner.change_footprint.byte_delta,
-            });
-            db.update_agent_status(
-                winner.log_id,
-                "success",
-                winner.total_tokens,
-                winner.total_cost,
-                Some(&winner_metadata.to_string()),
-            )?;
-
-            for loser in ranked_iter {
-                summary.rejected += 1;
-                let metadata = serde_json::json!({
-                    "outcome":"rejected",
-                    "reason":"lower-ranked competing candidate",
-                    "sandbox_root": loser.sandbox_root.display().to_string(),
-                    "candidate_source": loser.source.as_str(),
-                    "retry_attempts": loser.retry_attempts,
-                    "phase": phase.to_string(),
-                    "fanout": fanout,
-                    "temperature": phase_temperature,
-                    "touched_lines": loser.change_footprint.touched_lines,
-                    "byte_delta": loser.change_footprint.byte_delta,
-                });
-                db.update_agent_status(
-                    loser.log_id,
-                    "failed",
-                    loser.total_tokens,
-                    loser.total_cost,
-                    Some(&metadata.to_string()),
-                )?;
-            }
-        } else {
-            telemetry.sync(
-                db,
-                scheduler,
-                phase_temperature,
-                scheduler.active_count() as i64,
-            )?;
-        }
-    }
-
-    Ok(summary)
+    Ok(StepDispatchResult {
+        file_key: work_item.file_key,
+        summary,
+        winner,
+    })
 }
 
+fn read_workspace_file(project_root: &Path, relative_path: &Path) -> Result<String, EngineError> {
+    let full_path = project_root.join(relative_path);
+    match std::fs::read_to_string(&full_path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(EngineError::Io(err)),
+    }
+}
 #[allow(clippy::too_many_arguments)]
 async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
     candidate_index: usize,
@@ -1429,23 +1617,6 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
         scheduler.active_count() as i64,
     )?;
     result
-}
-
-async fn read_latest_state(
-    project_root: &Path,
-    accepted_states: &Mutex<HashMap<PathBuf, String>>,
-    relative_path: &Path,
-) -> Result<String, EngineError> {
-    if let Some(existing) = accepted_states.lock().await.get(relative_path).cloned() {
-        return Ok(existing);
-    }
-
-    let full_path = project_root.join(relative_path);
-    match std::fs::read_to_string(&full_path) {
-        Ok(content) => Ok(content),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(err) => Err(EngineError::Io(err)),
-    }
 }
 
 fn create_run_root(project_root: &Path) -> Result<PathBuf, EngineError> {

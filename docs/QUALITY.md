@@ -1,4 +1,4 @@
-# Mercury CLI Quality Contract (Current v1.0-in-progress, Rust-first runtime)
+# Mercury CLI Quality Contract (Current v1.0-in-progress, Rust + TypeScript runtime)
 
 This document describes what quality automation exists in the repository today.
 
@@ -59,7 +59,8 @@ This is the active contract. Do not infer unlisted module/property tests from th
 
 Current behavior should be documented and reviewed as:
 
-- Rust-first repair scope for end-to-end fix/watch flows
+- end-to-end `fix` and CI repair scope for direct allowlisted Rust/TypeScript verifier command paths
+- local `watch --repair` scope remains Rust-only
 - direct verifier command targeting for the repair loop (`cargo test`, `cargo check`, `cargo clippy`, including env-prefix forms)
 - verifier allowlisting for direct Rust cargo commands plus selected direct TypeScript verifier invocations, without shell composition by default
 - watch command allowlist rejects shell composition and wrapper commands before cycle execution by default
@@ -68,8 +69,18 @@ Current behavior should be documented and reviewed as:
 
 TypeScript lane status:
 
-- repo mapping/parser and selected verifier support exist in the current branch
-- full end-to-end TypeScript repair remains partial until engine integration lands
+- repo mapping/parser, failure parsing, and selected verifier support exist in the current branch
+- `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for second-language harness coverage
+- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths; watch-repair and broader command classes remain limited
+
+## Eval Harness Coverage
+
+Current corpus contracts:
+
+- `evals/v0`: Rust v0.3 baseline harness (50 logical cases)
+- `evals/v1_typescript`: TypeScript v1.0 lane baseline harness (50 logical cases)
+
+Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality.
 
 ## Release Artifact Reality
 
@@ -79,6 +90,11 @@ Current release/build workflows:
 - `.github/workflows/release.yml`: publish Linux x86_64 and macOS arm64 assets on tag/manual release
 
 If broader binary coverage is required, treat it as roadmap work, not current quality-gate fact.
+
+Versioning/distribution caveat:
+
+- Tagged releases are the GA contract boundary for binaries and migration expectations.
+- Branch-head docs can describe in-progress lanes but should not be treated as stable binary-support commitments.
 
 ## How to Use This Document
 

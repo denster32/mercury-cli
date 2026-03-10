@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,6 +30,495 @@ pub const ROLLBACK_CANDIDATE_TOOL: &str = "rollback_candidate";
 const MAX_GROUNDING_ROUNDS: usize = 2;
 const MAX_GROUNDING_TOOL_CALLS: usize = 6;
 const MAX_SUMMARY_CHARS: usize = 2400;
+const SENSITIVE_ENV_VARS: &[&str] = &[
+    "INCEPTION_API_KEY",
+    "MERCURY_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+];
+const SENSITIVE_MARKERS: &[&str] = &[
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+];
+const NONINTERACTIVE_VERIFIER_ENV: &[(&str, &str)] = &[
+    ("MERCURY_NONINTERACTIVE", "1"),
+    ("NO_COLOR", "1"),
+    ("CLICOLOR", "0"),
+    ("CLICOLOR_FORCE", "0"),
+    ("FORCE_COLOR", "0"),
+    ("CARGO_TERM_COLOR", "never"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("TERM", "dumb"),
+];
+const CI_VERIFIER_ENV: &[(&str, &str)] = &[("CI", "1")];
+
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+
+    for key in SENSITIVE_ENV_VARS {
+        if let Ok(value) = env::var(key) {
+            let trimmed = value.trim();
+            if trimmed.len() >= 4 && redacted.contains(trimmed) {
+                redacted = redacted.replace(trimmed, &format!("[REDACTED:{key}]"));
+            }
+        }
+    }
+
+    let mut sanitized_lines = Vec::new();
+    for line in redacted.lines() {
+        let mut sanitized = String::with_capacity(line.len());
+        let mut idx = 0usize;
+        while idx < line.len() {
+            let ch = line[idx..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                sanitized.push(ch);
+                idx += ch.len_utf8();
+                continue;
+            }
+
+            let start = idx;
+            while idx < line.len() {
+                let current = line[idx..].chars().next().unwrap();
+                if current.is_whitespace() {
+                    break;
+                }
+                idx += current.len_utf8();
+            }
+            let token = &line[start..idx];
+            sanitized.push_str(&redact_sensitive_token(token));
+        }
+
+        if !line.contains('=') {
+            if let Some(key) = sensitive_colon_prefix(&sanitized) {
+                sanitized_lines.push(format!("{key}: [REDACTED]"));
+                continue;
+            }
+        }
+        sanitized_lines.push(sanitized);
+    }
+
+    let mut joined = sanitized_lines.join("\n");
+    if text.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    let exact_marker = SENSITIVE_MARKERS
+        .iter()
+        .any(|marker| normalized == *marker || normalized == format!("{}_value", marker));
+    let suffixed_marker = [
+        "_token",
+        "_api_key",
+        "_apikey",
+        "_password",
+        "_secret",
+        "-token",
+        "-api-key",
+        "-apikey",
+        "-password",
+        "-secret",
+    ]
+    .iter()
+    .any(|suffix| normalized.ends_with(suffix));
+
+    SENSITIVE_ENV_VARS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+        || exact_marker
+        || suffixed_marker
+}
+
+fn redacted_secret_value() -> Value {
+    Value::String("[REDACTED]".to_string())
+}
+
+fn redact_sensitive_token(token: &str) -> String {
+    if let Some((key, _)) = token.split_once('=') {
+        if is_sensitive_key(key) {
+            return format!("{key}=[REDACTED]");
+        }
+    }
+    if let Some((key, _)) = token.split_once(':') {
+        if is_sensitive_key(key) {
+            return format!("{key}:[REDACTED]");
+        }
+    }
+    token.to_string()
+}
+
+fn sensitive_colon_prefix(line: &str) -> Option<&str> {
+    let (prefix, _) = line.split_once(':')?;
+    let key = prefix.trim();
+    if is_sensitive_key(key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn redact_sensitive_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_sensitive_text(&text)),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(redact_sensitive_value).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let value = if is_sensitive_key(&key) {
+                        redacted_secret_value()
+                    } else {
+                        redact_sensitive_value(value)
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn redact_parsed_failure_report(report: ParsedFailureReport) -> ParsedFailureReport {
+    let redacted = redact_sensitive_value(json!(report.clone()));
+    serde_json::from_value(redacted).unwrap_or(report)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        env::var(name),
+        Ok(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VerifierRuntimeMode {
+    ci: bool,
+    noninteractive: bool,
+}
+
+fn verifier_runtime_mode() -> VerifierRuntimeMode {
+    let ci = env_flag_enabled("CI") || env_flag_enabled("GITHUB_ACTIONS");
+    let noninteractive = ci || env_flag_enabled("MERCURY_NONINTERACTIVE");
+    VerifierRuntimeMode { ci, noninteractive }
+}
+
+#[derive(Debug, Clone)]
+struct VerifierInvocation {
+    command_kind: VerifierCommandKind,
+    env_clear: bool,
+    env_remove: Vec<String>,
+    env_set: Vec<(String, String)>,
+    program: String,
+    args: Vec<String>,
+}
+
+fn parse_allowlisted_verifier_invocation(parts: &[String]) -> Result<VerifierInvocation, String> {
+    if parts.is_empty() {
+        return Err("command is empty".to_string());
+    }
+
+    let command_kind = classify_verifier_command(parts);
+    if matches!(command_kind, VerifierCommandKind::Unknown) {
+        return Err(format!("command not allowlisted: {}", parts.join(" ")));
+    }
+
+    let mut idx = 0usize;
+    let mut env_clear = false;
+    let mut env_remove = Vec::new();
+    let mut env_set = Vec::new();
+
+    while idx < parts.len() && is_env_assignment(&parts[idx]) {
+        env_set.push(parse_env_assignment(&parts[idx])?);
+        idx += 1;
+    }
+
+    if parts.get(idx).map(String::as_str) == Some("env") {
+        idx += 1;
+        while idx < parts.len() {
+            let part = parts[idx].as_str();
+            if part == "--" {
+                idx += 1;
+                break;
+            }
+            if part == "-i" {
+                env_clear = true;
+                idx += 1;
+                continue;
+            }
+            if is_env_assignment(part) {
+                env_set.push(parse_env_assignment(part)?);
+                idx += 1;
+                continue;
+            }
+            if let Some(consumes_next) = env_option_arity(part) {
+                idx += 1;
+                if part.starts_with("--unset=") {
+                    if let Some((_, key)) = part.split_once('=') {
+                        env_remove.push(key.to_string());
+                    }
+                    continue;
+                }
+                if consumes_next && !part.contains('=') {
+                    let Some(value) = parts.get(idx) else {
+                        return Err(format!("env wrapper option requires a value: {part}"));
+                    };
+                    if part == "-u" || part == "--unset" {
+                        env_remove.push(value.clone());
+                    }
+                    idx += 1;
+                }
+                continue;
+            }
+            if part.starts_with('-') {
+                return Err(format!("unsupported env wrapper option: {part}"));
+            }
+            break;
+        }
+    }
+
+    while idx < parts.len() && is_env_assignment(&parts[idx]) {
+        env_set.push(parse_env_assignment(&parts[idx])?);
+        idx += 1;
+    }
+
+    let command_idx = command_start_index(parts);
+    if command_idx < idx {
+        return Err(format!("command not allowlisted: {}", parts.join(" ")));
+    }
+    let program = parts
+        .get(command_idx)
+        .ok_or_else(|| format!("command not allowlisted: {}", parts.join(" ")))?
+        .clone();
+
+    Ok(VerifierInvocation {
+        command_kind,
+        env_clear,
+        env_remove,
+        env_set,
+        program,
+        args: parts[command_idx + 1..].to_vec(),
+    })
+}
+
+fn injected_verifier_env(invocation: &VerifierInvocation) -> Vec<(String, String)> {
+    let runtime_mode = verifier_runtime_mode();
+    let explicit_keys = invocation
+        .env_set
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect::<BTreeSet<_>>();
+    let removed_keys = invocation
+        .env_remove
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut injected = Vec::new();
+
+    let mut maybe_push = |key: &str, value: &str| {
+        if !explicit_keys.contains(key) && !removed_keys.contains(key) {
+            injected.push((key.to_string(), value.to_string()));
+        }
+    };
+
+    if runtime_mode.ci {
+        for (key, value) in CI_VERIFIER_ENV {
+            maybe_push(key, value);
+        }
+    }
+    if runtime_mode.noninteractive {
+        for (key, value) in NONINTERACTIVE_VERIFIER_ENV {
+            maybe_push(key, value);
+        }
+    }
+
+    injected
+}
+
+fn verifier_isolation_mode(project_root: &Path, workspace_root: &Path) -> &'static str {
+    match (normalize_path(project_root), normalize_path(workspace_root)) {
+        (Ok(project), Ok(workspace)) if project == workspace => "project_root",
+        _ => "repo_copy",
+    }
+}
+
+fn verifier_policy_json(
+    invocation: Option<&VerifierInvocation>,
+    command_kind: &VerifierCommandKind,
+    project_root: &Path,
+    workspace_root: &Path,
+    injected_env: &[String],
+) -> Value {
+    let runtime_mode = verifier_runtime_mode();
+    let env_clear = invocation
+        .map(|invocation| invocation.env_clear)
+        .unwrap_or(false);
+    let env_removed = invocation
+        .map(|invocation| invocation.env_remove.clone())
+        .unwrap_or_default();
+    let env_overrides = invocation
+        .map(|invocation| {
+            invocation
+                .env_set
+                .iter()
+                .map(|(key, value)| {
+                    let redacted = if is_sensitive_key(key) {
+                        "[REDACTED]".to_string()
+                    } else {
+                        redact_sensitive_text(value)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let program = invocation
+        .map(|invocation| redact_sensitive_text(&invocation.program))
+        .unwrap_or_default();
+
+    json!({
+        "allowlist_enforced": true,
+        "secret_redaction_enabled": true,
+        "ci": runtime_mode.ci,
+        "noninteractive": runtime_mode.noninteractive,
+        "isolation_mode": verifier_isolation_mode(project_root, workspace_root),
+        "workspace_isolated": verifier_isolation_mode(project_root, workspace_root) == "repo_copy",
+        "command_kind": command_kind,
+        "program": program,
+        "env_clear": env_clear,
+        "env_removed": env_removed,
+        "env_overrides": env_overrides,
+        "injected_env": injected_env,
+    })
+}
+
+fn verifier_audit_json(
+    event: &str,
+    tool: &str,
+    command: &str,
+    command_kind: &VerifierCommandKind,
+    project_root: &Path,
+    workspace_root: &Path,
+    decision: &str,
+    exit_code: Option<i32>,
+    rejection_reason: Option<&str>,
+) -> Value {
+    let runtime_mode = verifier_runtime_mode();
+    json!({
+        "event": event,
+        "tool": tool,
+        "decision": decision,
+        "command": redact_sensitive_text(command),
+        "command_kind": command_kind,
+        "exit_code": exit_code,
+        "rejection_reason": rejection_reason,
+        "ci": runtime_mode.ci,
+        "noninteractive": runtime_mode.noninteractive,
+        "isolation_mode": verifier_isolation_mode(project_root, workspace_root),
+        "workspace_isolated": verifier_isolation_mode(project_root, workspace_root) == "repo_copy",
+    })
+}
+
+fn verifier_rejection_reason(error: &str) -> &'static str {
+    if error.contains("shell composition is not allowed") {
+        "shell_composition"
+    } else if error.contains("command not allowlisted") {
+        "command_not_allowlisted"
+    } else if error.contains("unsupported env wrapper option") {
+        "unsupported_env_option"
+    } else if error.contains("env wrapper option requires a value") {
+        "env_option_missing_value"
+    } else if error.contains("missing command") || error.contains("command is empty") {
+        "missing_command"
+    } else {
+        "execution_error"
+    }
+}
+
+fn build_tool_error_output(
+    tool: &str,
+    args: &Value,
+    error: &str,
+    project_root: &Path,
+    workspace_root: &Path,
+) -> Value {
+    let redacted_error = redact_sensitive_text(error);
+    if tool != RUN_TESTS_TOOL {
+        return json!({"error": redacted_error});
+    }
+
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let command_parts = if command.is_empty() {
+        Vec::new()
+    } else {
+        parse_command_parts(&command)
+    };
+    let command_kind = if command_parts.is_empty() {
+        VerifierCommandKind::Unknown
+    } else {
+        classify_verifier_command(&command_parts)
+    };
+    let invocation = if command_parts.is_empty() {
+        None
+    } else {
+        parse_allowlisted_verifier_invocation(&command_parts).ok()
+    };
+    let injected_env = invocation
+        .as_ref()
+        .map(injected_verifier_env)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+
+    json!({
+        "error": redacted_error,
+        "command": redact_sensitive_text(&command),
+        "command_parts": command_parts
+            .iter()
+            .map(|part| redact_sensitive_text(part))
+            .collect::<Vec<_>>(),
+        "kind": command_kind,
+        "policy": verifier_policy_json(
+            invocation.as_ref(),
+            &command_kind,
+            project_root,
+            workspace_root,
+            &injected_env,
+        ),
+        "audit": verifier_audit_json(
+            "verifier_command_rejected",
+            tool,
+            &command,
+            &command_kind,
+            project_root,
+            workspace_root,
+            "rejected",
+            None,
+            Some(verifier_rejection_reason(error)),
+        ),
+    })
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RepoToolResult {
@@ -147,7 +638,10 @@ pub async fn gather_grounded_repair_context<A: Mercury2Api>(
     description: &str,
     parsed_failure: Option<&ParsedFailureReport>,
 ) -> Result<GroundedRepairContext, VerificationError> {
-    let verifier_commands = verifier_commands(verify_config);
+    let verifier_commands = verifier_commands(verify_config)
+        .into_iter()
+        .map(|command| redact_sensitive_text(&command))
+        .collect::<Vec<_>>();
     let workspace_root = create_grounding_workspace(project_root)?;
     let _cleanup = CleanupPath(workspace_root.clone());
     copy_project_tree(project_root, &workspace_root, project_root)?;
@@ -155,7 +649,7 @@ pub async fn gather_grounded_repair_context<A: Mercury2Api>(
     let executor = RepoToolExecutor::new(project_root, &workspace_root);
     let system_prompt = grounding_system_prompt();
     let tools = mercury_repair_tools();
-    let parsed_failure_owned = parsed_failure.cloned();
+    let parsed_failure_owned = parsed_failure.cloned().map(redact_parsed_failure_report);
     let mut rounds = Vec::new();
     let mut total_usage = ApiUsage::default();
     let mut total_tool_calls = 0usize;
@@ -177,7 +671,7 @@ pub async fn gather_grounded_repair_context<A: Mercury2Api>(
 
         if tool_calls.is_empty() {
             rounds.push(GroundingRound {
-                assistant_text,
+                assistant_text: redact_sensitive_text(&assistant_text),
                 tool_calls: Vec::new(),
             });
             break;
@@ -197,18 +691,22 @@ pub async fn gather_grounded_repair_context<A: Mercury2Api>(
                     .function
                     .parse_arguments()
                     .unwrap_or_else(|_| json!({}));
-                let result = executor.execute_tool_call(&call);
+                let result = executor.execute_named(
+                    Some(call.id.clone()),
+                    &call.function.name,
+                    arguments.clone(),
+                );
                 GroundingToolCall {
                     id: call.id,
                     name,
-                    arguments,
+                    arguments: redact_sensitive_value(arguments),
                     result,
                 }
             })
             .collect::<Vec<_>>();
         total_tool_calls += executed_calls.len();
         rounds.push(GroundingRound {
-            assistant_text,
+            assistant_text: redact_sensitive_text(&assistant_text),
             tool_calls: executed_calls,
         });
 
@@ -257,7 +755,9 @@ impl RepoToolExecutor {
                     tool_call_id: Some(call.id.clone()),
                     name: call.function.name.clone(),
                     success: false,
-                    output: json!({"error": format!("invalid tool arguments: {err}")}),
+                    output: redact_sensitive_value(json!({
+                        "error": format!("invalid tool arguments: {err}")
+                    })),
                 }
             }
         };
@@ -286,13 +786,19 @@ impl RepoToolExecutor {
                 tool_call_id,
                 name: name.to_string(),
                 success: true,
-                output,
+                output: redact_sensitive_value(output),
             },
             Err(error) => RepoToolResult {
                 tool_call_id,
                 name: name.to_string(),
                 success: false,
-                output: json!({"error": error}),
+                output: redact_sensitive_value(build_tool_error_output(
+                    name,
+                    &args,
+                    &error,
+                    &self.project_root,
+                    &self.workspace_root,
+                )),
             },
         }
     }
@@ -352,7 +858,12 @@ impl RepoToolExecutor {
         }
 
         let parts = parse_allowlisted_verifier_parts(command)?;
-        let command_kind = classify_verifier_command(&parts);
+        let invocation = parse_allowlisted_verifier_invocation(&parts)?;
+        let command_kind = invocation.command_kind.clone();
+        let injected_env = injected_verifier_env(&invocation)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
 
         let mut process = build_allowlisted_verifier_command(&parts, &self.workspace_root)?;
         let output = process.output().map_err(|err| err.to_string())?;
@@ -368,15 +879,44 @@ impl RepoToolExecutor {
                 &stderr,
             ))
         };
+        let decision = if output.status.success() {
+            "passed"
+        } else {
+            "failed"
+        };
 
         Ok(json!({
-            "command": command,
+            "command": redact_sensitive_text(command),
+            "command_parts": parts
+                .iter()
+                .map(|part| redact_sensitive_text(part))
+                .collect::<Vec<_>>(),
             "kind": command_kind,
             "success": output.status.success(),
             "exit_code": output.status.code(),
-            "stdout": stdout,
-            "stderr": stderr,
-            "parsed_failure": parsed_failure,
+            "stdout": redact_sensitive_text(&stdout),
+            "stderr": redact_sensitive_text(&stderr),
+            "stdout_bytes": output.stdout.len(),
+            "stderr_bytes": output.stderr.len(),
+            "parsed_failure": redact_sensitive_value(json!(parsed_failure)),
+            "policy": verifier_policy_json(
+                Some(&invocation),
+                &invocation.command_kind,
+                &self.project_root,
+                &self.workspace_root,
+                &injected_env,
+            ),
+            "audit": verifier_audit_json(
+                "verifier_command_completed",
+                RUN_TESTS_TOOL,
+                command,
+                &invocation.command_kind,
+                &self.project_root,
+                &self.workspace_root,
+                decision,
+                output.status.code(),
+                None,
+            ),
         }))
     }
 
@@ -689,94 +1229,22 @@ pub fn build_allowlisted_verifier_command(
     parts: &[String],
     workspace_root: &Path,
 ) -> Result<Command, String> {
-    if parts.is_empty() {
-        return Err("command is empty".to_string());
-    }
-
-    let command_kind = classify_verifier_command(parts);
-    if matches!(command_kind, VerifierCommandKind::Unknown) {
-        return Err(format!("command not allowlisted: {}", parts.join(" ")));
-    }
-
-    let mut idx = 0usize;
-    let mut env_clear = false;
-    let mut env_remove = Vec::new();
-    let mut env_set = Vec::new();
-
-    while idx < parts.len() && is_env_assignment(&parts[idx]) {
-        env_set.push(parse_env_assignment(&parts[idx])?);
-        idx += 1;
-    }
-
-    if parts.get(idx).map(String::as_str) == Some("env") {
-        idx += 1;
-        while idx < parts.len() {
-            let part = parts[idx].as_str();
-            if part == "--" {
-                idx += 1;
-                break;
-            }
-            if part == "-i" {
-                env_clear = true;
-                idx += 1;
-                continue;
-            }
-            if is_env_assignment(part) {
-                env_set.push(parse_env_assignment(part)?);
-                idx += 1;
-                continue;
-            }
-            if let Some(consumes_next) = env_option_arity(part) {
-                idx += 1;
-                if part.starts_with("--unset=") {
-                    if let Some((_, key)) = part.split_once('=') {
-                        env_remove.push(key.to_string());
-                    }
-                    continue;
-                }
-                if consumes_next && !part.contains('=') {
-                    let Some(value) = parts.get(idx) else {
-                        return Err(format!("env wrapper option requires a value: {part}"));
-                    };
-                    if part == "-u" || part == "--unset" {
-                        env_remove.push(value.clone());
-                    }
-                    idx += 1;
-                }
-                continue;
-            }
-            if part.starts_with('-') {
-                return Err(format!("unsupported env wrapper option: {part}"));
-            }
-            break;
-        }
-    }
-
-    while idx < parts.len() && is_env_assignment(&parts[idx]) {
-        env_set.push(parse_env_assignment(&parts[idx])?);
-        idx += 1;
-    }
-
-    let command_idx = command_start_index(parts);
-    if command_idx < idx {
-        return Err(format!("command not allowlisted: {}", parts.join(" ")));
-    }
-    idx = command_idx;
-    let program = parts
-        .get(idx)
-        .ok_or_else(|| format!("command not allowlisted: {}", parts.join(" ")))?;
-    let mut command = Command::new(program);
+    let invocation = parse_allowlisted_verifier_invocation(parts)?;
+    let mut command = Command::new(&invocation.program);
     command.current_dir(workspace_root);
-    if env_clear {
+    if invocation.env_clear {
         command.env_clear();
     }
-    for key in env_remove {
+    for key in &invocation.env_remove {
         command.env_remove(key);
     }
-    for (key, value) in env_set {
+    for (key, value) in &invocation.env_set {
         command.env(key, value);
     }
-    command.args(&parts[idx + 1..]);
+    for (key, value) in injected_verifier_env(&invocation) {
+        command.env(key, value);
+    }
+    command.args(&invocation.args);
     Ok(command)
 }
 
@@ -908,7 +1376,7 @@ fn summarize_value(value: &Value, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
 
     use tempfile::tempdir;
 
@@ -918,6 +1386,8 @@ mod tests {
     struct FakeMercuryApi {
         responses: Arc<Mutex<Vec<(String, Vec<ToolCall>)>>>,
     }
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     impl FakeMercuryApi {
         fn new(responses: Vec<(String, Vec<ToolCall>)>) -> Self {
@@ -1089,6 +1559,77 @@ members = []
         );
         assert!(result.success);
         assert_eq!(result.output["success"], Value::Bool(true));
+    }
+
+    #[test]
+    fn repo_tool_executor_redacts_sensitive_test_output() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::create_dir_all(project_root.join("tests")).unwrap();
+        fs::write(
+            project_root.join("Cargo.toml"),
+            r#"[package]
+name = "tool-runner-redaction"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = []
+"#,
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("src/main.rs"),
+            "fn main() { println!(\"ok\"); }\n",
+        )
+        .unwrap();
+        fs::write(
+            project_root.join("tests/redaction.rs"),
+            r#"#[test]
+fn leaks_secret() {
+    let secret = std::env::var("INCEPTION_API_KEY").expect("secret set");
+    println!("stdout secret={secret}");
+    eprintln!("stderr secret={secret}");
+    panic!("panic secret={secret}");
+}
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        copy_project_tree(&project_root, &workspace_root, &project_root).unwrap();
+
+        let prior = env::var("INCEPTION_API_KEY").ok();
+        // SAFETY: the test holds ENV_LOCK for the full mutation window, serializing
+        // process-global environment changes while the child process is spawned.
+        unsafe { env::set_var("INCEPTION_API_KEY", "supersecret-observability-token") };
+
+        let executor = RepoToolExecutor::new(&project_root, &workspace_root);
+        let result = executor.execute_named(
+            None,
+            RUN_TESTS_TOOL,
+            json!({"command": "env INCEPTION_API_KEY=supersecret-observability-token cargo test --quiet"}),
+        );
+
+        match prior {
+            Some(value) => {
+                // SAFETY: guarded by ENV_LOCK above.
+                unsafe { env::set_var("INCEPTION_API_KEY", value) }
+            }
+            None => {
+                // SAFETY: guarded by ENV_LOCK above.
+                unsafe { env::remove_var("INCEPTION_API_KEY") }
+            }
+        }
+
+        assert!(result.success);
+        assert_eq!(result.output["success"], Value::Bool(false));
+        let output_json = serde_json::to_string(&result.output).unwrap();
+        assert!(!output_json.contains("supersecret-observability-token"));
+        assert!(output_json.contains("INCEPTION_API_KEY=[REDACTED]"));
+        assert!(output_json.contains("panic secret=[REDACTED]"));
     }
 
     #[test]

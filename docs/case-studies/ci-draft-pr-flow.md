@@ -10,7 +10,7 @@ Reproduce failure in CI conditions, run isolated Mercury repair, verify locally,
 
 ## Preconditions
 
-- branch with a reproducible failing verifier command
+- branch with a reproducible failing direct allowlisted verifier command (Rust or selected TypeScript forms)
 - repository or organization secret configured for repair jobs as `INCEPTION_API_KEY`, `MERCURY_API_KEY`, or `inception_api_key`
 - same-repository workflow context with `contents: write` and `pull-requests: write` so the workflow can push a repair branch and mutate a PR when eligible
 - if that write path is unavailable, plan to use `dry_run=true` and perform the PR handoff manually
@@ -60,8 +60,8 @@ Workflow behavior:
 - creates an isolated detached worktree on the runner
 - reproduces the baseline failure first
 - runs `target/release/mercury-cli fix ... --noninteractive` only when baseline is red and API key is present
-- repair targeting remains Rust-only (`cargo test`, `cargo check`, `cargo clippy` direct forms); unsupported command shapes may still produce artifacts but will not produce a verified repair
-- TypeScript support in v1.0 lane is still partial until full engine integration lands; do not treat this workflow as TypeScript-parity repair yet
+- repair targeting supports direct allowlisted Rust and selected direct TypeScript verifier commands; unsupported command shapes may still produce artifacts but will not produce a verified repair
+- local `watch --repair` remains Rust-only; this CI case study documents the `fix`/workflow path
 - uploads an evidence bundle and run summary for every terminal state
 - only attempts branch push and draft-PR mutation when repair is verified, the diff is non-empty, and `dry_run != true`
 - with `dry_run=true`, uploads evidence and run summary but skips branch push and PR mutation entirely
@@ -126,6 +126,7 @@ If eval corpus checks are part of the branch gate, include:
 
 ```bash
 python3 evals/v0/run.py --output-dir evals/v0/reports/ci
+python3 evals/v1_typescript/run.py --output-dir evals/v1_typescript/reports/ci
 ```
 
 ## Step 4: Promote a Verified Repair Into Draft PR

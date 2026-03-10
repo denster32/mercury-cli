@@ -71,6 +71,7 @@ What to expect:
 - Mercury runs the watched command immediately.
 - If the command is already green, the cycle is recorded as `passed_without_repair`.
 - If the command is red and supported, Mercury invokes the existing `fix` flow with a verifier config targeted to that exact Rust command.
+- Candidate verification runs in isolated repo-copy/worktree paths under `.mercury/worktrees/`; only accepted edits are copied back after verification.
 - If Mercury applies a fix, it reruns the watched command and records whether the result is now green.
 - The loop then waits for the next repository change and repeats until you stop it.
 
@@ -160,8 +161,8 @@ If the local run is good enough to share, either commit the accepted change and 
 
 - `watch --repair` is Rust-first and only auto-repairs direct verifier commands.
 - Shell pipelines, chained commands, and wrapper tools are deliberately outside the current auto-repair target surface.
-- `--max-agents` should not be described as proof of real concurrent swarm execution yet.
-- TypeScript runtime support is still partial and should not be treated as a parity path for this case study yet.
+- `--max-agents` materially changes real parallel candidate execution in the underlying `fix` runtime, but this case study does not claim benchmark-backed speedup numbers.
+- TypeScript support is implemented for selected direct verifier paths in `fix`/CI flows, but this local watch case study is intentionally Rust-only.
 
 ## Cleanup
 
