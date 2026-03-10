@@ -304,4 +304,4 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting guidance.
 
 ## License
 
-MIT
+Custom non-commercial license. Personal, educational, research, and other non-commercial use is permitted. Commercial or revenue-generating use requires a separate license with the author. See [LICENSE](LICENSE).

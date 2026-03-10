@@ -1,21 +1,38 @@
-MIT License
+Mercury CLI License
 
 Copyright (c) 2026 Dennis Palucki
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Permission is granted to any person to use, copy, modify, and distribute this software for personal, educational, research, and non-commercial purposes, free of charge, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Non-Commercial Use
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+You may freely use, modify, and share this software for any purpose that does not generate revenue. This includes personal projects, academic research, open-source contributions, and learning.
+
+2. Commercial Use Requires a License
+
+Any use of this software, its architecture, or derivative works that generates revenue, including but not limited to:
+
+- Selling products or services built with this software
+- Integrating this software into commercial products
+- Using this software to provide paid services
+- Incorporating the thermal field architecture, stigmergic coordination patterns, or other novel methods described in this project into revenue-generating products
+
+requires a separate commercial license agreement with the author.
+
+3. Revenue Sharing
+
+Commercial licensees shall negotiate a revenue sharing arrangement with the author prior to any commercial deployment.
+
+4. Attribution
+
+All copies or substantial portions of this software must include this license notice and the above copyright notice.
+
+5. No Warranty
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.
+
+For commercial licensing inquiries, contact:
+
+Dennis Palucki
+Email: denster32@gmail.com
+GitHub: https://github.com/denster32
