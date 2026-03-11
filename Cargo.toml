@@ -1,6 +1,6 @@
 [package]
 name = "mercury-cli"
-version = "1.0.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 description = "Mercury-native CI auto-repair CLI with local verification and evidence"
 license-file = "LICENSE"

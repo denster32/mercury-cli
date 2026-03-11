@@ -1,8 +1,8 @@
-# Mercury CLI Quality Contract (Current 1.0.0 Branch Contract, Rust + TypeScript Runtime)
+# Mercury CLI Quality Contract (Current 1.0.0-beta.1 Pre-Release Branch Contract, Rust-First Repair + Scoped TypeScript Support)
 
 This document describes what quality automation exists in the repository today.
 
-It is intentionally scope-limited to current workflows and test surfaces. It does not claim zero defects or complete coverage beyond the implemented 1.0.0 runtime scope.
+It is intentionally scope-limited to current workflows and test surfaces. It does not claim zero defects or complete coverage beyond the implemented `1.0.0-beta.1` pre-release runtime scope.
 
 ## Current CI Gates
 
@@ -59,7 +59,7 @@ This is the active contract. Do not infer unlisted module/property tests from th
 
 Current behavior should be documented and reviewed as:
 
-- end-to-end `fix` and CI repair scope for direct allowlisted Rust/TypeScript verifier command paths
+- end-to-end `fix` and CI repair scope is Rust-first for direct allowlisted verifier command paths, with scoped selected TypeScript verifier-command support
 - local `watch --repair` scope remains Rust-only
 - direct verifier command targeting for the repair loop (`cargo test`, `cargo check`, `cargo clippy`, including env-prefix forms)
 - verifier allowlisting for direct Rust cargo commands plus selected direct TypeScript verifier invocations, without shell composition by default
@@ -70,17 +70,19 @@ Current behavior should be documented and reviewed as:
 TypeScript lane status:
 
 - repo mapping/parser, failure parsing, and selected verifier support exist in the current branch
-- `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for second-language harness coverage
-- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths; watch-repair and broader command classes remain limited
+- `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for scoped-support harness coverage
+- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it is scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
 
 ## Eval Harness Coverage
 
 Current corpus contracts:
 
 - `evals/v0`: Rust v0.3 baseline harness (50 logical cases)
-- `evals/v1_typescript`: TypeScript v1.0 lane baseline harness (50 logical cases)
+- `evals/v1_typescript`: TypeScript scoped-support baseline harness (50 logical cases)
 
 Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality.
+
+Public repair benchmark reporting is not yet published. When published, checked-in reports will live under `docs/benchmarks/` and be emitted by a dedicated repair benchmark workflow.
 
 ## Release Artifact Reality
 
@@ -94,7 +96,7 @@ If broader binary coverage is required, treat it as roadmap work, not current qu
 Versioning/distribution caveat:
 
 - Tagged releases are the GA contract boundary for binaries and migration expectations.
-- Branch-head docs can describe in-progress lanes but should not be treated as stable binary-support commitments.
+- Plain `1.0.0` remains the stable release boundary; branch-head `1.0.0-beta.1` docs describe a pre-release contract and should not be treated as stable binary-support commitments.
 
 ## How to Use This Document
 

@@ -13,6 +13,7 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
     Arc,
 };
+use std::time::Instant;
 use std::{collections::HashMap, path::PathBuf};
 
 use chrono::Utc;
@@ -632,6 +633,8 @@ pub struct StepExecutionSummary {
     pub rejected: usize,
     pub verification_failures: usize,
     pub retry_attempts: usize,
+    pub time_to_first_candidate_ms: Option<u64>,
+    pub time_to_verified_repair_ms: Option<u64>,
     pub final_bundle_verified: bool,
     pub applied: bool,
     pub run_root: Option<PathBuf>,
@@ -648,6 +651,14 @@ impl StepExecutionSummary {
         self.rejected += other.rejected;
         self.verification_failures += other.verification_failures;
         self.retry_attempts += other.retry_attempts;
+        self.time_to_first_candidate_ms = merge_min_duration(
+            self.time_to_first_candidate_ms,
+            other.time_to_first_candidate_ms,
+        );
+        self.time_to_verified_repair_ms = merge_min_duration(
+            self.time_to_verified_repair_ms,
+            other.time_to_verified_repair_ms,
+        );
         self.final_bundle_verified |= other.final_bundle_verified;
         self.applied |= other.applied;
         if self.run_root.is_none() {
@@ -656,6 +667,15 @@ impl StepExecutionSummary {
         if self.final_verification.is_none() {
             self.final_verification = other.final_verification;
         }
+    }
+}
+
+fn merge_min_duration(current: Option<u64>, other: Option<u64>) -> Option<u64> {
+    match (current, other) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 
@@ -775,6 +795,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     project_root: &Path,
 ) -> Result<StepExecutionSummary, EngineError> {
     let run_root = create_run_root(project_root)?;
+    let started = Instant::now();
     let swarm_state = db.get_swarm_state()?;
     let swarm_id = swarm_state
         .as_ref()
@@ -867,6 +888,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
                             db,
                             project_root,
                             telemetry: &telemetry,
+                            started_at: started,
                         },
                     )
                     .await
@@ -911,6 +933,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     write_bundle_diff(&run_root, &original_workspace, &final_workspace)?;
 
     if final_verify.is_ok() {
+        summary.time_to_verified_repair_ms = Some(started.elapsed().as_millis() as u64);
         apply_changes_atomically(project_root, &accepted_snapshot)?;
         for accepted in accepted_candidates.values() {
             write_cool_lock(
@@ -1019,6 +1042,7 @@ struct DispatchContext<'a, E: MercuryEditApi, A: Mercury2Api> {
     db: &'a ThermalDb,
     project_root: &'a Path,
     telemetry: &'a ExecutionTelemetry,
+    started_at: Instant,
 }
 
 fn build_dispatch_batch(
@@ -1247,6 +1271,10 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             .cloned()
             .expect("verified candidate must carry content");
         summary.accepted += 1;
+        if summary.time_to_first_candidate_ms.is_none() {
+            summary.time_to_first_candidate_ms =
+                Some(context.started_at.elapsed().as_millis() as u64);
+        }
 
         let winner_metadata = serde_json::json!({
             "outcome":"accepted",

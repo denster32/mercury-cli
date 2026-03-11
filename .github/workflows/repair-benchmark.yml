@@ -1,0 +1,137 @@
+name: Mercury Repair Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      quality_agent_count:
+        description: Max agent count for the full quality run.
+        required: false
+        default: 4
+        type: number
+      quality_case_limit:
+        description: Optional case cap for the quality run. Leave empty for the full selected Rust suite.
+        required: false
+        type: string
+      representative_count:
+        description: Representative Rust subset size for the agent sweep.
+        required: false
+        default: 10
+        type: number
+      timeout_seconds:
+        description: Per-case timeout for `mercury fix`.
+        required: false
+        default: 300
+        type: number
+      max_cost:
+        description: Per-case Mercury spend cap in USD.
+        required: false
+        default: 0.5
+        type: number
+      artifact_retention_days:
+        description: Artifact retention window in days.
+        required: false
+        default: 14
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Publish Rust repair benchmark artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build Mercury CLI
+        run: cargo build --release --locked --bin mercury-cli
+
+      - name: Run quality benchmark
+        env:
+          INCEPTION_API_KEY: ${{ secrets.inception_api_key || secrets.INCEPTION_API_KEY || secrets.MERCURY_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --suite evals/v0/manifest.json
+            --binary target/release/mercury-cli
+            --mode quality
+            --agent-count "${{ inputs.quality_agent_count }}"
+            --timeout-seconds "${{ inputs.timeout_seconds }}"
+            --max-cost "${{ inputs.max_cost }}"
+            --output-dir evals/repair_benchmark/reports/quality
+            --run-id "quality-${{ github.run_id }}-${{ github.run_attempt }}"
+            --clean-output
+          )
+          if [[ -n "${{ inputs.quality_case_limit }}" ]]; then
+            args+=(--limit "${{ inputs.quality_case_limit }}")
+          fi
+          python3 evals/repair_benchmark/run.py "${args[@]}"
+
+      - name: Run agent-sweep benchmark
+        env:
+          INCEPTION_API_KEY: ${{ secrets.inception_api_key || secrets.INCEPTION_API_KEY || secrets.MERCURY_API_KEY }}
+        run: |
+          python3 evals/repair_benchmark/run.py \
+            --suite evals/v0/manifest.json \
+            --binary target/release/mercury-cli \
+            --mode agent-sweep \
+            --representative-count "${{ inputs.representative_count }}" \
+            --agent-count 1 \
+            --agent-count 2 \
+            --agent-count 4 \
+            --agent-count 8 \
+            --timeout-seconds "${{ inputs.timeout_seconds }}" \
+            --max-cost "${{ inputs.max_cost }}" \
+            --output-dir evals/repair_benchmark/reports/agent-sweep \
+            --run-id "agent-sweep-${{ github.run_id }}-${{ github.run_attempt }}" \
+            --clean-output
+
+      - name: Validate benchmark artifact contract
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          roots = [
+              Path("evals/repair_benchmark/reports/quality").glob("run-*/report.json"),
+              Path("evals/repair_benchmark/reports/agent-sweep").glob("run-*/report.json"),
+          ]
+          for matches in roots:
+              report_path = next(matches, None)
+              assert report_path is not None, "benchmark workflow should emit report.json"
+              report = json.loads(report_path.read_text())
+              assert report["schema_version"] == "mercury-repair-benchmark-v1"
+              assert "speedup_curve" in report
+              assert "cost_curve" in report
+              assert "metrics" in report
+          summary_path = Path("docs/benchmarks/rust-v0-repair-benchmark.md")
+          assert summary_path.exists(), "checked-in benchmark report scaffold should exist"
+          assert "mercury-repair-benchmark-v1" in summary_path.read_text()
+          PY
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-repair-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evals/repair_benchmark/reports
+            docs/benchmarks
+          if-no-files-found: error
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Publish benchmark summaries
+        run: |
+          find evals/repair_benchmark/reports -name summary.md -print -exec cat {} \; >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "Checked-in methodology: docs/benchmarks/rust-v0-repair-benchmark.md" >> "$GITHUB_STEP_SUMMARY"

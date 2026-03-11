@@ -1181,13 +1181,20 @@ async fn cmd_fix_with_verify_config(
             config.scheduler.backoff_base_ms,
         );
     let verifier = Verifier::new(
-        verify_config,
+        verify_config.clone(),
         if config.verification.mercury2_critique_on_failure {
             Some(verifier_client)
         } else {
             None
         },
     );
+    let benchmark_verifier = FixBenchmarkVerifier {
+        parse_before_write: verify_config.parse_before_write,
+        test_after_write: verify_config.test_after_write,
+        lint_after_write: verify_config.lint_after_write,
+        test_command: redact_secrets(&verify_config.test_command),
+        lint_command: redact_secrets(&verify_config.lint_command),
+    };
     let execution_summary: StepExecutionSummary =
         engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
             .await?;
@@ -1259,6 +1266,7 @@ async fn cmd_fix_with_verify_config(
     }
 
     let finished_at = Utc::now();
+    let duration_ms = started.elapsed().as_millis() as u64;
     write_json_artifact(&artifact_root.join("plan.json"), &plan)?;
     write_json_artifact(&artifact_root.join("assessments.json"), &assessments)?;
     write_json_artifact(
@@ -1287,6 +1295,10 @@ async fn cmd_fix_with_verify_config(
     let total_cost_usd =
         scheduler.current_cost() + grounded_context.total_usage.cost_usd + plan.estimated_cost;
     let budget_remaining_usd = (max_cost - total_cost_usd).max(0.0);
+    let sandbox_run_root = execution_summary
+        .run_root
+        .as_ref()
+        .map(|path| path.display().to_string());
     write_json_artifact(
         &artifact_root.join("metadata.json"),
         &FixRunMetadata {
@@ -1295,7 +1307,7 @@ async fn cmd_fix_with_verify_config(
             max_cost,
             started_at: started_at.to_rfc3339(),
             finished_at: finished_at.to_rfc3339(),
-            duration_ms: started.elapsed().as_millis() as u64,
+            duration_ms,
             planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
             grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
             grounding_rounds: grounded_context.rounds.len(),
@@ -1306,26 +1318,54 @@ async fn cmd_fix_with_verify_config(
             planner_estimated_cost_usd: plan.estimated_cost,
             final_bundle_verified: execution_summary.final_bundle_verified,
             applied: execution_summary.applied,
-            sandbox_run_root: execution_summary
-                .run_root
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            sandbox_run_root: sandbox_run_root.clone(),
             total_cost_usd,
             budget_remaining_usd,
             security: final_security.clone(),
         },
     )?;
+    let diff_patch_path = artifact_root.join("diff.patch");
     if let Some(run_root) = execution_summary.run_root.as_ref() {
-        copy_if_exists(
-            &run_root.join("accepted.patch"),
-            &artifact_root.join("diff.patch"),
-        )?;
+        copy_if_exists(&run_root.join("accepted.patch"), &diff_patch_path)?;
     }
+    let accepted_patch_bytes = patch_size_bytes(&diff_patch_path)?;
+    let accepted_patch = accepted_patch_bytes.is_some_and(|len| len > 0);
+    write_json_artifact(
+        &artifact_root.join("benchmark-run.json"),
+        &FixBenchmarkRun {
+            schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
+            description: description_redacted.clone(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms,
+            accepted_steps: execution_summary.accepted,
+            rejected_steps: execution_summary.rejected,
+            verification_failures: execution_summary.verification_failures,
+            retry_attempts: execution_summary.retry_attempts,
+            time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
+            time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
+            final_bundle_verified: execution_summary.final_bundle_verified,
+            applied: execution_summary.applied,
+            accepted_patch,
+            accepted_patch_bytes,
+            outcome: classify_fix_benchmark_outcome(
+                execution_summary.final_bundle_verified,
+                accepted_patch,
+            )
+            .to_string(),
+            false_green: false,
+            sandbox_run_root: sandbox_run_root.clone(),
+            total_cost_usd,
+            budget_remaining_usd,
+            verifier: benchmark_verifier,
+            security: final_security.clone(),
+        },
+    )?;
     write_audit_event(
         &artifact_root,
         "fix_run_completed",
         serde_json::json!({
-            "duration_ms": started.elapsed().as_millis() as u64,
+            "duration_ms": duration_ms,
             "total_cost_usd": total_cost_usd,
             "budget_remaining_usd": budget_remaining_usd,
             "artifact_root": artifact_root.display().to_string(),
@@ -1336,7 +1376,7 @@ async fn cmd_fix_with_verify_config(
         noninteractive,
         "fix_run_completed",
         serde_json::json!({
-            "duration_ms": started.elapsed().as_millis() as u64,
+            "duration_ms": duration_ms,
             "total_cost_usd": total_cost_usd,
             "budget_remaining_usd": budget_remaining_usd,
             "artifact_root": artifact_root.display().to_string(),
@@ -1592,6 +1632,10 @@ async fn execute_watch_cycle(
                     copy_if_exists(
                         &outcome.artifact_root.join("metadata.json"),
                         &artifact_root.join("repair").join("metadata.json"),
+                    )?;
+                    copy_if_exists(
+                        &outcome.artifact_root.join("benchmark-run.json"),
+                        &artifact_root.join("repair").join("benchmark-run.json"),
                     )?;
                     copy_if_exists(
                         &outcome.artifact_root.join("plan.json"),
@@ -1872,6 +1916,8 @@ fn security_runtime_context(
     }
 }
 
+const FIX_BENCHMARK_RUN_SCHEMA_NAME: &str = "mercury-repair-benchmark-case-v1";
+
 #[derive(Debug, Serialize)]
 struct FixRunMetadata {
     description: String,
@@ -1892,6 +1938,41 @@ struct FixRunMetadata {
     sandbox_run_root: Option<String>,
     total_cost_usd: f64,
     budget_remaining_usd: f64,
+    security: SecurityRuntimeContext,
+}
+
+#[derive(Debug, Serialize)]
+struct FixBenchmarkVerifier {
+    parse_before_write: bool,
+    test_after_write: bool,
+    lint_after_write: bool,
+    test_command: String,
+    lint_command: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FixBenchmarkRun {
+    schema_version: String,
+    description: String,
+    started_at: String,
+    finished_at: String,
+    duration_ms: u64,
+    accepted_steps: usize,
+    rejected_steps: usize,
+    verification_failures: usize,
+    retry_attempts: usize,
+    time_to_first_candidate_ms: Option<u64>,
+    time_to_verified_repair_ms: Option<u64>,
+    final_bundle_verified: bool,
+    applied: bool,
+    accepted_patch: bool,
+    accepted_patch_bytes: Option<u64>,
+    outcome: String,
+    false_green: bool,
+    sandbox_run_root: Option<String>,
+    total_cost_usd: f64,
+    budget_remaining_usd: f64,
+    verifier: FixBenchmarkVerifier,
     security: SecurityRuntimeContext,
 }
 
@@ -1999,6 +2080,26 @@ fn copy_if_exists(source: &Path, destination: &Path) -> Result<()> {
     }
     std::fs::copy(source, destination)?;
     Ok(())
+}
+
+fn patch_size_bytes(path: &Path) -> Result<Option<u64>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(path.metadata()?.len()))
+}
+
+fn classify_fix_benchmark_outcome(
+    final_bundle_verified: bool,
+    accepted_patch: bool,
+) -> &'static str {
+    if final_bundle_verified {
+        "verified_repair"
+    } else if accepted_patch {
+        "accepted_patch_unverified"
+    } else {
+        "no_patch"
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,10 +1,10 @@
-# Mercury CLI Architecture (1.0.0 Runtime Scope, Rust + TypeScript Runtime)
+# Mercury CLI Architecture (1.0.0-beta.1 Pre-Release Scope, Rust-First Repair + Scoped TypeScript Support)
 
-This document describes the current runtime and trust boundaries for Mercury CLI in the 1.0.0 branch scope, with implemented repair behavior across Rust and selected TypeScript verifier paths plus current observability and hardening surfaces.
+This document describes the current runtime and trust boundaries for Mercury CLI in the `1.0.0-beta.1` pre-release branch scope, with repair quality centered on Rust, scoped selected TypeScript verifier-path support, and current observability and hardening surfaces.
 
 Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
-- start from a failing direct allowlisted Rust/TypeScript verifier command
+- start from a failing direct allowlisted verifier command, with Rust as the primary repair-quality target and selected TypeScript commands supported in scoped `fix` and CI flows
 - attempt bounded repair with Mercury models
 - verify locally in isolation before acceptance
 - emit a reviewable evidence bundle
@@ -49,7 +49,7 @@ For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI 
 
 ## Safety Model
 
-The 1.0.0 safety boundary is workflow-first and evidence-first.
+The `1.0.0-beta.1` pre-release safety boundary is workflow-first and evidence-first.
 
 ### Candidate isolation
 
@@ -105,16 +105,16 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 - Verifier allowlist enforces direct Rust cargo verifier commands and selected direct TypeScript verifier invocations by default (including supported env-prefix forms).
 - Shell composition in verifier commands is blocked unless `MERCURY_ALLOW_UNSAFE_VERIFIER_COMMANDS=1` is set explicitly.
 - Noninteractive mode is available for CI-oriented output surfaces.
-- End-to-end `fix` and CI repair targeting support allowlisted Rust/TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
+- End-to-end `fix` and CI repair targeting support allowlisted Rust direct verifier commands plus scoped selected TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
 
-## Known 1.0.0 Limits
+## Known 1.0.0-beta.1 Limits
 
 - Local `watch --repair` remains Rust-only.
 - `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but the repo does not yet publish benchmark-backed speedup claims or broad overlapping-edit convergence claims from that setting.
-- TypeScript support is intentionally scoped: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited.
+- TypeScript support is intentionally scoped: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited; this is not parity with the Rust repair surface.
 - Live observability is summary-oriented today, not a full per-candidate trace or conflict-telemetry surface.
 - CI automation is draft-PR oriented, not autonomous merge.
-- Public benchmark reporting is still behind corpus/harness readiness.
+- Public benchmark reporting is still behind corpus/harness readiness. When published, checked-in reports will live under `docs/benchmarks/` and be emitted by a dedicated repair benchmark workflow.
 - TypeScript harness fixtures currently validate deterministic expected-red script outputs; this is useful for corpus/reporter contract checks but not a replacement for full benchmark-backed repair reporting.
 
 ## Relationship to Case Studies

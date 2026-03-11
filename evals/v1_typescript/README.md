@@ -1,6 +1,6 @@
-# Mercury CLI Eval Harness v1 TypeScript (v1.0 lane)
+# Mercury CLI Eval Harness v1 TypeScript (scoped support lane)
 
-This harness is the TypeScript second-language eval lane for the current 1.0.0 branch contract.
+This harness is the TypeScript scoped-support eval lane for the current `1.0.0-beta.1` pre-release branch contract. Mercury CLI's repair-quality story remains Rust-first; this lane hardens selected TypeScript support without claiming parity.
 
 Contents:
 - `manifest.json`: canonical 50-case TypeScript baseline corpus contract
@@ -37,9 +37,10 @@ Current scope:
 - baseline mode only
 - validates TypeScript fixture red-state contract and report reproducibility
 - emits schema/version metadata for downstream CI checks
-- intended as corpus/evidence infrastructure for TypeScript lane hardening
+- intended as corpus/evidence infrastructure for TypeScript scoped-support hardening
 
 Known limits:
 - this harness does not run the Mercury repair engine
 - fixtures currently execute deterministic failing scripts; they do not install or run full `tsc`/eslint/jest toolchains
-- passing harness runs do not prove end-to-end TypeScript repair success
+- passing harness runs do not prove end-to-end TypeScript repair success or parity with Rust repair quality
+- public repair benchmark reporting, when published under `docs/benchmarks/` by a dedicated repair benchmark workflow, is a separate deliverable

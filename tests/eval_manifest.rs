@@ -3,7 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{json, Value};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn manifest() -> Value {
     manifest_at("evals/v0/manifest.json")
@@ -297,6 +300,36 @@ fn eval_runner_lists_filtered_cases_as_json() {
 }
 
 #[test]
+fn repair_benchmark_runner_lists_filtered_cases_as_json() {
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--list-json")
+        .arg("--stage")
+        .arg("lint")
+        .arg("--limit")
+        .arg("2")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute repair benchmark runner");
+
+    assert!(
+        output.status.success(),
+        "repair benchmark list mode should succeed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let listed: Value = serde_json::from_str(&stdout).expect("list-json should emit json");
+    let listed = listed
+        .as_array()
+        .expect("list-json output should be an array");
+    assert!(
+        !listed.is_empty(),
+        "repair benchmark list-json should return at least one case"
+    );
+    assert!(listed.len() <= 2, "limit should cap returned cases");
+    assert!(listed.iter().all(|case| case["failure_stage"] == "lint"));
+}
+
+#[test]
 fn repair_workflow_contract_exposes_expected_inputs_and_artifacts() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workflow = fs::read_to_string(repo_root.join(".github/workflows/repair.yml"))
@@ -414,6 +447,94 @@ fn repair_workflow_contract_exposes_expected_inputs_and_artifacts() {
 }
 
 #[test]
+fn repair_benchmark_workflow_contract_exposes_expected_inputs_and_artifacts() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(repo_root.join(".github/workflows/repair-benchmark.yml"))
+        .expect("repair benchmark workflow should exist");
+
+    assert!(
+        workflow.contains("name: Mercury Repair Benchmark"),
+        "repair benchmark workflow should declare its name"
+    );
+
+    for (input, expected_required, expected_type, expected_default) in [
+        (
+            "quality_agent_count",
+            "required: false",
+            "type: number",
+            Some("default: 4"),
+        ),
+        (
+            "quality_case_limit",
+            "required: false",
+            "type: string",
+            None,
+        ),
+        (
+            "representative_count",
+            "required: false",
+            "type: number",
+            Some("default: 10"),
+        ),
+        (
+            "timeout_seconds",
+            "required: false",
+            "type: number",
+            Some("default: 300"),
+        ),
+        (
+            "max_cost",
+            "required: false",
+            "type: number",
+            Some("default: 0.5"),
+        ),
+        (
+            "artifact_retention_days",
+            "required: false",
+            "type: number",
+            Some("default: 14"),
+        ),
+    ] {
+        let dispatch_block = workflow_input_block(&workflow, "workflow_dispatch", input);
+        assert!(
+            dispatch_block.contains(expected_required),
+            "dispatch input `{input}` should include `{expected_required}`"
+        );
+        assert!(
+            dispatch_block.contains(expected_type),
+            "dispatch input `{input}` should include `{expected_type}`"
+        );
+        if let Some(default) = expected_default {
+            assert!(
+                dispatch_block.contains(default),
+                "dispatch input `{input}` should include `{default}`"
+            );
+        }
+    }
+
+    for expected in [
+        "evals/repair_benchmark/run.py",
+        "--mode quality",
+        "--mode agent-sweep",
+        "--agent-count 1",
+        "--agent-count 2",
+        "--agent-count 4",
+        "--agent-count 8",
+        "report.json",
+        "summary.md",
+        "docs/benchmarks",
+        "mercury-repair-benchmark-v1",
+        "Upload benchmark artifacts",
+        "Validate benchmark artifact contract",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "repair benchmark workflow should contain `{expected}`",
+        );
+    }
+}
+
+#[test]
 fn eval_runner_writes_expected_run_bundle_for_single_case() {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let output_dir = temp.path().join("reports");
@@ -469,6 +590,67 @@ fn eval_runner_writes_expected_run_bundle_for_single_case() {
     assert_eq!(
         report["selection"]["selected_case_ids"][0],
         "rust_type_mismatch"
+    );
+}
+
+#[test]
+fn release_truth_and_benchmark_docs_remain_consistent() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo_toml =
+        fs::read_to_string(repo_root.join("Cargo.toml")).expect("Cargo.toml should exist");
+    let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
+    let architecture = fs::read_to_string(repo_root.join("docs/ARCHITECTURE.md"))
+        .expect("architecture doc should exist");
+    let quality =
+        fs::read_to_string(repo_root.join("docs/QUALITY.md")).expect("quality doc should exist");
+    let benchmark_readme = fs::read_to_string(repo_root.join("docs/benchmarks/README.md"))
+        .expect("benchmark README should exist");
+    let benchmark_report =
+        fs::read_to_string(repo_root.join("docs/benchmarks/rust-v0-repair-benchmark.md"))
+            .expect("benchmark report scaffold should exist");
+    let typescript_readme = fs::read_to_string(repo_root.join("evals/v1_typescript/README.md"))
+        .expect("typescript README should exist");
+
+    assert!(
+        cargo_toml.contains("version = \"1.0.0-beta.1\""),
+        "Cargo.toml should keep branch-head on the beta version"
+    );
+
+    for (label, text) in [
+        ("README", readme.as_str()),
+        ("ARCHITECTURE", architecture.as_str()),
+        ("QUALITY", quality.as_str()),
+    ] {
+        assert!(
+            text.contains("1.0.0-beta.1"),
+            "{label} should describe the beta branch contract"
+        );
+        assert!(
+            text.contains("docs/benchmarks/"),
+            "{label} should point readers to checked-in benchmark reports"
+        );
+    }
+
+    for (label, text) in [
+        ("docs/benchmarks/README.md", benchmark_readme.as_str()),
+        (
+            "docs/benchmarks/rust-v0-repair-benchmark.md",
+            benchmark_report.as_str(),
+        ),
+    ] {
+        assert!(
+            text.contains("mercury-repair-benchmark-v1"),
+            "{label} should mention the aggregate benchmark schema"
+        );
+    }
+
+    assert!(
+        typescript_readme.contains("scoped support lane"),
+        "TypeScript README should remain scoped-support only"
+    );
+    assert!(
+        typescript_readme.contains("without claiming parity"),
+        "TypeScript README should not claim parity with Rust"
     );
 }
 
@@ -882,6 +1064,189 @@ fn command_available(command: &str) -> bool {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .is_ok()
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let suite_root = temp.path().join("suite");
+    let case_root = suite_root.join("cases/synthetic_false_green");
+    fs::create_dir_all(&case_root).expect("synthetic case directory should exist");
+
+    fs::write(case_root.join("state.txt"), "red\n").expect("state file should be written");
+    fs::write(
+        case_root.join("verifier.py"),
+        r#"from pathlib import Path
+import sys
+
+state = Path("state.txt").read_text(encoding="utf-8").strip()
+sys.exit(0 if state == "green" else 1)
+"#,
+    )
+    .expect("verifier should be written");
+
+    let manifest = json!({
+        "schema_version": "mercury-evals-v0",
+        "suite_id": "synthetic-repair-benchmark",
+        "language": "rust",
+        "version": 1,
+        "artifact_schema_version": "mercury-eval-report-v0",
+        "description": "Synthetic manifest for false-green downgrade coverage",
+        "default_timeout_seconds": 30,
+        "supported_modes": ["baseline"],
+        "cases": [{
+            "id": "synthetic_false_green",
+            "title": "Synthetic false green",
+            "failure_stage": "test",
+            "failure_class": "assertion",
+            "difficulty": "easy",
+            "path": "cases/synthetic_false_green",
+            "verifier_command": ["python3", "verifier.py"],
+            "expected_exit_codes": [1],
+            "expected_patterns": ["synthetic"],
+            "source_files": ["state.txt", "verifier.py"],
+            "tags": ["language:rust", "stage:test", "kind:seed"],
+            "timeout_seconds": 30,
+            "demo_track": "none",
+            "provenance": {
+                "origin": "synthetic",
+                "suite": "synthetic-repair-benchmark",
+                "variant": "seed",
+                "generator": "tests/eval_manifest.rs"
+            }
+        }]
+    });
+    fs::write(
+        suite_root.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+    )
+    .expect("synthetic manifest should be written");
+
+    let fake_binary = temp.path().join("fake-mercury");
+    fs::write(
+        &fake_binary,
+        r#"#!/usr/bin/env python3
+import json
+import shutil
+import sys
+from pathlib import Path
+
+cwd = Path.cwd()
+args = sys.argv[1:]
+
+if args and args[0] == "init":
+    sys.exit(0)
+
+if args and args[0] == "fix":
+    run_root = cwd / ".mercury" / "runs" / "run-test"
+    run_root.mkdir(parents=True, exist_ok=True)
+    sandbox_root = cwd.parent / "fake-sandbox"
+    candidate = sandbox_root / "final-bundle"
+    if sandbox_root.exists():
+        shutil.rmtree(sandbox_root)
+    shutil.copytree(cwd, candidate, ignore=shutil.ignore_patterns(".mercury"))
+    payload = {
+        "schema_version": "mercury-repair-benchmark-case-v1",
+        "description": "synthetic false green",
+        "started_at": "2026-03-11T00:00:00Z",
+        "finished_at": "2026-03-11T00:00:01Z",
+        "duration_ms": 1000,
+        "accepted_steps": 1,
+        "rejected_steps": 0,
+        "verification_failures": 0,
+        "retry_attempts": 0,
+        "time_to_first_candidate_ms": 10,
+        "time_to_verified_repair_ms": 20,
+        "final_bundle_verified": True,
+        "applied": True,
+        "accepted_patch": True,
+        "accepted_patch_bytes": 16,
+        "outcome": "verified_repair",
+        "false_green": False,
+        "sandbox_run_root": str(sandbox_root),
+        "total_cost_usd": 0.12,
+        "budget_remaining_usd": 0.38,
+        "verifier": {
+            "parse_before_write": True,
+            "test_after_write": True,
+            "lint_after_write": False,
+            "test_command": "python3 verifier.py",
+            "lint_command": ""
+        },
+        "security": {
+            "api_key_env_names": ["INCEPTION_API_KEY"],
+            "unsafe_verifier_override": False
+        }
+    }
+    (run_root / "benchmark-run.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    sys.exit(0)
+
+sys.exit(1)
+"#,
+    )
+    .expect("fake mercury binary should be written");
+
+    let mut permissions = fs::metadata(&fake_binary)
+        .expect("fake mercury binary should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_binary, permissions)
+        .expect("fake mercury binary should be executable");
+
+    let output_dir = temp.path().join("reports");
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(suite_root.join("manifest.json"))
+        .arg("--binary")
+        .arg(&fake_binary)
+        .arg("--case")
+        .arg("synthetic_false_green")
+        .arg("--run-id")
+        .arg("false-green")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--clean-output")
+        .env("INCEPTION_API_KEY", "test-key")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute repair benchmark runner");
+
+    assert!(
+        output.status.success(),
+        "synthetic false-green benchmark run should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let run_dir = output_dir.join("run-false-green");
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(
+            run_dir
+                .join("cases")
+                .join("synthetic_false_green")
+                .join("agents-4")
+                .join("result.json"),
+        )
+        .expect("result.json should exist"),
+    )
+    .expect("result.json should be valid json");
+    assert_eq!(result["schema_version"], "mercury-repair-benchmark-case-v1");
+    assert_eq!(result["false_green"], true);
+    assert_eq!(result["verified_repair"], false);
+    assert_eq!(result["outcome"], "false_green");
+    assert_eq!(result["final_bundle_verified"], true);
+    assert_eq!(result["accepted_patch"], true);
+    assert_eq!(result["independent_rerun_success"], false);
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
+    )
+    .expect("report.json should be valid json");
+    assert_eq!(report["schema_version"], "mercury-repair-benchmark-v1");
+    assert_eq!(report["metrics"]["false_greens"], 1);
+    assert_eq!(report["metrics"]["verified_repairs"], 0);
 }
 
 #[cfg(unix)]

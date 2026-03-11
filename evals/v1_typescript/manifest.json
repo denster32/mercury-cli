@@ -4,7 +4,7 @@
   "language": "typescript",
   "version": 1,
   "artifact_schema_version": "mercury-eval-report-v0",
-  "description": "TypeScript seeded baseline corpus for the 1.0.0 second-language support lane",
+  "description": "TypeScript seeded baseline corpus for the 1.0.0-beta.1 scoped-support lane in the Rust-first branch contract",
   "default_timeout_seconds": 60,
   "supported_modes": [
     "baseline"

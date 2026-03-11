@@ -336,6 +336,10 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
             "watch artifacts should mirror final-verification presence from fix artifacts"
         );
         assert!(artifact_root.join("repair").join("metadata.json").exists());
+        assert!(artifact_root
+            .join("repair")
+            .join("benchmark-run.json")
+            .exists());
         assert!(artifact_root.join("repair").join("plan.json").exists());
         assert_eq!(
             artifact_root
@@ -354,6 +358,7 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
         assert!(fix_artifact_root.join("assessments.json").exists());
         assert!(fix_artifact_root.join("execution-summary.json").exists());
         assert!(fix_artifact_root.join("metadata.json").exists());
+        assert!(fix_artifact_root.join("benchmark-run.json").exists());
 
         if repair["applied"] == Value::Bool(true) && confirmation_success {
             assert_eq!(
@@ -370,6 +375,37 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
         .expect("fix metadata should parse");
         assert!(fix_metadata["final_bundle_verified"].is_boolean());
         assert!(fix_metadata["applied"].is_boolean());
+
+        let fix_benchmark = read_json(fix_artifact_root.join("benchmark-run.json"));
+        let mirrored_benchmark = read_json(artifact_root.join("repair").join("benchmark-run.json"));
+        assert_eq!(
+            fix_benchmark["schema_version"],
+            Value::String("mercury-repair-benchmark-case-v1".to_string())
+        );
+        assert_eq!(mirrored_benchmark, fix_benchmark);
+        assert_eq!(
+            fix_benchmark["accepted_steps"], repair["accepted_steps"],
+            "benchmark accepted_steps should match the watch repair record"
+        );
+        assert_eq!(
+            fix_benchmark["final_bundle_verified"], repair["final_bundle_verified"],
+            "benchmark final_bundle_verified should match the watch repair record"
+        );
+        assert_eq!(
+            fix_benchmark["final_bundle_verified"], fix_metadata["final_bundle_verified"],
+            "benchmark final_bundle_verified should match fix metadata"
+        );
+        assert_eq!(
+            fix_benchmark["applied"], repair["applied"],
+            "benchmark applied should match the watch repair record"
+        );
+        assert!(fix_benchmark["accepted_patch"].is_boolean());
+        assert!(
+            fix_benchmark["verifier"]["test_command"]
+                .as_str()
+                .is_some_and(|command| command.contains("cargo test")),
+            "benchmark verifier test command should record the cargo test invocation"
+        );
     }
 
     let requests = stub.recorded_requests();
@@ -590,6 +626,7 @@ fn wait_for_mirrored_repair_artifacts(artifact_root: &Path, fix_artifact_root: &
         let mirrored_exists = mirrored_repair_root.exists();
         let mandatory_mirrored = mirrored_repair_root.join("execution-summary.json").exists()
             && mirrored_repair_root.join("metadata.json").exists()
+            && mirrored_repair_root.join("benchmark-run.json").exists()
             && mirrored_repair_root.join("plan.json").exists();
         let optional_mirrors_match = mirrored_repair_root
             .join("final-verification.json")
