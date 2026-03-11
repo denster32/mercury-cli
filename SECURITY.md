@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Mercury CLI is pre-1.0. Security fixes are handled on a best-effort basis for:
+Mercury CLI is currently on the `1.0.0-beta.1` prerelease track. Security fixes are handled on a best-effort basis for:
 
 - the latest commit on `main`
 - the most recent tagged release, once releases begin

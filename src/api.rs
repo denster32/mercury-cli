@@ -626,6 +626,12 @@ fn is_retryable(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+fn retry_delay_ms(config: TransportConfig, attempts: u32) -> u64 {
+    config
+        .backoff_base_ms
+        .saturating_mul(2u64.saturating_pow(attempts.saturating_sub(1)))
+}
+
 fn estimate_cost(usage: &UsageBlock) -> f64 {
     let uncached_input = (usage.prompt_tokens - usage.cached_input_tokens).max(0);
     let cached_cost = (usage.cached_input_tokens as f64 / 1000.0) * COST_PER_1K_CACHED_INPUT;
@@ -649,21 +655,37 @@ async fn post_json_with_retry_raw(
         attempts += 1;
         state.throttle(config.min_request_interval_ms).await;
 
-        let response = http
+        let response = match http
             .post(url)
             .bearer_auth(api_key)
             .json(payload)
             .send()
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if attempts <= config.retry_limit {
+                    let delay = retry_delay_ms(config, attempts);
+                    warn!(
+                        attempt = attempts,
+                        delay_ms = delay,
+                        endpoint = log_label,
+                        error = %error,
+                        "transport error, retrying request"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                return Err(ApiError::Http(error));
+            }
+        };
         let status = response.status().as_u16();
 
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
 
             if is_retryable(status) && attempts <= config.retry_limit {
-                let delay = config
-                    .backoff_base_ms
-                    .saturating_mul(2u64.saturating_pow(attempts - 1));
+                let delay = retry_delay_ms(config, attempts);
                 warn!(
                     status,
                     attempt = attempts,
@@ -682,7 +704,65 @@ async fn post_json_with_retry_raw(
             return Err(ApiError::ApiStatus { status, body });
         }
 
-        return Ok(response.bytes().await?.to_vec());
+        let raw = match response.bytes().await {
+            Ok(raw) => raw.to_vec(),
+            Err(error) => {
+                if attempts <= config.retry_limit {
+                    let delay = retry_delay_ms(config, attempts);
+                    warn!(
+                        attempt = attempts,
+                        delay_ms = delay,
+                        endpoint = log_label,
+                        error = %error,
+                        "failed to read response body, retrying request"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    continue;
+                }
+                return Err(ApiError::Http(error));
+            }
+        };
+
+        return Ok(raw);
+    }
+}
+
+async fn post_json_with_retry_parsed<T, P>(
+    http: &Client,
+    api_key: &str,
+    url: &str,
+    payload: &(impl Serialize + Sync),
+    config: TransportConfig,
+    state: &TransportState,
+    log_label: &str,
+    mut parse: P,
+) -> Result<T, ApiError>
+where
+    P: FnMut(&[u8]) -> Result<T, ApiError>,
+{
+    let mut attempts: u32 = 0;
+
+    loop {
+        attempts += 1;
+        let raw =
+            post_json_with_retry_raw(http, api_key, url, payload, config, state, log_label).await?;
+
+        match parse(&raw) {
+            Ok(parsed) => return Ok(parsed),
+            Err(ApiError::JsonParse(error)) if attempts <= config.retry_limit => {
+                let delay = retry_delay_ms(config, attempts);
+                warn!(
+                    attempt = attempts,
+                    delay_ms = delay,
+                    endpoint = log_label,
+                    response_bytes = raw.len(),
+                    error = %error,
+                    "JSON parse error, retrying request"
+                );
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -786,7 +866,7 @@ pub trait Mercury2Api: Send + Sync {
 
 /// Trait abstracting Mercury Edit operations so callers can inject fakes.
 pub trait MercuryEditApi: Send + Sync {
-    /// Apply an instruction-driven edit to a code region.
+    /// Apply a concrete replacement snippet or patch to a code region.
     fn apply(
         &self,
         payload: &EditPayload,
@@ -924,16 +1004,40 @@ impl Mercury2Client {
         schema_name: &str,
         schema: Value,
     ) -> Result<(T, ApiUsage), ApiError> {
-        let (raw, usage) = self
-            .do_chat(
-                system,
-                user,
-                max_tokens,
-                Some(strict_json_schema_response_format(schema_name, schema)),
-            )
-            .await?;
-        let parsed = serde_json::from_str(&raw)?;
-        Ok((parsed, usage))
+        let mut attempts: u32 = 0;
+
+        loop {
+            attempts += 1;
+            let (raw, usage) = self
+                .do_chat(
+                    system,
+                    user,
+                    max_tokens,
+                    Some(strict_json_schema_response_format(
+                        schema_name,
+                        schema.clone(),
+                    )),
+                )
+                .await?;
+
+            match serde_json::from_str(&raw) {
+                Ok(parsed) => return Ok((parsed, usage)),
+                Err(error) if attempts <= self.retry_limit => {
+                    let delay = retry_delay_ms(self.transport_config(), attempts);
+                    warn!(
+                        attempt = attempts,
+                        delay_ms = delay,
+                        endpoint = "chat/completions",
+                        schema = schema_name,
+                        response_chars = raw.chars().count(),
+                        error = %error,
+                        "structured content JSON parse error, retrying request"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                Err(error) => return Err(ApiError::JsonParse(error)),
+            }
+        }
     }
 
     /// Estimate USD cost from a [`UsageBlock`], accounting for cached input discount.
@@ -1000,7 +1104,7 @@ impl Mercury2Client {
     ) -> Result<(String, ApiUsage), ApiError> {
         let body = self.build_chat_request(system, user, max_tokens, response_format, None, None);
 
-        let raw = post_json_with_retry_raw(
+        let (content, api_usage) = post_json_with_retry_parsed(
             &self.http,
             &self.api_key,
             &self.base_url,
@@ -1008,10 +1112,9 @@ impl Mercury2Client {
             self.transport_config(),
             &self.transport_state,
             "chat/completions",
+            parse_chat_response,
         )
         .await?;
-
-        let (content, api_usage) = parse_chat_response(&raw)?;
         self.track_usage(&api_usage)?;
 
         debug!(
@@ -1037,7 +1140,7 @@ impl Mercury2Client {
         let body =
             self.build_chat_request(system, user, max_tokens, None, Some(tools), tool_choice);
 
-        let raw = post_json_with_retry_raw(
+        let (content, tool_calls, api_usage) = post_json_with_retry_parsed(
             &self.http,
             &self.api_key,
             &self.base_url,
@@ -1045,10 +1148,9 @@ impl Mercury2Client {
             self.transport_config(),
             &self.transport_state,
             "chat/completions",
+            parse_chat_response_with_tools,
         )
         .await?;
-
-        let (content, tool_calls, api_usage) = parse_chat_response_with_tools(&raw)?;
         self.track_usage(&api_usage)?;
 
         debug!(
@@ -1220,13 +1322,17 @@ impl MercuryEditClient {
     }
 
     /// Post a JSON body to the given path with shared retry and throttle logic.
-    async fn post_with_retry_raw(
+    async fn post_with_retry_parsed<T, P>(
         &self,
         path: &str,
         payload: &(impl Serialize + Sync),
-    ) -> Result<Vec<u8>, ApiError> {
+        parse: P,
+    ) -> Result<T, ApiError>
+    where
+        P: FnMut(&[u8]) -> Result<T, ApiError>,
+    {
         let url = format!("{}{}", self.base_url, path);
-        post_json_with_retry_raw(
+        post_json_with_retry_parsed(
             &self.http,
             &self.api_key,
             &url,
@@ -1234,6 +1340,7 @@ impl MercuryEditClient {
             self.transport_config(),
             &self.transport_state,
             path,
+            parse,
         )
         .await
     }
@@ -1275,10 +1382,9 @@ impl MercuryEditClient {
         payload: &NextEditPayload,
     ) -> Result<(String, ApiUsage), ApiError> {
         let request = Self::build_next_edit_request(current_file_path, payload);
-        let raw = self
-            .post_with_retry_raw("/edit/completions", &request)
+        let (text, usage) = self
+            .post_with_retry_parsed("/edit/completions", &request, parse_chat_response)
             .await?;
-        let (text, usage) = parse_chat_response(&raw)?;
         self.track_usage(&usage)?;
         debug!(
             tokens = usage.tokens_used,
@@ -1310,10 +1416,9 @@ impl MercuryEditApi for MercuryEditClient {
     /// `<|update_snippet|>` markup tags as required by the API.
     async fn apply(&self, payload: &EditPayload) -> Result<(String, ApiUsage), ApiError> {
         let request = Self::build_apply_request(payload);
-        let raw = self
-            .post_with_retry_raw("/apply/completions", &request)
+        let (text, usage) = self
+            .post_with_retry_parsed("/apply/completions", &request, parse_chat_response)
             .await?;
-        let (text, usage) = parse_chat_response(&raw)?;
         self.track_usage(&usage)?;
         debug!(
             tokens = usage.tokens_used,
@@ -1336,10 +1441,9 @@ impl MercuryEditApi for MercuryEditClient {
             max_tokens: payload.max_tokens,
             temperature: 0.0,
         };
-        let raw = self
-            .post_with_retry_raw("/fim/completions", &request)
+        let (text, usage) = self
+            .post_with_retry_parsed("/fim/completions", &request, parse_fim_response)
             .await?;
-        let (text, usage) = parse_fim_response(&raw)?;
         self.track_usage(&usage)?;
         debug!(
             tokens = usage.tokens_used,
@@ -1375,10 +1479,211 @@ impl MercuryEditApi for MercuryEditClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct StubResponse {
+        status_line: &'static str,
+        body: Vec<u8>,
+    }
+
+    struct ApiStubServer {
+        addr: SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        request_count: Arc<AtomicUsize>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl ApiStubServer {
+        fn start(responses: Vec<StubResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("stub listener should bind");
+            listener
+                .set_nonblocking(true)
+                .expect("stub listener should be configurable");
+            let addr = listener
+                .local_addr()
+                .expect("stub listener should have a local address");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let queued_responses = Arc::new(StdMutex::new(VecDeque::from(responses)));
+
+            let worker_shutdown = Arc::clone(&shutdown);
+            let worker_request_count = Arc::clone(&request_count);
+            let worker_responses = Arc::clone(&queued_responses);
+            let worker = thread::spawn(move || loop {
+                if worker_shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+                        let _ = read_http_request(&mut stream);
+                        worker_request_count.fetch_add(1, Ordering::AcqRel);
+
+                        let response = worker_responses
+                            .lock()
+                            .expect("stub response queue poisoned")
+                            .pop_front()
+                            .unwrap_or_else(|| StubResponse {
+                                status_line: "500 Internal Server Error",
+                                body: br#"{"error":"no stub response queued"}"#.to_vec(),
+                            });
+
+                        write_http_response(&mut stream, response)
+                            .expect("stub response should be writable");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            });
+
+            Self {
+                addr,
+                shutdown,
+                request_count,
+                worker: Some(worker),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn request_count(&self) -> usize {
+            self.request_count.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for ApiStubServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Release);
+            let _ = TcpStream::connect(self.addr);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn write_http_response(stream: &mut TcpStream, response: StubResponse) -> std::io::Result<()> {
+        let headers = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status_line,
+            response.body.len()
+        );
+        stream.write_all(headers.as_bytes())?;
+        stream.write_all(&response.body)?;
+        stream.flush()
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, String)>> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            match stream.read(&mut chunk) {
+                Ok(0) if buffer.is_empty() => return Ok(None),
+                Ok(0) => break None,
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = find_bytes(&buffer, b"\r\n\r\n") {
+                        break Some(index + 4);
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        let Some(header_end) = header_end else {
+            return Ok(None);
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let path = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        while buffer.len() < header_end + content_length {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let body = if buffer.len() >= header_end {
+            let available = buffer.len().saturating_sub(header_end);
+            let body_len = content_length.min(available);
+            String::from_utf8_lossy(&buffer[header_end..header_end + body_len]).to_string()
+        } else {
+            String::new()
+        };
+
+        Ok(Some((path, body)))
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
+    fn chat_completion_response(content: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": content
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "cached_input_tokens": 0
+            }
+        }))
+        .expect("chat completion response should serialize")
+    }
 
     fn with_api_envs<T>(
         inception: Option<&str>,
@@ -1909,5 +2214,70 @@ mod tests {
             schema["properties"]["assessments"]["items"]["properties"]["reasoning"]["minLength"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn chat_retries_after_malformed_outer_json_response() {
+        let server = ApiStubServer::start(vec![
+            StubResponse {
+                status_line: "200 OK",
+                body: br#"{"choices":"#.to_vec(),
+            },
+            StubResponse {
+                status_line: "200 OK",
+                body: chat_completion_response("ok"),
+            },
+        ]);
+
+        let client = Mercury2Client::new("test-key".into())
+            .with_base_url(server.url())
+            .with_retries(2, 1);
+
+        let (content, usage) = client
+            .chat("system", "user", 64)
+            .await
+            .expect("client should retry malformed outer JSON");
+
+        assert_eq!(content, "ok");
+        assert_eq!(usage.tokens_used, 2);
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_json_schema_retries_after_malformed_structured_content() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" }
+            },
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+        let server = ApiStubServer::start(vec![
+            StubResponse {
+                status_line: "200 OK",
+                body: chat_completion_response("{\"ok\":"),
+            },
+            StubResponse {
+                status_line: "200 OK",
+                body: chat_completion_response(
+                    &serde_json::to_string(&json!({ "ok": true }))
+                        .expect("structured response should serialize"),
+                ),
+            },
+        ]);
+
+        let client = Mercury2Client::new("test-key".into())
+            .with_base_url(server.url())
+            .with_retries(2, 1);
+
+        let (value, usage): (Value, ApiUsage) = client
+            .chat_with_json_schema("system", "user", 64, "test_schema", schema)
+            .await
+            .expect("client should retry malformed structured content");
+
+        assert_eq!(value["ok"], true);
+        assert_eq!(usage.tokens_used, 2);
+        assert_eq!(server.request_count(), 2);
     }
 }

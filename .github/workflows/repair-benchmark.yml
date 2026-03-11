@@ -97,6 +97,13 @@ jobs:
             --run-id "agent-sweep-${{ github.run_id }}-${{ github.run_attempt }}" \
             --clean-output
 
+      - name: Render public benchmark surface
+        run: |
+          python3 evals/repair_benchmark/publish.py \
+            --quality-report "evals/repair_benchmark/reports/quality/run-quality-${{ github.run_id }}-${{ github.run_attempt }}/report.json" \
+            --agent-sweep-report "evals/repair_benchmark/reports/agent-sweep/run-agent-sweep-${{ github.run_id }}-${{ github.run_attempt }}/report.json" \
+            --output-dir docs/benchmarks
+
       - name: Validate benchmark artifact contract
         run: |
           python3 - <<'PY'
@@ -116,8 +123,14 @@ jobs:
               assert "cost_curve" in report
               assert "metrics" in report
           summary_path = Path("docs/benchmarks/rust-v0-repair-benchmark.md")
-          assert summary_path.exists(), "checked-in benchmark report scaffold should exist"
-          assert "mercury-repair-benchmark-v1" in summary_path.read_text()
+          quality_path = Path("docs/benchmarks/rust-v0-quality.report.json")
+          agent_sweep_path = Path("docs/benchmarks/rust-v0-agent-sweep.report.json")
+          assert summary_path.exists(), "public benchmark markdown should exist"
+          assert quality_path.exists(), "public quality report should exist"
+          assert agent_sweep_path.exists(), "public agent-sweep report should exist"
+          summary_text = summary_path.read_text()
+          assert "mercury-repair-benchmark-v1" in summary_text
+          assert "Status: published from benchmark runner artifacts." in summary_text
           PY
 
       - name: Upload benchmark artifacts
@@ -134,4 +147,4 @@ jobs:
         run: |
           find evals/repair_benchmark/reports -name summary.md -print -exec cat {} \; >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
-          echo "Checked-in methodology: docs/benchmarks/rust-v0-repair-benchmark.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "Public benchmark report: docs/benchmarks/rust-v0-repair-benchmark.md" >> "$GITHUB_STEP_SUMMARY"

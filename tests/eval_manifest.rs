@@ -1,12 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+const PENDING_BENCHMARK_STATUS: &str = "Status: pending first checked-in secret-backed run.";
+const PUBLISHED_BENCHMARK_STATUS: &str = "Status: published from benchmark runner artifacts.";
 
 fn manifest() -> Value {
     manifest_at("evals/v0/manifest.json")
@@ -20,6 +23,48 @@ fn manifest_at(path: &str) -> Value {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let raw = fs::read_to_string(repo_root.join(path)).expect("eval manifest should exist");
     serde_json::from_str(&raw).expect("eval manifest should be valid json")
+}
+
+fn assert_public_benchmark_report_is_scrubbed(report: &Value) {
+    assert!(
+        report.get("run_root").is_none(),
+        "public benchmark report should not expose run_root"
+    );
+    assert!(
+        report.get("binary_path").is_none(),
+        "public benchmark report should not expose binary_path"
+    );
+    assert!(
+        report.get("api_key_env").is_none(),
+        "public benchmark report should not expose api_key_env"
+    );
+    assert!(
+        report["repair_outcome_distribution"]
+            .as_object()
+            .is_some_and(|value| !value.is_empty()),
+        "public benchmark report should keep a non-empty repair outcome distribution"
+    );
+
+    if let Some(manifest_path) = report["selection"]["manifest_path"].as_str() {
+        assert!(
+            !Path::new(manifest_path).is_absolute(),
+            "public benchmark report should not expose an absolute manifest path"
+        );
+    }
+
+    for result in report["results"]
+        .as_array()
+        .expect("public benchmark report should keep results as an array")
+    {
+        assert!(
+            result.get("benchmark_run_path").is_none(),
+            "public benchmark result should not expose benchmark_run_path"
+        );
+        assert!(
+            result.get("candidate_workspace").is_none(),
+            "public benchmark result should not expose candidate_workspace"
+        );
+    }
 }
 
 fn expected_variant_or_seed(id: &str) -> String {
@@ -426,6 +471,9 @@ fn repair_workflow_contract_exposes_expected_inputs_and_artifacts() {
         "applied,",
         "post_verify.returncode == 0,",
         "bool(diff_text.strip()),",
+        "import hashlib",
+        "def stable_pr_branch(base_ref: str, failure_command: str) -> str:",
+        "pr_branch = stable_pr_branch(base_ref=base_ref, failure_command=failure_command)",
         "repo_root / \"target\" / \"release\" / \"mercury-cli\"",
         "inputs.dry_run != true",
         "Upload evidence bundle",
@@ -514,6 +562,7 @@ fn repair_benchmark_workflow_contract_exposes_expected_inputs_and_artifacts() {
 
     for expected in [
         "evals/repair_benchmark/run.py",
+        "evals/repair_benchmark/publish.py",
         "--mode quality",
         "--mode agent-sweep",
         "--agent-count 1",
@@ -523,7 +572,10 @@ fn repair_benchmark_workflow_contract_exposes_expected_inputs_and_artifacts() {
         "report.json",
         "summary.md",
         "docs/benchmarks",
+        "rust-v0-quality.report.json",
+        "rust-v0-agent-sweep.report.json",
         "mercury-repair-benchmark-v1",
+        "Render public benchmark surface",
         "Upload benchmark artifacts",
         "Validate benchmark artifact contract",
     ] {
@@ -596,8 +648,12 @@ fn eval_runner_writes_expected_run_bundle_for_single_case() {
 #[test]
 fn release_truth_and_benchmark_docs_remain_consistent() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let quality_report_path = repo_root.join("docs/benchmarks/rust-v0-quality.report.json");
+    let agent_sweep_report_path = repo_root.join("docs/benchmarks/rust-v0-agent-sweep.report.json");
     let cargo_toml =
         fs::read_to_string(repo_root.join("Cargo.toml")).expect("Cargo.toml should exist");
+    let changelog =
+        fs::read_to_string(repo_root.join("CHANGELOG.md")).expect("CHANGELOG should exist");
     let readme = fs::read_to_string(repo_root.join("README.md")).expect("README should exist");
     let architecture = fs::read_to_string(repo_root.join("docs/ARCHITECTURE.md"))
         .expect("architecture doc should exist");
@@ -608,12 +664,29 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
     let benchmark_report =
         fs::read_to_string(repo_root.join("docs/benchmarks/rust-v0-repair-benchmark.md"))
             .expect("benchmark report scaffold should exist");
+    let benchmark_publisher =
+        fs::read_to_string(repo_root.join("evals/repair_benchmark/README.md"))
+            .expect("benchmark harness README should exist");
     let typescript_readme = fs::read_to_string(repo_root.join("evals/v1_typescript/README.md"))
         .expect("typescript README should exist");
+    let benchmark_is_pending = benchmark_report.contains(PENDING_BENCHMARK_STATUS);
+    let benchmark_is_published = benchmark_report.contains(PUBLISHED_BENCHMARK_STATUS);
 
     assert!(
         cargo_toml.contains("version = \"1.0.0-beta.1\""),
         "Cargo.toml should keep branch-head on the beta version"
+    );
+    assert!(
+        changelog.contains("## [Unreleased]"),
+        "CHANGELOG should keep unreleased work under the unreleased heading"
+    );
+    assert!(
+        !changelog.contains("## [1.0.0]"),
+        "CHANGELOG should not advertise a stable 1.0.0 release before the tag exists"
+    );
+    assert!(
+        benchmark_is_pending ^ benchmark_is_published,
+        "checked-in benchmark report should declare exactly one publication status"
     );
 
     for (label, text) in [
@@ -644,6 +717,104 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
         );
     }
 
+    for (label, text) in [
+        ("README", readme.as_str()),
+        ("QUALITY", quality.as_str()),
+        ("docs/benchmarks/README.md", benchmark_readme.as_str()),
+        (
+            "evals/repair_benchmark/README.md",
+            benchmark_publisher.as_str(),
+        ),
+    ] {
+        assert!(
+            text.contains("evals/repair_benchmark/publish.py"),
+            "{label} should point to the benchmark publisher"
+        );
+    }
+
+    if benchmark_is_published {
+        for (label, path, expected_mode) in [
+            (
+                "docs/benchmarks/rust-v0-quality.report.json",
+                quality_report_path.as_path(),
+                "quality",
+            ),
+            (
+                "docs/benchmarks/rust-v0-agent-sweep.report.json",
+                agent_sweep_report_path.as_path(),
+                "agent-sweep",
+            ),
+        ] {
+            assert!(
+                path.exists(),
+                "{label} should exist when the benchmark is published"
+            );
+            let payload: Value = serde_json::from_str(
+                &fs::read_to_string(path).expect("published benchmark json should be readable"),
+            )
+            .expect("published benchmark json should parse");
+            assert_eq!(
+                payload["schema_version"], "mercury-repair-benchmark-v1",
+                "{label} should declare the benchmark schema"
+            );
+            assert_eq!(
+                payload["mode"], expected_mode,
+                "{label} should keep the published mode aligned"
+            );
+            assert_public_benchmark_report_is_scrubbed(&payload);
+            assert!(
+                payload["repair_outcome_distribution"].is_object(),
+                "{label} should expose repair_outcome_distribution as an object"
+            );
+        }
+
+        for (label, text) in [
+            ("docs/benchmarks/README.md", benchmark_readme.as_str()),
+            ("README", readme.as_str()),
+            ("QUALITY", quality.as_str()),
+        ] {
+            assert!(
+                !text.contains("secret-backed Rust"),
+                "{label} should stop describing the benchmark as unpublished once reports are checked in"
+            );
+            assert!(
+                text.contains("rust-v0-quality.report.json"),
+                "{label} should point to the checked-in quality aggregate"
+            );
+            assert!(
+                text.contains("rust-v0-agent-sweep.report.json"),
+                "{label} should point to the checked-in agent-sweep aggregate"
+            );
+        }
+        assert!(
+            benchmark_readme.contains("repair outcome distribution"),
+            "docs/benchmarks/README.md should describe the published repair outcome distribution"
+        );
+        assert!(
+            benchmark_report.contains("## Repair Outcome Distribution"),
+            "published benchmark markdown should include the repair outcome distribution section"
+        );
+    } else {
+        for (label, text) in [
+            ("docs/benchmarks/README.md", benchmark_readme.as_str()),
+            ("README", readme.as_str()),
+            ("QUALITY", quality.as_str()),
+        ] {
+            assert!(
+                text.contains("secret-backed Rust"),
+                "{label} should keep the checked-in benchmark truth aligned"
+            );
+        }
+        assert!(
+            !quality_report_path.exists(),
+            "pending benchmark docs should not check in a stale quality report"
+        );
+        assert!(
+            !agent_sweep_report_path.exists(),
+            "pending benchmark docs should not check in a stale agent-sweep report"
+        );
+    }
+
     assert!(
         typescript_readme.contains("scoped support lane"),
         "TypeScript README should remain scoped-support only"
@@ -652,6 +823,399 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
         typescript_readme.contains("without claiming parity"),
         "TypeScript README should not claim parity with Rust"
     );
+}
+
+#[test]
+fn release_workflow_requires_manual_version_to_match_manifest_version() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow = fs::read_to_string(repo_root.join(".github/workflows/release.yml"))
+        .expect("release workflow should exist");
+
+    let dispatch_block = workflow_input_block(&workflow, "workflow_dispatch", "version");
+    assert!(
+        dispatch_block.contains("must match Cargo.toml exactly"),
+        "manual release input should document the manifest-version requirement"
+    );
+
+    for expected in [
+        "MANIFEST_VERSION",
+        "Cargo.toml",
+        "version input is required for manual releases",
+        "does not match Cargo.toml package version",
+        "if [[ \"$VERSION\" == *-* ]]; then",
+        "echo \"version=$VERSION\" >> \"$GITHUB_OUTPUT\"",
+        "echo \"prerelease=$PRERELEASE\" >> \"$GITHUB_OUTPUT\"",
+        "prerelease: ${{ steps.version.outputs.prerelease == 'true' }}",
+    ] {
+        assert!(
+            workflow.contains(expected),
+            "release workflow should contain `{expected}`"
+        );
+    }
+}
+
+#[test]
+fn repair_benchmark_checked_in_report_matches_generator_output() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checked_in =
+        fs::read_to_string(repo_root.join("docs/benchmarks/rust-v0-repair-benchmark.md"))
+            .expect("checked-in benchmark report should exist");
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let output_dir = temp.path().join("published");
+
+    let mut command = Command::new("python3");
+    command.arg("evals/repair_benchmark/publish.py");
+    if checked_in.contains(PUBLISHED_BENCHMARK_STATUS) {
+        command
+            .arg("--quality-report")
+            .arg(repo_root.join("docs/benchmarks/rust-v0-quality.report.json"))
+            .arg("--agent-sweep-report")
+            .arg(repo_root.join("docs/benchmarks/rust-v0-agent-sweep.report.json"));
+    } else {
+        command.arg("--pending");
+    }
+    let output = command
+        .arg("--output-dir")
+        .arg(output_dir.as_os_str())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute benchmark publisher");
+    assert!(
+        output.status.success(),
+        "checked-in benchmark publisher invocation should succeed"
+    );
+
+    let generated = fs::read_to_string(output_dir.join("rust-v0-repair-benchmark.md"))
+        .expect("generated benchmark report should exist");
+
+    assert_eq!(
+        generated, checked_in,
+        "checked-in benchmark report should stay in sync with the publisher"
+    );
+
+    if checked_in.contains(PUBLISHED_BENCHMARK_STATUS) {
+        for file_name in [
+            "rust-v0-quality.report.json",
+            "rust-v0-agent-sweep.report.json",
+        ] {
+            let generated = fs::read_to_string(output_dir.join(file_name))
+                .expect("generated published benchmark json should exist");
+            let checked_in = fs::read_to_string(repo_root.join("docs/benchmarks").join(file_name))
+                .expect("checked-in published benchmark json should exist");
+            assert_eq!(
+                generated, checked_in,
+                "checked-in {file_name} should stay in sync with the publisher inputs"
+            );
+        }
+    } else {
+        assert!(
+            !output_dir.join("rust-v0-quality.report.json").exists(),
+            "pending benchmark publish should not emit a quality report"
+        );
+        assert!(
+            !output_dir.join("rust-v0-agent-sweep.report.json").exists(),
+            "pending benchmark publish should not emit an agent-sweep report"
+        );
+    }
+}
+
+#[test]
+fn repair_benchmark_pending_publish_clears_stale_public_reports() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let output_dir = temp.path().join("published");
+    fs::create_dir_all(&output_dir).expect("output directory should be creatable");
+    fs::write(
+        output_dir.join("rust-v0-quality.report.json"),
+        "{\"stale\":true}\n",
+    )
+    .expect("stale quality report should be writable");
+    fs::write(
+        output_dir.join("rust-v0-agent-sweep.report.json"),
+        "{\"stale\":true}\n",
+    )
+    .expect("stale agent-sweep report should be writable");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/publish.py")
+        .arg("--pending")
+        .arg("--output-dir")
+        .arg(output_dir.as_os_str())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute benchmark publisher");
+    assert!(
+        output.status.success(),
+        "pending benchmark publisher should succeed"
+    );
+
+    assert!(
+        !output_dir.join("rust-v0-quality.report.json").exists(),
+        "pending benchmark publish should remove stale quality report output"
+    );
+    assert!(
+        !output_dir.join("rust-v0-agent-sweep.report.json").exists(),
+        "pending benchmark publish should remove stale agent-sweep report output"
+    );
+    assert!(
+        output_dir.join("rust-v0-repair-benchmark.md").exists(),
+        "pending benchmark publish should still render the pending markdown"
+    );
+}
+
+#[test]
+fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = temp.path().join("published");
+    let quality_path = temp.path().join("quality.report.json");
+    let agent_sweep_path = temp.path().join("agent-sweep.report.json");
+
+    let quality_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Public Mercury repair benchmark aggregate report",
+        "suite_id": "rust-v0.3-seeded",
+        "language": "rust",
+        "mode": "quality",
+        "generated_at": "2026-03-11T00:00:00Z",
+        "run_id": "quality-demo",
+        "run_root": "/tmp/quality",
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [4],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "INCEPTION_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "selected_count": 10,
+            "selected_case_ids": ["rust_type_mismatch"],
+            "selected_unique_fixture_paths": 2,
+            "requested_limit": serde_json::Value::Null,
+            "requested_stages": ["compile"]
+        },
+        "started_at": "2026-03-11T00:00:00Z",
+        "finished_at": "2026-03-11T00:05:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 10,
+            "verified_repairs": 7,
+            "accepted_patches": 8,
+            "false_greens": 1,
+            "verified_repair_rate": 0.7,
+            "accepted_patch_rate": 0.8,
+            "false_green_rate": 0.1,
+            "median_time_to_first_candidate_ms": 1200,
+            "median_time_to_verified_repair_ms": 4200,
+            "median_cost_per_attempted_case_usd": 0.12,
+            "mean_cost_per_attempted_case_usd": 0.15,
+            "median_cost_per_verified_repair_usd": 0.18,
+            "mean_cost_per_verified_repair_usd": 0.21
+        },
+        "speedup_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 10,
+            "verified_repairs": 7,
+            "median_duration_ms": 5100,
+            "median_time_to_verified_repair_ms": 4200,
+            "speedup_vs_baseline": 1.0
+        }],
+        "cost_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 10,
+            "median_total_cost_usd": 0.12,
+            "mean_total_cost_usd": 0.15
+        }],
+        "results": [{
+            "case_id": "rust_type_mismatch",
+            "agent_count": 4,
+            "verified_repair": true,
+            "benchmark_run_path": "/tmp/quality/cases/rust_type_mismatch/agents-4/benchmark-run.json",
+            "candidate_workspace": "/tmp/quality/workspaces/rust_type_mismatch-agents-4"
+        }]
+    });
+    let agent_sweep_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Public Mercury repair benchmark aggregate report",
+        "suite_id": "rust-v0.3-seeded",
+        "language": "rust",
+        "mode": "agent-sweep",
+        "generated_at": "2026-03-11T01:00:00Z",
+        "run_id": "sweep-demo",
+        "run_root": "/tmp/sweep",
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [1, 2, 4, 8],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "INCEPTION_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "selected_count": 4,
+            "selected_case_ids": ["rust_type_mismatch"],
+            "selected_unique_fixture_paths": 2,
+            "requested_limit": 4,
+            "requested_stages": ["compile", "test"]
+        },
+        "started_at": "2026-03-11T01:00:00Z",
+        "finished_at": "2026-03-11T01:05:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 16,
+            "verified_repairs": 10,
+            "accepted_patches": 11,
+            "false_greens": 2,
+            "verified_repair_rate": 0.625,
+            "accepted_patch_rate": 0.6875,
+            "false_green_rate": 0.125,
+            "median_time_to_first_candidate_ms": 1100,
+            "median_time_to_verified_repair_ms": 3900,
+            "median_cost_per_attempted_case_usd": 0.11,
+            "mean_cost_per_attempted_case_usd": 0.13,
+            "median_cost_per_verified_repair_usd": 0.16,
+            "mean_cost_per_verified_repair_usd": 0.19
+        },
+        "speedup_curve": [
+            {
+                "agent_count": 1,
+                "attempted_cases": 4,
+                "verified_repairs": 2,
+                "median_duration_ms": 8000,
+                "median_time_to_verified_repair_ms": 6000,
+                "speedup_vs_baseline": 1.0
+            },
+            {
+                "agent_count": 2,
+                "attempted_cases": 4,
+                "verified_repairs": 3,
+                "median_duration_ms": 6500,
+                "median_time_to_verified_repair_ms": 5000,
+                "speedup_vs_baseline": 1.231
+            },
+            {
+                "agent_count": 4,
+                "attempted_cases": 4,
+                "verified_repairs": 3,
+                "median_duration_ms": 5200,
+                "median_time_to_verified_repair_ms": 4100,
+                "speedup_vs_baseline": 1.538
+            },
+            {
+                "agent_count": 8,
+                "attempted_cases": 4,
+                "verified_repairs": 2,
+                "median_duration_ms": 5000,
+                "median_time_to_verified_repair_ms": 4300,
+                "speedup_vs_baseline": 1.6
+            }
+        ],
+        "cost_curve": [
+            {
+                "agent_count": 1,
+                "attempted_cases": 4,
+                "median_total_cost_usd": 0.09,
+                "mean_total_cost_usd": 0.1
+            },
+            {
+                "agent_count": 2,
+                "attempted_cases": 4,
+                "median_total_cost_usd": 0.1,
+                "mean_total_cost_usd": 0.11
+            },
+            {
+                "agent_count": 4,
+                "attempted_cases": 4,
+                "median_total_cost_usd": 0.12,
+                "mean_total_cost_usd": 0.13
+            },
+            {
+                "agent_count": 8,
+                "attempted_cases": 4,
+                "median_total_cost_usd": 0.16,
+                "mean_total_cost_usd": 0.17
+            }
+        ],
+        "results": [{
+            "case_id": "rust_type_mismatch",
+            "agent_count": 8,
+            "verified_repair": false,
+            "benchmark_run_path": "/tmp/sweep/cases/rust_type_mismatch/agents-8/benchmark-run.json",
+            "candidate_workspace": "/tmp/sweep/workspaces/rust_type_mismatch-agents-8"
+        }]
+    });
+
+    fs::write(
+        &quality_path,
+        serde_json::to_vec_pretty(&quality_report).expect("quality report should serialize"),
+    )
+    .expect("quality report should be writable");
+    fs::write(
+        &agent_sweep_path,
+        serde_json::to_vec_pretty(&agent_sweep_report)
+            .expect("agent sweep report should serialize"),
+    )
+    .expect("agent sweep report should be writable");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/publish.py")
+        .arg("--quality-report")
+        .arg(quality_path.as_os_str())
+        .arg("--agent-sweep-report")
+        .arg(agent_sweep_path.as_os_str())
+        .arg("--output-dir")
+        .arg(output_dir.as_os_str())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute benchmark publisher");
+    assert!(
+        output.status.success(),
+        "benchmark publisher should succeed"
+    );
+
+    let markdown = fs::read_to_string(output_dir.join("rust-v0-repair-benchmark.md"))
+        .expect("published benchmark markdown should exist");
+    assert!(
+        markdown.contains("Status: published from benchmark runner artifacts."),
+        "published benchmark markdown should declare published status"
+    );
+    assert!(
+        markdown.contains("quality-demo"),
+        "published benchmark markdown should include quality run metadata"
+    );
+    assert!(
+        markdown.contains("| 8 | 4 | 2 | 5000 | 4300 | 1.600 |"),
+        "published benchmark markdown should render the speedup curve table"
+    );
+
+    let copied_quality = fs::read_to_string(output_dir.join("rust-v0-quality.report.json"))
+        .expect("copied quality report should exist");
+    let copied_agent_sweep = fs::read_to_string(output_dir.join("rust-v0-agent-sweep.report.json"))
+        .expect("copied agent sweep report should exist");
+    let copied_quality: Value =
+        serde_json::from_str(&copied_quality).expect("copied quality report should parse");
+    let copied_agent_sweep: Value =
+        serde_json::from_str(&copied_agent_sweep).expect("copied agent sweep report should parse");
+    assert_eq!(copied_quality["run_id"], "quality-demo");
+    assert_eq!(copied_agent_sweep["run_id"], "sweep-demo");
+    assert_eq!(
+        copied_quality["selection"]["manifest_path"],
+        "evals/v0/manifest.json"
+    );
+    assert_eq!(
+        copied_agent_sweep["selection"]["manifest_path"],
+        "evals/v0/manifest.json"
+    );
+    assert_public_benchmark_report_is_scrubbed(&copied_quality);
+    assert_public_benchmark_report_is_scrubbed(&copied_agent_sweep);
 }
 
 #[test]
@@ -1067,8 +1631,20 @@ fn command_available(command: &str) -> bool {
 }
 
 #[cfg(unix)]
-#[test]
-fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
+fn run_synthetic_false_green_benchmark(keep_workspaces: bool) -> (tempfile::TempDir, PathBuf) {
+    let run_id = if keep_workspaces {
+        "false-green-keep"
+    } else {
+        "false-green"
+    };
+    run_synthetic_false_green_benchmark_with_run_id(keep_workspaces, run_id)
+}
+
+#[cfg(unix)]
+fn run_synthetic_false_green_benchmark_with_run_id(
+    keep_workspaces: bool,
+    run_id: &str,
+) -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("tempdir should be created");
     let suite_root = temp.path().join("suite");
     let case_root = suite_root.join("cases/synthetic_false_green");
@@ -1141,7 +1717,7 @@ if args and args[0] == "init":
 if args and args[0] == "fix":
     run_root = cwd / ".mercury" / "runs" / "run-test"
     run_root.mkdir(parents=True, exist_ok=True)
-    sandbox_root = cwd.parent / "fake-sandbox"
+    sandbox_root = cwd / ".mercury" / "worktrees" / "fake-sandbox"
     candidate = sandbox_root / "final-bundle"
     if sandbox_root.exists():
         shutil.rmtree(sandbox_root)
@@ -1163,7 +1739,6 @@ if args and args[0] == "fix":
         "accepted_patch": True,
         "accepted_patch_bytes": 16,
         "outcome": "verified_repair",
-        "false_green": False,
         "sandbox_run_root": str(sandbox_root),
         "total_cost_usd": 0.12,
         "budget_remaining_usd": 0.38,
@@ -1195,7 +1770,8 @@ sys.exit(1)
         .expect("fake mercury binary should be executable");
 
     let output_dir = temp.path().join("reports");
-    let output = Command::new("python3")
+    let mut command = Command::new("python3");
+    command
         .arg("evals/repair_benchmark/run.py")
         .arg("--suite")
         .arg(suite_root.join("manifest.json"))
@@ -1204,10 +1780,14 @@ sys.exit(1)
         .arg("--case")
         .arg("synthetic_false_green")
         .arg("--run-id")
-        .arg("false-green")
+        .arg(run_id)
         .arg("--output-dir")
         .arg(&output_dir)
-        .arg("--clean-output")
+        .arg("--clean-output");
+    if keep_workspaces {
+        command.arg("--keep-workspaces");
+    }
+    let output = command
         .env("INCEPTION_API_KEY", "test-key")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -1220,7 +1800,13 @@ sys.exit(1)
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let run_dir = output_dir.join("run-false-green");
+    (temp, output_dir.join(format!("run-{run_id}")))
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
+    let (_temp, run_dir) = run_synthetic_false_green_benchmark(false);
     let result: Value = serde_json::from_str(
         &fs::read_to_string(
             run_dir
@@ -1239,6 +1825,31 @@ sys.exit(1)
     assert_eq!(result["final_bundle_verified"], true);
     assert_eq!(result["accepted_patch"], true);
     assert_eq!(result["independent_rerun_success"], false);
+    assert_eq!(result["workspace_preserved"], false);
+    assert!(result["candidate_workspace"].is_null());
+
+    let benchmark_run: Value = serde_json::from_str(
+        &fs::read_to_string(
+            run_dir
+                .join("cases")
+                .join("synthetic_false_green")
+                .join("agents-4")
+                .join("benchmark-run.json"),
+        )
+        .expect("benchmark-run.json should exist"),
+    )
+    .expect("benchmark-run.json should be valid json");
+    assert!(
+        benchmark_run.get("sandbox_run_root").is_none(),
+        "default run should redact sandbox_run_root from copied benchmark-run.json"
+    );
+    assert!(
+        !run_dir
+            .join("workspaces")
+            .join("synthetic_false_green-agents-4")
+            .exists(),
+        "default run should delete copied workspaces after rerun"
+    );
 
     let report: Value = serde_json::from_str(
         &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
@@ -1247,6 +1858,424 @@ sys.exit(1)
     assert_eq!(report["schema_version"], "mercury-repair-benchmark-v1");
     assert_eq!(report["metrics"]["false_greens"], 1);
     assert_eq!(report["metrics"]["verified_repairs"], 0);
+    assert_eq!(report["keep_workspaces"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_preserves_workspaces_when_requested() {
+    let (_temp, run_dir) = run_synthetic_false_green_benchmark(true);
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(
+            run_dir
+                .join("cases")
+                .join("synthetic_false_green")
+                .join("agents-4")
+                .join("result.json"),
+        )
+        .expect("result.json should exist"),
+    )
+    .expect("result.json should be valid json");
+    assert_eq!(result["workspace_preserved"], true);
+
+    let candidate_workspace = PathBuf::from(
+        result["candidate_workspace"]
+            .as_str()
+            .expect("candidate workspace should be recorded when kept"),
+    );
+    assert!(
+        candidate_workspace.exists(),
+        "kept run should retain the candidate workspace"
+    );
+    assert!(
+        run_dir
+            .join("workspaces")
+            .join("synthetic_false_green-agents-4")
+            .exists(),
+        "kept run should retain copied workspaces"
+    );
+
+    let benchmark_run: Value = serde_json::from_str(
+        &fs::read_to_string(
+            run_dir
+                .join("cases")
+                .join("synthetic_false_green")
+                .join("agents-4")
+                .join("benchmark-run.json"),
+        )
+        .expect("benchmark-run.json should exist"),
+    )
+    .expect("benchmark-run.json should be valid json");
+    let sandbox_run_root = PathBuf::from(
+        benchmark_run["sandbox_run_root"]
+            .as_str()
+            .expect("kept run should preserve sandbox_run_root"),
+    );
+    assert!(
+        sandbox_run_root.exists(),
+        "kept run should preserve the sandbox root on disk"
+    );
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
+    )
+    .expect("report.json should be valid json");
+    assert_eq!(report["keep_workspaces"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_clears_stale_case_output_on_rerun() {
+    let (temp, run_dir) =
+        run_synthetic_false_green_benchmark_with_run_id(false, "false-green-rerun");
+    let result_root = run_dir
+        .join("cases")
+        .join("synthetic_false_green")
+        .join("agents-4");
+    let stale_marker = result_root.join("stale.txt");
+    fs::write(&stale_marker, "stale\n").expect("stale marker should be writable");
+    assert!(
+        stale_marker.exists(),
+        "stale marker should exist before rerun"
+    );
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(temp.path().join("suite/manifest.json"))
+        .arg("--binary")
+        .arg(temp.path().join("fake-mercury"))
+        .arg("--case")
+        .arg("synthetic_false_green")
+        .arg("--run-id")
+        .arg("false-green-rerun")
+        .arg("--output-dir")
+        .arg(temp.path().join("reports"))
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("INCEPTION_API_KEY", "test-key")
+        .output()
+        .expect("python3 should execute repair benchmark rerun");
+
+    assert!(
+        output.status.success(),
+        "synthetic benchmark rerun should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !stale_marker.exists(),
+        "rerun with the same run id should clear stale per-case output before writing new results"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_preserves_timeout_logs_when_subprocess_returns_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let suite_root = temp.path().join("synthetic-suite");
+    let case_root = suite_root.join("cases").join("synthetic_timeout_bytes");
+    fs::create_dir_all(&case_root).expect("synthetic case directory should be created");
+
+    fs::write(case_root.join("verifier.py"), "import sys\nsys.exit(1)\n")
+        .expect("verifier should be written");
+
+    let manifest = json!({
+        "schema_version": "mercury-evals-v0",
+        "suite_id": "synthetic-timeout-bytes",
+        "language": "rust",
+        "version": 3,
+        "artifact_schema_version": "mercury-eval-report-v0",
+        "supported_modes": ["baseline"],
+        "cases": [{
+            "id": "synthetic_timeout_bytes",
+            "title": "Synthetic timeout bytes",
+            "path": "cases/synthetic_timeout_bytes",
+            "verifier_command": ["python3", "verifier.py"],
+            "failure_stage": "test",
+            "failure_class": "timeout_bytes",
+            "tags": ["language:rust", "stage:test", "kind:synthetic"],
+            "timeout_seconds": 1,
+            "demo_track": "none",
+            "provenance": {
+                "origin": "synthetic",
+                "suite": "synthetic-timeout-bytes",
+                "variant": "timeout",
+                "generator": "tests/eval_manifest.rs"
+            }
+        }]
+    });
+    fs::write(
+        suite_root.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+    )
+    .expect("synthetic manifest should be written");
+
+    let fake_binary = temp.path().join("fake-mercury-timeout");
+    fs::write(
+        &fake_binary,
+        r#"#!/usr/bin/env python3
+import sys
+import time
+
+args = sys.argv[1:]
+
+if args and args[0] == "init":
+    sys.exit(0)
+
+if args and args[0] == "fix":
+    sys.stdout.buffer.write(b"timed out bytes\n")
+    sys.stdout.flush()
+    time.sleep(2)
+    sys.exit(1)
+
+sys.exit(1)
+"#,
+    )
+    .expect("fake mercury binary should be written");
+
+    let mut permissions = fs::metadata(&fake_binary)
+        .expect("fake mercury binary should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_binary, permissions)
+        .expect("fake mercury binary should be executable");
+
+    let output_dir = temp.path().join("reports");
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(suite_root.join("manifest.json"))
+        .arg("--binary")
+        .arg(&fake_binary)
+        .arg("--case")
+        .arg("synthetic_timeout_bytes")
+        .arg("--run-id")
+        .arg("timeout-bytes")
+        .arg("--timeout-seconds")
+        .arg("1")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--clean-output")
+        .env("INCEPTION_API_KEY", "test-key")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute repair benchmark runner");
+
+    assert!(
+        output.status.success(),
+        "synthetic timeout benchmark run should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let result_root = output_dir
+        .join("run-timeout-bytes")
+        .join("cases")
+        .join("synthetic_timeout_bytes")
+        .join("agents-4");
+    let fix_log = fs::read_to_string(result_root.join("fix.stdout.log"))
+        .expect("fix stdout log should exist");
+    assert!(
+        fix_log.contains("timed out bytes"),
+        "timed-out fix stdout should still be captured in the log"
+    );
+
+    let fix_meta: Value = serde_json::from_str(
+        &fs::read_to_string(result_root.join("fix.json")).expect("fix metadata should exist"),
+    )
+    .expect("fix metadata should parse");
+    assert_eq!(
+        fix_meta["timed_out"],
+        Value::Bool(true),
+        "timed-out fix metadata should be preserved"
+    );
+
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(result_root.join("result.json")).expect("result metadata should exist"),
+    )
+    .expect("result metadata should parse");
+    assert_eq!(
+        result["outcome"],
+        Value::String("missing_benchmark_run".to_string()),
+        "timed-out runs without benchmark artifacts should still produce a result"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_resumes_existing_results_and_keeps_partial_checkpoints() {
+    let (temp, run_dir) =
+        run_synthetic_false_green_benchmark_with_run_id(false, "false-green-resume");
+    let result_root = run_dir
+        .join("cases")
+        .join("synthetic_false_green")
+        .join("agents-4");
+    let resume_sentinel = result_root.join("resume-sentinel.txt");
+    fs::write(&resume_sentinel, "keep\n").expect("resume sentinel should be writable");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(temp.path().join("suite/manifest.json"))
+        .arg("--binary")
+        .arg(temp.path().join("fake-mercury"))
+        .arg("--case")
+        .arg("synthetic_false_green")
+        .arg("--run-id")
+        .arg("false-green-resume")
+        .arg("--output-dir")
+        .arg(temp.path().join("reports"))
+        .arg("--resume")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("INCEPTION_API_KEY", "test-key")
+        .output()
+        .expect("python3 should execute repair benchmark resume");
+
+    assert!(
+        output.status.success(),
+        "synthetic benchmark resume should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        resume_sentinel.exists(),
+        "resume should reuse the existing case result directory instead of clearing it"
+    );
+    assert!(
+        run_dir.join("report.partial.json").exists(),
+        "resume should maintain a partial aggregate checkpoint"
+    );
+    assert!(
+        run_dir.join("summary.partial.md").exists(),
+        "resume should maintain a partial summary checkpoint"
+    );
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
+    )
+    .expect("report.json should be valid json");
+    assert_eq!(report["metrics"]["attempted_cases"], 1);
+    assert_eq!(report["results"][0]["outcome"], "false_green");
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_records_runner_errors_instead_of_aborting() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let suite_root = temp.path().join("suite");
+    fs::create_dir_all(&suite_root).expect("synthetic suite root should be created");
+
+    let manifest = json!({
+        "schema_version": "mercury-evals-v0",
+        "suite_id": "synthetic-runner-error",
+        "language": "rust",
+        "version": 1,
+        "artifact_schema_version": "mercury-eval-report-v0",
+        "supported_modes": ["baseline"],
+        "cases": [{
+            "id": "missing_fixture_case",
+            "title": "Missing fixture case",
+            "path": "cases/missing_fixture_case",
+            "verifier_command": ["python3", "verifier.py"],
+            "failure_stage": "test",
+            "failure_class": "synthetic",
+            "tags": ["language:rust", "stage:test", "kind:synthetic"],
+            "timeout_seconds": 30,
+            "demo_track": "none",
+            "provenance": {
+                "origin": "synthetic",
+                "suite": "synthetic-runner-error",
+                "variant": "seed",
+                "generator": "tests/eval_manifest.rs"
+            }
+        }]
+    });
+    fs::write(
+        suite_root.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).expect("manifest should serialize"),
+    )
+    .expect("synthetic manifest should be written");
+
+    let fake_binary = temp.path().join("fake-mercury-runner-error");
+    fs::write(
+        &fake_binary,
+        "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n",
+    )
+    .expect("fake mercury binary should be written");
+
+    let mut permissions = fs::metadata(&fake_binary)
+        .expect("fake mercury binary should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_binary, permissions)
+        .expect("fake mercury binary should be executable");
+
+    let output_dir = temp.path().join("reports");
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(suite_root.join("manifest.json"))
+        .arg("--binary")
+        .arg(&fake_binary)
+        .arg("--case")
+        .arg("missing_fixture_case")
+        .arg("--run-id")
+        .arg("runner-error")
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--clean-output")
+        .env("INCEPTION_API_KEY", "test-key")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute repair benchmark runner");
+
+    assert!(
+        output.status.success(),
+        "runner errors should be captured without aborting the benchmark: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let run_dir = output_dir.join("run-runner-error");
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(
+            run_dir
+                .join("cases")
+                .join("missing_fixture_case")
+                .join("agents-4")
+                .join("result.json"),
+        )
+        .expect("result.json should exist"),
+    )
+    .expect("result.json should be valid json");
+    assert_eq!(result["outcome"], "runner_error");
+    assert_eq!(result["accepted_patch"], false);
+    assert_eq!(result["verified_repair"], false);
+    assert!(
+        result["runner_error_message"]
+            .as_str()
+            .expect("runner error message should be present")
+            .contains("missing_fixture_case"),
+        "runner error should record the failing fixture path"
+    );
+    assert!(
+        result["runner_error_traceback"]
+            .as_str()
+            .expect("runner error traceback should be present")
+            .contains("copytree"),
+        "runner error traceback should preserve the original failure site"
+    );
+    assert!(run_dir.join("report.partial.json").exists());
+    assert!(run_dir.join("summary.partial.md").exists());
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
+    )
+    .expect("report.json should be valid json");
+    assert_eq!(report["metrics"]["attempted_cases"], 1);
+    assert_eq!(report["results"][0]["outcome"], "runner_error");
 }
 
 #[cfg(unix)]

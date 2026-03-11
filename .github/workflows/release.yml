@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version to release when running manually, for example 1.0.0
+        description: Version to release when running manually; must match Cargo.toml exactly
         required: false
         type: string
 
@@ -45,6 +45,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          MANIFEST_VERSION="$(python3 - <<'PY'
+import tomllib
+from pathlib import Path
+manifest = Path("Cargo.toml").read_bytes()
+print(tomllib.loads(manifest.decode("utf-8"))["package"]["version"])
+PY
+)"
+
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
@@ -56,7 +64,18 @@ jobs:
             exit 1
           fi
 
+          if [[ "$VERSION" != "$MANIFEST_VERSION" ]]; then
+            echo "resolved release version '$VERSION' does not match Cargo.toml package version '$MANIFEST_VERSION'" >&2
+            exit 1
+          fi
+
+          PRERELEASE=false
+          if [[ "$VERSION" == *-* ]]; then
+            PRERELEASE=true
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -101,6 +120,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256

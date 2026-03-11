@@ -6,6 +6,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -32,9 +33,19 @@ def isoformat_utc(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def write_text(path: Path, content: str) -> None:
+def normalize_text(content: Union[str, bytes, None, object]) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, str):
+        return content
+    return str(content)
+
+
+def write_text(path: Path, content: Union[str, bytes, None, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(normalize_text(content), encoding="utf-8")
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -314,6 +325,15 @@ def candidate_workspace_from_benchmark_run(benchmark_run: dict[str, Any]) -> Opt
     return None
 
 
+def sanitized_benchmark_run(
+    benchmark_run: dict[str, Any], keep_workspaces: bool
+) -> dict[str, Any]:
+    copied = dict(benchmark_run)
+    if not keep_workspaces:
+        copied.pop("sandbox_run_root", None)
+    return copied
+
+
 def classify_case_outcome(
     benchmark_run: dict[str, Any],
     accepted_patch: bool,
@@ -342,6 +362,15 @@ def median_or_none(values: list[Union[float, int]]) -> Optional[float]:
     if not values:
         return None
     return float(statistics.median(values))
+
+
+def compute_repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        outcome = result.get("outcome")
+        label = outcome if isinstance(outcome, str) and outcome else "unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def compute_agent_curves(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -410,6 +439,7 @@ def summarize_report(report: dict[str, Any]) -> str:
         f"- Suite: `{report['suite_id']}`",
         f"- Language: `{report['language']}`",
         f"- Agent counts: `{', '.join(str(value) for value in report['agent_counts'])}`",
+        f"- Keep workspaces: `{report['keep_workspaces']}`",
         f"- Attempted cases: `{metrics['attempted_cases']}`",
         f"- Verified repairs: `{metrics['verified_repairs']}`",
         f"- Accepted patch rate: `{metrics['accepted_patch_rate']:.3f}`",
@@ -421,9 +451,20 @@ def summarize_report(report: dict[str, Any]) -> str:
         f"- Median cost per verified repair (USD): `{metrics['median_cost_per_verified_repair_usd']}`",
         f"- Mean cost per verified repair (USD): `{metrics['mean_cost_per_verified_repair_usd']}`",
         "",
-        "## Speedup Curve",
+        "## Repair Outcome Distribution",
         "",
     ]
+
+    for outcome, count in report["repair_outcome_distribution"].items():
+        lines.append(f"- {outcome}: {count}")
+
+    lines.extend(
+        [
+            "",
+        "## Speedup Curve",
+        "",
+        ]
+    )
 
     for entry in report["speedup_curve"]:
         lines.append(
@@ -471,6 +512,81 @@ def render_selection(
     }
 
 
+def case_result_root(run_root: Path, case: dict[str, Any], agent_count: int) -> Path:
+    return run_root / "cases" / case["id"] / f"agents-{agent_count}"
+
+
+def case_workspace_root(run_root: Path, case: dict[str, Any], agent_count: int) -> Path:
+    return run_root / "workspaces" / f"{case['id']}-agents-{agent_count}"
+
+
+def load_existing_result(result_path: Path) -> Optional[dict[str, Any]]:
+    if not result_path.exists():
+        return None
+    payload = read_json(result_path)
+    require_manifest_keys(
+        payload,
+        [
+            "schema_version",
+            "case_id",
+            "agent_count",
+            "outcome",
+            "accepted_patch",
+            "verified_repair",
+            "false_green",
+            "fix_duration_ms",
+            "total_cost_usd",
+        ],
+        "benchmark result",
+    )
+    if payload["schema_version"] != BENCHMARK_RESULT_SCHEMA_VERSION:
+        raise ValueError(
+            f"benchmark result at {result_path} declared unsupported schema version {payload['schema_version']}"
+        )
+    return payload
+
+
+def build_runner_error_result(
+    case: dict[str, Any],
+    agent_count: int,
+    keep_workspaces: bool,
+    message: str,
+    traceback_text: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": BENCHMARK_RESULT_SCHEMA_VERSION,
+        "case_id": case["id"],
+        "case_title": case["title"],
+        "case_path": case["path"],
+        "failure_stage": case["failure_stage"],
+        "failure_class": case["failure_class"],
+        "agent_count": agent_count,
+        "baseline_reproduced": False,
+        "outcome": "runner_error",
+        "accepted_patch": False,
+        "accepted_patch_bytes": 0,
+        "verified_repair": False,
+        "false_green": False,
+        "fix_exit_code": None,
+        "fix_timed_out": False,
+        "fix_duration_ms": 0,
+        "time_to_first_candidate_ms": None,
+        "time_to_verified_repair_ms": None,
+        "total_cost_usd": 0.0,
+        "budget_remaining_usd": 0.0,
+        "final_bundle_verified": False,
+        "applied": False,
+        "independent_rerun_success": False,
+        "independent_rerun_exit_code": None,
+        "independent_rerun_timed_out": False,
+        "benchmark_run_path": None,
+        "candidate_workspace": None,
+        "workspace_preserved": keep_workspaces,
+        "runner_error_message": message,
+        "runner_error_traceback": traceback_text,
+    }
+
+
 def build_report(
     manifest: dict[str, Any],
     selected_cases: list[dict[str, Any]],
@@ -501,6 +617,7 @@ def build_report(
         for result in results
         if result["verified_repair"]
     ]
+    repair_outcome_distribution = compute_repair_outcome_distribution(results)
     speedup_curve, cost_curve = compute_agent_curves(results)
 
     return {
@@ -514,6 +631,7 @@ def build_report(
         "run_root": str(run_root),
         "binary_path": str(args.binary.resolve()),
         "agent_counts": args.agent_count,
+        "keep_workspaces": args.keep_workspaces,
         "max_cost_usd": args.max_cost,
         "timeout_seconds": args.timeout_seconds,
         "api_key_env": api_key_env,
@@ -542,6 +660,7 @@ def build_report(
             "median_cost_per_verified_repair_usd": median_or_none(verified_costs),
             "mean_cost_per_verified_repair_usd": mean_or_none(verified_costs),
         },
+        "repair_outcome_distribution": repair_outcome_distribution,
         "speedup_curve": speedup_curve,
         "cost_curve": cost_curve,
         "results": results,
@@ -556,22 +675,121 @@ def evaluate_case(
     api_key_env: str,
     env: dict[str, str],
 ) -> dict[str, Any]:
-    workspace_root = run_root / "workspaces" / f"{case['id']}-agents-{agent_count}"
-    if workspace_root.exists():
-        shutil.rmtree(workspace_root)
-    shutil.copytree(args.suite.parent / case["path"], workspace_root)
+    workspace_root = case_workspace_root(run_root, case, agent_count)
+    result_root = case_result_root(run_root, case, agent_count)
+    try:
+        if workspace_root.exists():
+            shutil.rmtree(workspace_root)
+        if result_root.exists():
+            shutil.rmtree(result_root)
 
-    result_root = run_root / "cases" / case["id"] / f"agents-{agent_count}"
-    result_root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(args.suite.parent / case["path"], workspace_root)
+        result_root.mkdir(parents=True, exist_ok=True)
 
-    baseline = run_command(
-        list(case["verifier_command"]),
-        workspace_root,
-        min(int(case.get("timeout_seconds", args.timeout_seconds)), args.timeout_seconds),
-        env,
-    )
-    write_command_logs(result_root, "baseline", baseline)
-    if baseline["success"]:
+        baseline = run_command(
+            list(case["verifier_command"]),
+            workspace_root,
+            min(int(case.get("timeout_seconds", args.timeout_seconds)), args.timeout_seconds),
+            env,
+        )
+        write_command_logs(result_root, "baseline", baseline)
+        if baseline["success"]:
+            result = {
+                "schema_version": BENCHMARK_RESULT_SCHEMA_VERSION,
+                "case_id": case["id"],
+                "case_title": case["title"],
+                "case_path": case["path"],
+                "failure_stage": case["failure_stage"],
+                "failure_class": case["failure_class"],
+                "agent_count": agent_count,
+                "baseline_reproduced": False,
+                "outcome": "baseline_not_reproduced",
+                "accepted_patch": False,
+                "verified_repair": False,
+                "false_green": False,
+                "total_cost_usd": 0.0,
+                "fix_duration_ms": 0,
+                "time_to_first_candidate_ms": None,
+                "time_to_verified_repair_ms": None,
+                "candidate_workspace": None,
+                "workspace_preserved": args.keep_workspaces,
+            }
+            write_json(result_root / "result.json", result)
+            return result
+
+        run_command([str(args.binary.resolve()), "init"], workspace_root, 60, env)
+        configure_mercury(workspace_root, case, api_key_env)
+
+        fix_result = run_command(
+            [
+                str(args.binary.resolve()),
+                "fix",
+                case["title"],
+                "--max-agents",
+                str(agent_count),
+                "--max-cost",
+                str(args.max_cost),
+                "--noninteractive",
+            ],
+            workspace_root,
+            args.timeout_seconds,
+            env,
+        )
+        write_command_logs(result_root, "fix", fix_result)
+
+        latest_run = latest_mercury_run(workspace_root)
+        benchmark_run: dict[str, Any] = {}
+        if latest_run:
+            source_artifact = latest_run / "benchmark-run.json"
+            if source_artifact.exists():
+                benchmark_run = read_json(source_artifact)
+                write_json(
+                    result_root / "benchmark-run.json",
+                    sanitized_benchmark_run(benchmark_run, args.keep_workspaces),
+                )
+
+        accepted_patch = bool(
+            benchmark_run.get("accepted_patch", benchmark_run.get("accepted_patch_present"))
+        )
+        candidate_workspace = candidate_workspace_from_benchmark_run(benchmark_run)
+        rerun_timeout = min(int(case.get("timeout_seconds", args.timeout_seconds)), args.timeout_seconds)
+        rerun: dict[str, Any]
+        if candidate_workspace is not None:
+            rerun = run_command(
+                list(case["verifier_command"]),
+                candidate_workspace,
+                rerun_timeout,
+                env,
+            )
+        else:
+            rerun = {
+                "command": list(case["verifier_command"]),
+                "command_text": command_text(list(case["verifier_command"])),
+                "cwd": None,
+                "started_at": None,
+                "finished_at": None,
+                "duration_ms": 0,
+                "timeout_seconds": rerun_timeout,
+                "timed_out": False,
+                "exit_code": None,
+                "stdout": "",
+                "stderr": "",
+                "success": False,
+                "error": "missing final-bundle candidate workspace",
+            }
+        write_command_logs(result_root, "independent-rerun", rerun)
+
+        mercury_verified = bool(benchmark_run.get("final_bundle_verified"))
+        rerun_success = bool(rerun.get("success"))
+        verified_repair = accepted_patch and rerun_success
+        false_green = mercury_verified and not rerun_success
+        outcome = classify_case_outcome(
+            benchmark_run,
+            accepted_patch,
+            mercury_verified,
+            rerun_success,
+        )
+
         result = {
             "schema_version": BENCHMARK_RESULT_SCHEMA_VERSION,
             "case_id": case["id"],
@@ -580,122 +798,70 @@ def evaluate_case(
             "failure_stage": case["failure_stage"],
             "failure_class": case["failure_class"],
             "agent_count": agent_count,
-            "baseline_reproduced": False,
-            "outcome": "baseline_not_reproduced",
-            "accepted_patch": False,
-            "verified_repair": False,
-            "false_green": False,
-            "total_cost_usd": 0.0,
-            "fix_duration_ms": 0,
-            "time_to_first_candidate_ms": None,
-            "time_to_verified_repair_ms": None,
+            "baseline_reproduced": True,
+            "outcome": outcome,
+            "accepted_patch": accepted_patch,
+            "accepted_patch_bytes": int(benchmark_run.get("accepted_patch_bytes") or 0),
+            "verified_repair": verified_repair,
+            "false_green": false_green,
+            "fix_exit_code": fix_result.get("exit_code"),
+            "fix_timed_out": fix_result.get("timed_out"),
+            "fix_duration_ms": int(benchmark_run.get("duration_ms") or fix_result["duration_ms"]),
+            "time_to_first_candidate_ms": benchmark_run.get("time_to_first_candidate_ms"),
+            "time_to_verified_repair_ms": benchmark_run.get("time_to_verified_repair_ms"),
+            "total_cost_usd": float(benchmark_run.get("total_cost_usd") or 0.0),
+            "budget_remaining_usd": float(benchmark_run.get("budget_remaining_usd") or 0.0),
+            "final_bundle_verified": mercury_verified,
+            "applied": bool(benchmark_run.get("applied")),
+            "independent_rerun_success": rerun_success,
+            "independent_rerun_exit_code": rerun.get("exit_code"),
+            "independent_rerun_timed_out": rerun.get("timed_out"),
+            "benchmark_run_path": str(result_root / "benchmark-run.json")
+            if benchmark_run
+            else None,
+            "candidate_workspace": str(candidate_workspace)
+            if candidate_workspace and args.keep_workspaces
+            else None,
+            "workspace_preserved": args.keep_workspaces,
         }
         write_json(result_root / "result.json", result)
         return result
+    finally:
+        if not args.keep_workspaces:
+            shutil.rmtree(workspace_root, ignore_errors=True)
 
-    run_command([str(args.binary.resolve()), "init"], workspace_root, 60, env)
-    configure_mercury(workspace_root, case, api_key_env)
 
-    fix_result = run_command(
-        [
-            str(args.binary.resolve()),
-            "fix",
-            case["title"],
-            "--max-agents",
-            str(agent_count),
-            "--max-cost",
-            str(args.max_cost),
-            "--noninteractive",
-        ],
-        workspace_root,
-        args.timeout_seconds,
-        env,
+def write_report_bundle(
+    manifest: dict[str, Any],
+    selected_cases: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    args: argparse.Namespace,
+    run_root: Path,
+    started_at: datetime,
+    finished_at: datetime,
+    api_key_env: Optional[str],
+    *,
+    partial: bool,
+) -> None:
+    report = build_report(
+        manifest,
+        selected_cases,
+        results,
+        args,
+        run_root,
+        started_at,
+        finished_at,
+        api_key_env,
     )
-    write_command_logs(result_root, "fix", fix_result)
+    if partial:
+        report["status"] = "partial"
+        report["expected_attempts"] = len(selected_cases) * len(args.agent_count)
+        write_json(run_root / "report.partial.json", report)
+        write_text(run_root / "summary.partial.md", summarize_report(report))
+        return
 
-    latest_run = latest_mercury_run(workspace_root)
-    benchmark_run: dict[str, Any] = {}
-    if latest_run:
-        source_artifact = latest_run / "benchmark-run.json"
-        if source_artifact.exists():
-            benchmark_run = read_json(source_artifact)
-            write_json(result_root / "benchmark-run.json", benchmark_run)
-
-    accepted_patch = bool(
-        benchmark_run.get("accepted_patch", benchmark_run.get("accepted_patch_present"))
-    )
-    candidate_workspace = candidate_workspace_from_benchmark_run(benchmark_run)
-    rerun_timeout = min(int(case.get("timeout_seconds", args.timeout_seconds)), args.timeout_seconds)
-    rerun: dict[str, Any]
-    if candidate_workspace is not None:
-        rerun = run_command(
-            list(case["verifier_command"]),
-            candidate_workspace,
-            rerun_timeout,
-            env,
-        )
-    else:
-        rerun = {
-            "command": list(case["verifier_command"]),
-            "command_text": command_text(list(case["verifier_command"])),
-            "cwd": None,
-            "started_at": None,
-            "finished_at": None,
-            "duration_ms": 0,
-            "timeout_seconds": rerun_timeout,
-            "timed_out": False,
-            "exit_code": None,
-            "stdout": "",
-            "stderr": "",
-            "success": False,
-            "error": "missing final-bundle candidate workspace",
-        }
-    write_command_logs(result_root, "independent-rerun", rerun)
-
-    mercury_verified = bool(benchmark_run.get("final_bundle_verified"))
-    rerun_success = bool(rerun.get("success"))
-    verified_repair = accepted_patch and rerun_success
-    false_green = mercury_verified and not rerun_success
-    outcome = classify_case_outcome(
-        benchmark_run,
-        accepted_patch,
-        mercury_verified,
-        rerun_success,
-    )
-
-    result = {
-        "schema_version": BENCHMARK_RESULT_SCHEMA_VERSION,
-        "case_id": case["id"],
-        "case_title": case["title"],
-        "case_path": case["path"],
-        "failure_stage": case["failure_stage"],
-        "failure_class": case["failure_class"],
-        "agent_count": agent_count,
-        "baseline_reproduced": True,
-        "outcome": outcome,
-        "accepted_patch": accepted_patch,
-        "accepted_patch_bytes": int(benchmark_run.get("accepted_patch_bytes") or 0),
-        "verified_repair": verified_repair,
-        "false_green": false_green,
-        "fix_exit_code": fix_result.get("exit_code"),
-        "fix_timed_out": fix_result.get("timed_out"),
-        "fix_duration_ms": int(benchmark_run.get("duration_ms") or fix_result["duration_ms"]),
-        "time_to_first_candidate_ms": benchmark_run.get("time_to_first_candidate_ms"),
-        "time_to_verified_repair_ms": benchmark_run.get("time_to_verified_repair_ms"),
-        "total_cost_usd": float(benchmark_run.get("total_cost_usd") or 0.0),
-        "budget_remaining_usd": float(benchmark_run.get("budget_remaining_usd") or 0.0),
-        "final_bundle_verified": mercury_verified,
-        "applied": bool(benchmark_run.get("applied")),
-        "independent_rerun_success": rerun_success,
-        "independent_rerun_exit_code": rerun.get("exit_code"),
-        "independent_rerun_timed_out": rerun.get("timed_out"),
-        "benchmark_run_path": str(result_root / "benchmark-run.json")
-        if benchmark_run
-        else None,
-        "candidate_workspace": str(candidate_workspace) if candidate_workspace else None,
-    }
-    write_json(result_root / "result.json", result)
-    return result
+    write_json(run_root / "report.json", report)
+    write_text(run_root / "summary.md", summarize_report(report))
 
 
 def parse_args() -> argparse.Namespace:
@@ -779,6 +945,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete an existing run directory before writing the new bundle.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse existing per-case result.json files under the run directory and continue unfinished work.",
+    )
+    parser.add_argument(
+        "--keep-workspaces",
+        action="store_true",
+        help="Preserve copied case workspaces and sandbox_run_root metadata for debugging.",
+    )
     return parser.parse_args()
 
 
@@ -837,19 +1013,70 @@ def main() -> int:
         "api_key_env": api_key_env,
         "mode": args.mode,
         "agent_counts": args.agent_count,
+        "keep_workspaces": args.keep_workspaces,
         "max_cost_usd": args.max_cost,
         "timeout_seconds": args.timeout_seconds,
     })
     write_json(run_root / "selection.json", render_selection(manifest, selected_cases, args))
+    write_report_bundle(
+        manifest,
+        selected_cases,
+        results,
+        args,
+        run_root,
+        started_at,
+        started_at,
+        api_key_env,
+        partial=True,
+    )
 
     for agent_count in args.agent_count:
         for case in selected_cases:
-            results.append(
-                evaluate_case(run_root, case, agent_count, args, api_key_env, env)
+            result_root = case_result_root(run_root, case, agent_count)
+            result_path = result_root / "result.json"
+            if args.resume:
+                existing = load_existing_result(result_path)
+                if existing is not None:
+                    results.append(existing)
+                    write_report_bundle(
+                        manifest,
+                        selected_cases,
+                        results,
+                        args,
+                        run_root,
+                        started_at,
+                        now_utc(),
+                        api_key_env,
+                        partial=True,
+                    )
+                    continue
+            try:
+                result = evaluate_case(run_root, case, agent_count, args, api_key_env, env)
+            except Exception as exc:
+                result_root.mkdir(parents=True, exist_ok=True)
+                result = build_runner_error_result(
+                    case,
+                    agent_count,
+                    args.keep_workspaces,
+                    str(exc),
+                    traceback.format_exc(),
+                )
+                write_json(result_path, result)
+            results.append(result)
+            write_report_bundle(
+                manifest,
+                selected_cases,
+                results,
+                args,
+                run_root,
+                started_at,
+                now_utc(),
+                api_key_env,
+                partial=True,
             )
 
     finished_at = now_utc()
-    report = build_report(
+    write_report_bundle(
         manifest,
         selected_cases,
         results,
@@ -858,9 +1085,8 @@ def main() -> int:
         started_at,
         finished_at,
         api_key_env,
+        partial=False,
     )
-    write_json(run_root / "report.json", report)
-    write_text(run_root / "summary.md", summarize_report(report))
     print(json.dumps({"run_root": str(run_root), "report_path": str(run_root / "report.json")}))
     return 0
 

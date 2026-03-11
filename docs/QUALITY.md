@@ -29,6 +29,7 @@ What it enforces today:
 - repair attempt only when baseline is red and API key is present
 - artifact bundle validation for a minimum evidence contract
 - branch push + draft PR mutation only when repair is verified, diff is non-empty, and `dry_run=false`
+- verified reruns targeting the same base ref and failure command reuse the same repair branch/PR head instead of creating a new branch name per run
 
 Terminal status behavior:
 
@@ -64,12 +65,12 @@ Current behavior should be documented and reviewed as:
 - direct verifier command targeting for the repair loop (`cargo test`, `cargo check`, `cargo clippy`, including env-prefix forms)
 - verifier allowlisting for direct Rust cargo commands plus selected direct TypeScript verifier invocations, without shell composition by default
 - watch command allowlist rejects shell composition and wrapper commands before cycle execution by default
-- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but this repo still does not publish benchmark-backed speedup claims from that setting
-- `status --live` is a summary dashboard for heatmap/agent/budget state, not a full candidate-event stream
+- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout; `docs/benchmarks/` now publishes selected-Rust runtime and cost curves for that setting, but the repo still does not claim broad overlapping-edit convergence or verified-repair improvement from those numbers alone
+- `status --live` now exposes candidate, phase, and runtime events via a TTY event pane or JSONL stream; it is still not a full conflict-telemetry or merge-decision explanation surface
 
 TypeScript lane status:
 
-- repo mapping/parser, failure parsing, and selected verifier support exist in the current branch
+- token-aware repo mapping/symbol extraction, failure parsing, and selected verifier support exist in the current branch
 - `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for scoped-support harness coverage
 - TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it is scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
 
@@ -82,7 +83,7 @@ Current corpus contracts:
 
 Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality.
 
-Public repair benchmark reporting is not yet published. When published, checked-in reports will live under `docs/benchmarks/` and be emitted by a dedicated repair benchmark workflow.
+The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to the selected Rust corpus and exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence, and the public report now includes both the false-green policy and repair outcome distribution used to interpret those numbers.
 
 ## Release Artifact Reality
 
@@ -96,7 +97,7 @@ If broader binary coverage is required, treat it as roadmap work, not current qu
 Versioning/distribution caveat:
 
 - Tagged releases are the GA contract boundary for binaries and migration expectations.
-- Plain `1.0.0` remains the stable release boundary; branch-head `1.0.0-beta.1` docs describe a pre-release contract and should not be treated as stable binary-support commitments.
+- Hyphenated versions such as `1.0.0-beta.1` are published as GitHub prereleases; plain `1.0.0` remains the stable release boundary. Branch-head `1.0.0-beta.1` docs describe a pre-release contract and should not be treated as stable binary-support commitments.
 
 ## How to Use This Document
 

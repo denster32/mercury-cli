@@ -144,6 +144,7 @@ jobs:
           INCEPTION_API_KEY: ${{ secrets.inception_api_key || secrets.INCEPTION_API_KEY || secrets.MERCURY_API_KEY }}
         run: |
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           import re
@@ -199,6 +200,23 @@ jobs:
                   return text[:match.start(2)] + updated_body + text[match.end(2):]
               suffix = "" if text.endswith("\n") else "\n"
               return f"{text}{suffix}\n[{section}]\n{replacement_line}\n"
+
+          def slugify_branch_segment(value: str, fallback: str, max_length: int) -> str:
+              normalized = re.sub(r"[^a-z0-9._/-]+", "-", value.lower())
+              normalized = normalized.replace("/", "-")
+              normalized = re.sub(r"-{2,}", "-", normalized).strip("-.")
+              if not normalized:
+                  normalized = fallback
+              truncated = normalized[:max_length].rstrip("-.")
+              return truncated or fallback
+
+          def stable_pr_branch(base_ref: str, failure_command: str) -> str:
+              branch_scope = slugify_branch_segment(base_ref, "default", 24)
+              command_scope = slugify_branch_segment(failure_command, "repair", 28)
+              fingerprint = hashlib.sha1(
+                  f"{base_ref}\n{failure_command}".encode("utf-8")
+              ).hexdigest()[:12]
+              return f"mercury/repair/{branch_scope}/{command_scope}-{fingerprint}"
 
           def patch_mercury_config(config_path: Path, failure_command: str, lint_command: str | None) -> None:
               text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
@@ -287,8 +305,7 @@ jobs:
                   else:
                       base_ref = default_branch
 
-              run_suffix = source_sha[:12]
-              pr_branch = f"mercury/repair/{run_suffix}-{run_key}"
+              pr_branch = stable_pr_branch(base_ref=base_ref, failure_command=failure_command)
               pr_title = f"Mercury repair: make `{failure_command}` pass"
               if len(pr_title) > 120:
                   pr_title = pr_title[:117] + "..."

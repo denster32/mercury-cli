@@ -29,9 +29,10 @@ Composed shell commands (`&&`, pipes, redirection, shell wrappers like `make tes
 
 ### Live Observability
 
-`mercury-cli status --live` provides a terminal-streaming summary dashboard for heatmap, agent, and budget views with configurable refresh (`--interval-ms`).
+`mercury-cli status --live` provides candidate-level runtime observability with configurable refresh (`--interval-ms`).
 
-It is not yet a candidate-level event stream or conflict-alert console.
+- In a TTY it renders the existing heatmap/agent/budget dashboard and appends a rolling live-event pane for candidate launches, status changes, phase activation, and runtime-state updates.
+- When stdout is piped, it emits the same redacted runtime feed as JSONL so CI and local tooling can inspect candidate/phase/runtime events without scraping the terminal dashboard.
 
 For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI workflow invokes `fix --noninteractive`.
 
@@ -44,7 +45,7 @@ For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI 
 3. Mercury repair attempt (`fix`)
 4. post-repair verifier rerun
 5. evidence bundle validation and upload
-6. draft PR creation/update only when repair is verified, `dry_run != true`, and the workflow can push to the same repository with required permissions
+6. draft PR creation/update only when repair is verified, `dry_run != true`, and the workflow can push to the same repository with required permissions; verified reruns targeting the same base ref and failure command reuse the same repair branch/PR head
 7. final workflow status is blocking for orchestration failures (`baseline_not_reproduced`, `missing_api_key`, `setup_failed`, `internal_error`) even though artifacts are still uploaded
 
 ## Safety Model
@@ -110,11 +111,11 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 ## Known 1.0.0-beta.1 Limits
 
 - Local `watch --repair` remains Rust-only.
-- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but the repo does not yet publish benchmark-backed speedup claims or broad overlapping-edit convergence claims from that setting.
+- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout. The repo now publishes scoped Rust benchmark speedup data under `docs/benchmarks/`, but it still does not claim broad overlapping-edit convergence from that setting.
 - TypeScript support is intentionally scoped: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited; this is not parity with the Rust repair surface.
-- Live observability is summary-oriented today, not a full per-candidate trace or conflict-telemetry surface.
+- Live observability now exposes candidate/phase/runtime events, but it is still not a full conflict-telemetry or merge-decision explanation surface.
 - CI automation is draft-PR oriented, not autonomous merge.
-- Public benchmark reporting is still behind corpus/harness readiness. When published, checked-in reports will live under `docs/benchmarks/` and be emitted by a dedicated repair benchmark workflow.
+- Public benchmark reporting now exists under `docs/benchmarks/` for the selected Rust corpus, emitted by the dedicated repair benchmark workflow and publisher. Those checked-in numbers are bounded to the exact run ids and corpus selection documented there.
 - TypeScript harness fixtures currently validate deterministic expected-red script outputs; this is useful for corpus/reporter contract checks but not a replacement for full benchmark-backed repair reporting.
 
 ## Relationship to Case Studies

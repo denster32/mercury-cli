@@ -135,6 +135,8 @@ Inspect the uploaded artifact bundle first. The workflow only attempts the PR st
 
 If `decision.json` shows `repair_verified=true` and you ran with `dry_run=false`, the workflow will attempt to push `pr_branch` and then open or update a draft PR using the generated `pr-body.md`. The PR body includes the run artifact URL.
 
+Repeated verified reruns that target the same base ref and failure command reuse that same repair branch/PR head, so reviewers do not have to chase a new draft PR for every successful retry.
+
 If you used `dry_run=true`, no branch push or PR mutation occurs; use the uploaded artifact bundle for review-only triage.
 
 If the workflow ran in a context that cannot push back to the repository or mutate PRs, keep the uploaded artifact bundle and fall back to the manual PR path below.

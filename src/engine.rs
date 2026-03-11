@@ -241,12 +241,26 @@ impl<E: MercuryEditApi> Patcher<E> {
         file_content: &str,
         edit_history: &str,
     ) -> Result<(String, ApiUsage), EngineError> {
+        self.next_edit_with_context(current_file_path, file_content, "", "", "", edit_history)
+            .await
+    }
+
+    /// Predict the next edit with explicit code focus, cursor, and recent snippets.
+    pub async fn next_edit_with_context(
+        &self,
+        current_file_path: &str,
+        file_content: &str,
+        code_to_edit: &str,
+        cursor: &str,
+        recent_snippets: &str,
+        edit_history: &str,
+    ) -> Result<(String, ApiUsage), EngineError> {
         use crate::api::NextEditPayload;
         let payload = NextEditPayload {
             file_content: file_content.to_string(),
-            code_to_edit: String::new(),
-            cursor: String::new(),
-            recent_snippets: String::new(),
+            code_to_edit: code_to_edit.to_string(),
+            cursor: cursor.to_string(),
+            recent_snippets: recent_snippets.to_string(),
             edit_history: edit_history.to_string(),
         };
         let (result, usage) = self

@@ -3,7 +3,8 @@
 //! Uses Inception Labs' Mercury 2 with thermal heat maps as a stigmergic
 //! coordination primitive for multi-agent code editing.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
@@ -11,12 +12,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use chrono::Utc;
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use toml_edit::{value as toml_value, DocumentMut, Item, Table};
 
 use mercury_cli::api::{self, Mercury2Client, MercuryEditClient};
 use mercury_cli::db::{self, ThermalDb};
@@ -251,7 +253,7 @@ enum Commands {
         /// Render the thermal heatmap.
         #[arg(long)]
         heatmap: bool,
-        /// Stream status updates continuously in a TTY until Ctrl-C.
+        /// Stream live status in a TTY dashboard or JSONL event feed until Ctrl-C.
         #[arg(long)]
         live: bool,
         /// Live refresh interval in milliseconds.
@@ -316,13 +318,13 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum EditAction {
-    /// Apply an instruction-based edit to a file.
+    /// Apply a concrete replacement snippet or patch to a file.
     Apply {
         /// The file to edit.
         file: PathBuf,
-        /// The edit instruction.
-        #[arg(long)]
-        instruction: String,
+        /// Concrete replacement code or patch content for Mercury Edit apply.
+        #[arg(long = "update-snippet")]
+        update_snippet: String,
         /// Dry run — show diff without writing.
         #[arg(long)]
         dry_run: bool,
@@ -335,7 +337,7 @@ enum EditAction {
         /// File and optional line (file.rs:42).
         file: String,
     },
-    /// Predict the next edit based on history.
+    /// Predict the next edit based on file content and cursor context.
     Next {
         /// File and optional line (file.rs:42).
         file: String,
@@ -359,6 +361,63 @@ enum ConfigAction {
     /// Validate the current configuration.
     Validate,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigValueKind {
+    String,
+    Bool,
+    Integer,
+    Float,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NextEditCliContext {
+    current_file_path: String,
+    code_to_edit: String,
+    cursor: String,
+    recent_snippets: String,
+}
+
+const SUPPORTED_CONFIG_KEYS: &[(&str, ConfigValueKind)] = &[
+    ("api.mercury2_endpoint", ConfigValueKind::String),
+    ("api.mercury_edit_endpoint", ConfigValueKind::String),
+    ("api.api_key_env", ConfigValueKind::String),
+    ("scheduler.max_concurrency", ConfigValueKind::Integer),
+    ("scheduler.max_cost_per_command", ConfigValueKind::Float),
+    ("scheduler.max_agents_per_command", ConfigValueKind::Integer),
+    ("scheduler.retry_limit", ConfigValueKind::Integer),
+    ("scheduler.backoff_base_ms", ConfigValueKind::Integer),
+    ("thermal.decay_half_life_seconds", ConfigValueKind::Float),
+    ("thermal.aggregation_method", ConfigValueKind::String),
+    ("thermal.rescan_on_git_pull", ConfigValueKind::Bool),
+    ("thermal.hot_threshold", ConfigValueKind::Float),
+    ("thermal.cool_threshold", ConfigValueKind::Float),
+    ("thermal.lock_cool_zones", ConfigValueKind::Bool),
+    ("annealing.enable_global_momentum", ConfigValueKind::Bool),
+    ("annealing.initial_temperature", ConfigValueKind::Float),
+    ("annealing.cooling_rate", ConfigValueKind::Float),
+    (
+        "annealing.min_modification_threshold",
+        ConfigValueKind::Float,
+    ),
+    ("verification.parse_before_write", ConfigValueKind::Bool),
+    ("verification.test_after_write", ConfigValueKind::Bool),
+    ("verification.lint_after_write", ConfigValueKind::Bool),
+    (
+        "verification.mercury2_critique_on_failure",
+        ConfigValueKind::Bool,
+    ),
+    ("verification.test_command", ConfigValueKind::String),
+    ("verification.lint_command", ConfigValueKind::String),
+    ("repo.languages.rust", ConfigValueKind::Bool),
+    ("repo.languages.python", ConfigValueKind::Bool),
+    ("repo.languages.typescript", ConfigValueKind::Bool),
+    ("repo.languages.go", ConfigValueKind::Bool),
+    ("repo.languages.java", ConfigValueKind::Bool),
+    ("constitutional.style_guide", ConfigValueKind::String),
+    ("constitutional.architecture_rules", ConfigValueKind::String),
+    ("constitutional.naming_conventions", ConfigValueKind::String),
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -566,6 +625,531 @@ fn write_audit_event(artifact_root: &Path, event: &str, details: serde_json::Val
     Ok(())
 }
 
+const LIVE_EVENT_BACKLOG_LIMIT: usize = 8;
+const LIVE_EVENT_BUFFER_LIMIT: usize = 14;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveRenderMode {
+    Terminal,
+    JsonStream,
+}
+
+impl LiveRenderMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "tty",
+            Self::JsonStream => "jsonl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct CandidateRuntimeMetadata {
+    phase: Option<String>,
+    source_lineage: Option<String>,
+    retry_count: Option<u64>,
+    outcome: Option<String>,
+    reason: Option<String>,
+    failure_stage: Option<String>,
+    sandbox_root: Option<String>,
+    fanout: Option<u64>,
+    temperature: Option<f64>,
+    touched_lines: Option<u64>,
+    byte_delta: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CandidateLiveState {
+    log_id: i64,
+    agent_id: String,
+    file_path: String,
+    command: String,
+    status: String,
+    started_at: String,
+    completed_at: Option<String>,
+    tokens_used: i64,
+    cost_usd: f64,
+    metadata: CandidateRuntimeMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RuntimeOverview {
+    active_agents: i64,
+    total_agents_spawned: i64,
+    total_tokens_used: i64,
+    total_cost_usd: f64,
+    global_temperature: f64,
+    iteration_count: i64,
+    hottest_file: Option<String>,
+    hottest_score: Option<f64>,
+    max_agent_density: i32,
+    locked_files: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LiveStatusSnapshot {
+    logs_by_id: BTreeMap<i64, CandidateLiveState>,
+    ordered_log_ids: Vec<i64>,
+    phase_counts: BTreeMap<String, usize>,
+    active_phase_counts: BTreeMap<String, usize>,
+    runtime: RuntimeOverview,
+}
+
+#[derive(Debug, Clone)]
+struct LiveStatusEvent {
+    event: &'static str,
+    details: Value,
+}
+
+fn phase_from_command(command: &str) -> Option<String> {
+    command
+        .split_once(':')
+        .map(|(_, phase)| phase.trim().to_string())
+        .filter(|phase| !phase.is_empty())
+}
+
+fn parse_candidate_runtime_metadata(entry: &db::AgentLogEntry) -> CandidateRuntimeMetadata {
+    let mut metadata = CandidateRuntimeMetadata {
+        phase: phase_from_command(&entry.command),
+        ..CandidateRuntimeMetadata::default()
+    };
+
+    let Some(raw) = entry.micro_heatmap.as_deref() else {
+        return metadata;
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw) else {
+        return metadata;
+    };
+
+    let string_field = |key: &str| {
+        map.get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .filter(|value| !value.is_empty())
+    };
+    let u64_field = |key: &str| map.get(key).and_then(Value::as_u64);
+    let i64_field = |key: &str| map.get(key).and_then(Value::as_i64);
+    let f64_field = |key: &str| map.get(key).and_then(Value::as_f64);
+
+    metadata.phase = string_field("phase").or(metadata.phase);
+    metadata.source_lineage = string_field("candidate_source");
+    metadata.retry_count = u64_field("retry_attempts");
+    metadata.outcome = string_field("outcome");
+    metadata.reason = string_field("reason");
+    metadata.failure_stage = string_field("failure_stage");
+    metadata.sandbox_root = string_field("sandbox_root");
+    metadata.fanout = u64_field("fanout");
+    metadata.temperature = f64_field("temperature");
+    metadata.touched_lines = u64_field("touched_lines");
+    metadata.byte_delta = i64_field("byte_delta");
+    metadata
+}
+
+fn build_candidate_live_state(entry: &db::AgentLogEntry) -> CandidateLiveState {
+    CandidateLiveState {
+        log_id: entry.id,
+        agent_id: entry.agent_id.clone(),
+        file_path: entry.file_path.clone(),
+        command: entry.command.clone(),
+        status: entry.status.clone(),
+        started_at: entry.started_at.clone(),
+        completed_at: entry.completed_at.clone(),
+        tokens_used: entry.tokens_used,
+        cost_usd: entry.cost_usd,
+        metadata: parse_candidate_runtime_metadata(entry),
+    }
+}
+
+fn build_runtime_overview(
+    aggregates: &[db::ThermalAggregate],
+    active_agents: &[db::AgentLogEntry],
+    logs: &[db::AgentLogEntry],
+    state: Option<&db::SwarmState>,
+) -> RuntimeOverview {
+    let hottest = aggregates.iter().max_by(|left, right| {
+        left.composite_score
+            .partial_cmp(&right.composite_score)
+            .unwrap_or(Ordering::Equal)
+    });
+    let total_tokens_from_logs: i64 = logs.iter().map(|entry| entry.tokens_used).sum();
+    let total_cost_from_logs: f64 = logs.iter().map(|entry| entry.cost_usd).sum();
+
+    RuntimeOverview {
+        active_agents: active_agents.len() as i64,
+        total_agents_spawned: state
+            .map(|value| value.total_agents_spawned)
+            .unwrap_or(logs.len() as i64),
+        total_tokens_used: state
+            .map(|value| value.total_tokens_used)
+            .unwrap_or(total_tokens_from_logs),
+        total_cost_usd: state
+            .map(|value| value.total_cost_usd)
+            .unwrap_or(total_cost_from_logs),
+        global_temperature: state.map(|value| value.global_temperature).unwrap_or(0.0),
+        iteration_count: state.map(|value| value.iteration_count).unwrap_or(0),
+        hottest_file: hottest.map(|aggregate| aggregate.file_path.clone()),
+        hottest_score: hottest.map(|aggregate| aggregate.composite_score),
+        max_agent_density: aggregates
+            .iter()
+            .map(|aggregate| aggregate.agent_density)
+            .max()
+            .unwrap_or_default(),
+        locked_files: aggregates
+            .iter()
+            .filter(|aggregate| aggregate.is_locked)
+            .count(),
+    }
+}
+
+fn build_live_status_snapshot(
+    aggregates: &[db::ThermalAggregate],
+    active_agents: &[db::AgentLogEntry],
+    logs: &[db::AgentLogEntry],
+    state: Option<&db::SwarmState>,
+) -> LiveStatusSnapshot {
+    let mut logs_by_id = BTreeMap::new();
+    let mut ordered = logs
+        .iter()
+        .map(|entry| (entry.id, entry.started_at.clone()))
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+
+    let mut phase_counts = BTreeMap::new();
+    let mut active_phase_counts = BTreeMap::new();
+    for entry in logs {
+        let state = build_candidate_live_state(entry);
+        if let Some(phase) = state.metadata.phase.as_ref() {
+            *phase_counts.entry(phase.clone()).or_default() += 1;
+            if matches!(state.status.as_str(), "spawned" | "running" | "retrying") {
+                *active_phase_counts.entry(phase.clone()).or_default() += 1;
+            }
+        }
+        logs_by_id.insert(state.log_id, state);
+    }
+
+    LiveStatusSnapshot {
+        logs_by_id,
+        ordered_log_ids: ordered.into_iter().map(|(id, _)| id).collect(),
+        phase_counts,
+        active_phase_counts,
+        runtime: build_runtime_overview(aggregates, active_agents, logs, state),
+    }
+}
+
+fn candidate_verification_result(state: &CandidateLiveState) -> &'static str {
+    if state.status == "success" {
+        return "passed";
+    }
+    if state.metadata.failure_stage.as_deref() == Some("verification") {
+        return "failed";
+    }
+    if matches!(
+        state.metadata.reason.as_deref(),
+        Some("duplicate verified candidate output" | "lower-ranked competing candidate")
+    ) {
+        return "passed_not_selected";
+    }
+    match state.status.as_str() {
+        "retrying" => "retrying",
+        "spawned" | "running" => "pending",
+        _ => "not_reached",
+    }
+}
+
+fn candidate_event_details(
+    state: &CandidateLiveState,
+    transition: &str,
+    backlog: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "transition": transition,
+        "backlog": backlog,
+        "log_id": state.log_id,
+        "agent_id": state.agent_id,
+        "file_path": state.file_path,
+        "status": state.status,
+        "phase": state.metadata.phase,
+        "source_lineage": state.metadata.source_lineage,
+        "retry_count": state.metadata.retry_count,
+        "outcome": state.metadata.outcome,
+        "verification_result": candidate_verification_result(state),
+        "reason": state.metadata.reason,
+        "failure_stage": state.metadata.failure_stage,
+        "sandbox_root": state.metadata.sandbox_root,
+        "fanout": state.metadata.fanout,
+        "temperature": state.metadata.temperature,
+        "touched_lines": state.metadata.touched_lines,
+        "byte_delta": state.metadata.byte_delta,
+        "tokens_used": state.tokens_used,
+        "cost_usd": state.cost_usd,
+        "started_at": state.started_at,
+        "completed_at": state.completed_at,
+    })
+}
+
+fn phase_started_event(
+    phase: &str,
+    observed_candidates: usize,
+    active_candidates: usize,
+    backlog: bool,
+) -> LiveStatusEvent {
+    LiveStatusEvent {
+        event: "phase_started",
+        details: serde_json::json!({
+            "phase": phase,
+            "observed_candidates": observed_candidates,
+            "active_candidates": active_candidates,
+            "backlog": backlog,
+        }),
+    }
+}
+
+fn runtime_state_event(runtime: &RuntimeOverview, backlog: bool) -> LiveStatusEvent {
+    LiveStatusEvent {
+        event: "runtime_state",
+        details: serde_json::json!({
+            "active_agents": runtime.active_agents,
+            "total_agents_spawned": runtime.total_agents_spawned,
+            "total_tokens_used": runtime.total_tokens_used,
+            "total_cost_usd": runtime.total_cost_usd,
+            "global_temperature": runtime.global_temperature,
+            "iteration_count": runtime.iteration_count,
+            "hottest_file": runtime.hottest_file,
+            "hottest_score": runtime.hottest_score,
+            "max_agent_density": runtime.max_agent_density,
+            "locked_files": runtime.locked_files,
+            "backlog": backlog,
+        }),
+    }
+}
+
+fn initial_live_status_events(
+    snapshot: &LiveStatusSnapshot,
+    render_mode: LiveRenderMode,
+    interval_ms: u64,
+) -> Vec<LiveStatusEvent> {
+    let mut events = vec![LiveStatusEvent {
+        event: "live_attached",
+        details: serde_json::json!({
+            "mode": render_mode.as_str(),
+            "interval_ms": interval_ms,
+        }),
+    }];
+
+    for (phase, observed) in &snapshot.phase_counts {
+        events.push(phase_started_event(
+            phase,
+            *observed,
+            snapshot
+                .active_phase_counts
+                .get(phase)
+                .copied()
+                .unwrap_or_default(),
+            true,
+        ));
+    }
+
+    let backlog_ids = snapshot
+        .ordered_log_ids
+        .iter()
+        .rev()
+        .take(LIVE_EVENT_BACKLOG_LIMIT)
+        .copied()
+        .collect::<Vec<_>>();
+    for log_id in backlog_ids.into_iter().rev() {
+        if let Some(state) = snapshot.logs_by_id.get(&log_id) {
+            events.push(LiveStatusEvent {
+                event: "candidate_event",
+                details: candidate_event_details(state, "observed", true),
+            });
+        }
+    }
+
+    events.push(runtime_state_event(&snapshot.runtime, true));
+    events
+}
+
+fn diff_live_status_events(
+    previous: &LiveStatusSnapshot,
+    current: &LiveStatusSnapshot,
+) -> Vec<LiveStatusEvent> {
+    let mut events = Vec::new();
+
+    for (phase, observed) in &current.phase_counts {
+        if !previous.phase_counts.contains_key(phase) {
+            events.push(phase_started_event(
+                phase,
+                *observed,
+                current
+                    .active_phase_counts
+                    .get(phase)
+                    .copied()
+                    .unwrap_or_default(),
+                false,
+            ));
+        }
+    }
+
+    for log_id in &current.ordered_log_ids {
+        let Some(state) = current.logs_by_id.get(log_id) else {
+            continue;
+        };
+        match previous.logs_by_id.get(log_id) {
+            None => events.push(LiveStatusEvent {
+                event: "candidate_event",
+                details: candidate_event_details(state, "launched", false),
+            }),
+            Some(previous_state) if previous_state.status != state.status => {
+                events.push(LiveStatusEvent {
+                    event: "candidate_event",
+                    details: candidate_event_details(state, "status_changed", false),
+                })
+            }
+            Some(previous_state) if previous_state != state => events.push(LiveStatusEvent {
+                event: "candidate_event",
+                details: candidate_event_details(state, "metadata_updated", false),
+            }),
+            Some(_) => {}
+        }
+    }
+
+    if previous.runtime != current.runtime {
+        events.push(runtime_state_event(&current.runtime, false));
+    }
+
+    events
+}
+
+fn push_live_event_line(buffer: &mut VecDeque<String>, line: String) {
+    buffer.push_back(line);
+    while buffer.len() > LIVE_EVENT_BUFFER_LIMIT {
+        buffer.pop_front();
+    }
+}
+
+fn value_string<'a>(details: &'a Value, key: &str) -> Option<&'a str> {
+    details.get(key).and_then(Value::as_str)
+}
+
+fn value_u64(details: &Value, key: &str) -> Option<u64> {
+    details.get(key).and_then(Value::as_u64)
+}
+
+fn value_i64(details: &Value, key: &str) -> Option<i64> {
+    details.get(key).and_then(Value::as_i64)
+}
+
+fn value_f64(details: &Value, key: &str) -> Option<f64> {
+    details.get(key).and_then(Value::as_f64)
+}
+
+fn format_live_event_line(event: &LiveStatusEvent) -> String {
+    let now = Utc::now().format("%H:%M:%S");
+    let details = &event.details;
+    match event.event {
+        "live_attached" => format!(
+            "[{now}] live attached | mode={} | refresh={}ms",
+            value_string(details, "mode").unwrap_or("unknown"),
+            value_u64(details, "interval_ms").unwrap_or_default()
+        ),
+        "phase_started" => format!(
+            "[{now}] phase {} | observed={} | active={}",
+            value_string(details, "phase").unwrap_or("unknown"),
+            value_u64(details, "observed_candidates").unwrap_or_default(),
+            value_u64(details, "active_candidates").unwrap_or_default()
+        ),
+        "runtime_state" => {
+            let hot = match (
+                value_string(details, "hottest_file"),
+                value_f64(details, "hottest_score"),
+            ) {
+                (Some(file), Some(score)) => format!(" | hottest={file}@{score:.2}"),
+                (Some(file), None) => format!(" | hottest={file}"),
+                _ => String::new(),
+            };
+            format!(
+                "[{now}] runtime | active={} | total={} | tokens={} | cost=${:.4} | temp={:.2} | iter={} | density={} | locks={}{}",
+                value_i64(details, "active_agents").unwrap_or_default(),
+                value_i64(details, "total_agents_spawned").unwrap_or_default(),
+                value_i64(details, "total_tokens_used").unwrap_or_default(),
+                value_f64(details, "total_cost_usd").unwrap_or_default(),
+                value_f64(details, "global_temperature").unwrap_or_default(),
+                value_i64(details, "iteration_count").unwrap_or_default(),
+                value_i64(details, "max_agent_density").unwrap_or_default(),
+                value_u64(details, "locked_files").unwrap_or_default(),
+                hot
+            )
+        }
+        "candidate_event" => {
+            let mut parts = vec![format!(
+                "[{now}] {} | {} | {}",
+                value_string(details, "transition").unwrap_or("observed"),
+                value_string(details, "phase").unwrap_or("unknown"),
+                value_string(details, "agent_id").unwrap_or("unknown-agent")
+            )];
+            parts.push(format!(
+                "{} | {}",
+                value_string(details, "status").unwrap_or("unknown"),
+                value_string(details, "file_path").unwrap_or("unknown-file")
+            ));
+            if let Some(source) = value_string(details, "source_lineage") {
+                parts.push(format!("source={source}"));
+            }
+            if let Some(retry_count) = value_u64(details, "retry_count") {
+                if retry_count > 0 {
+                    parts.push(format!("retry={retry_count}"));
+                }
+            }
+            if let Some(outcome) = value_string(details, "outcome") {
+                parts.push(format!("outcome={outcome}"));
+            }
+            if let Some(result) = value_string(details, "verification_result") {
+                parts.push(format!("verify={result}"));
+            }
+            if let Some(reason) = value_string(details, "reason") {
+                parts.push(format!("reason={reason}"));
+            }
+            if let Some(touched_lines) = value_u64(details, "touched_lines") {
+                parts.push(format!("lines={touched_lines}"));
+            }
+            if let Some(byte_delta) = value_i64(details, "byte_delta") {
+                parts.push(format!("bytes={byte_delta:+}"));
+            }
+            parts.push(format!(
+                "tokens={}",
+                value_i64(details, "tokens_used").unwrap_or_default()
+            ));
+            parts.push(format!(
+                "cost=${:.4}",
+                value_f64(details, "cost_usd").unwrap_or_default()
+            ));
+            parts.join(" | ")
+        }
+        other => format!("[{now}] {other}"),
+    }
+}
+
+fn emit_live_status_events(
+    events: &[LiveStatusEvent],
+    render_mode: LiveRenderMode,
+    buffer: &mut VecDeque<String>,
+) {
+    for event in events {
+        match render_mode {
+            LiveRenderMode::Terminal => push_live_event_line(buffer, format_live_event_line(event)),
+            LiveRenderMode::JsonStream => {
+                match serde_json::to_string(&event_payload(event.event, event.details.clone())) {
+                    Ok(line) => println!("{line}"),
+                    Err(err) => eprintln!(
+                        "failed to serialize live status event {}: {err}",
+                        event.event
+                    ),
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Command handlers
 // ---------------------------------------------------------------------------
@@ -653,9 +1237,11 @@ fn cmd_status_live(
     budget: bool,
     interval_ms: u64,
 ) -> Result<()> {
-    if !std::io::stdout().is_terminal() {
-        anyhow::bail!("`status --live` requires a TTY terminal");
-    }
+    let render_mode = if std::io::stdout().is_terminal() {
+        LiveRenderMode::Terminal
+    } else {
+        LiveRenderMode::JsonStream
+    };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -663,55 +1249,99 @@ fn cmd_status_live(
         .context("failed to initialize runtime for live status")?;
 
     runtime.block_on(async {
+        let mut previous_snapshot: Option<LiveStatusSnapshot> = None;
+        let mut event_buffer = VecDeque::new();
+
         loop {
             let aggregates = db.get_all_aggregates()?;
             let active = db.get_active_agents()?;
+            let agent_logs = db.get_agent_logs()?;
             let state = db.get_swarm_state()?;
+            let snapshot =
+                build_live_status_snapshot(&aggregates, &active, &agent_logs, state.as_ref());
+            let events = match previous_snapshot.as_ref() {
+                Some(previous) => diff_live_status_events(previous, &snapshot),
+                None => initial_live_status_events(&snapshot, render_mode, interval_ms),
+            };
+            emit_live_status_events(&events, render_mode, &mut event_buffer);
+            previous_snapshot = Some(snapshot.clone());
 
-            print!("\x1B[2J\x1B[H");
-            println!(
-                "Mercury live status  |  {}  |  refresh={}ms  |  ctrl-c to stop\n",
-                Utc::now().to_rfc3339(),
-                interval_ms
-            );
+            if render_mode == LiveRenderMode::Terminal {
+                print!("\x1B[2J\x1B[H");
+                println!(
+                    "Mercury live status  |  {}  |  refresh={}ms  |  mode={}  |  ctrl-c to stop\n",
+                    Utc::now().to_rfc3339(),
+                    interval_ms,
+                    render_mode.as_str()
+                );
 
-            if heatmap || (!agents && !budget) {
-                println!("{}", render_heatmap_to_string(&aggregates, &active));
-            }
+                if heatmap || (!agents && !budget) {
+                    println!("{}", render_heatmap_to_string(&aggregates, &active));
+                }
 
-            if agents {
-                if active.is_empty() {
-                    println!("\nActive Agents: 0");
-                } else {
-                    println!("\nActive Agents ({}):", active.len());
-                    for agent in active.iter().take(12) {
-                        println!(
-                            "  {} | {} | {} | {}",
-                            agent.agent_id, agent.file_path, agent.status, agent.started_at
-                        );
-                    }
-                    if active.len() > 12 {
-                        println!("  ... {} more", active.len() - 12);
+                if agents {
+                    if active.is_empty() {
+                        println!("\nActive Agents: 0");
+                    } else {
+                        println!("\nActive Agents ({}):", active.len());
+                        for agent in active.iter().take(12) {
+                            println!(
+                                "  {} | {} | {} | {}",
+                                agent.agent_id, agent.file_path, agent.status, agent.started_at
+                            );
+                        }
+                        if active.len() > 12 {
+                            println!("  ... {} more", active.len() - 12);
+                        }
                     }
                 }
-            }
 
-            if budget {
-                if let Some(state) = state {
+                if budget {
                     println!("\nBudget:");
-                    println!("  Total cost: ${:.4}", state.total_cost_usd);
-                    println!("  Total tokens: {}", state.total_tokens_used);
-                    println!("  Agents spawned: {}", state.total_agents_spawned);
-                    println!("  Temperature: {:.2}", state.global_temperature);
-                    println!("  Iteration: {}", state.iteration_count);
+                    println!("  Total cost: ${:.4}", snapshot.runtime.total_cost_usd);
+                    println!("  Total tokens: {}", snapshot.runtime.total_tokens_used);
+                    println!(
+                        "  Agents spawned: {}",
+                        snapshot.runtime.total_agents_spawned
+                    );
+                    println!("  Active agents: {}", snapshot.runtime.active_agents);
+                    println!("  Temperature: {:.2}", snapshot.runtime.global_temperature);
+                    println!("  Iteration: {}", snapshot.runtime.iteration_count);
+                    if state.is_none() {
+                        println!("  Source: derived from persisted agent logs");
+                    }
+                }
+
+                println!("\nLive Events (latest {}):", LIVE_EVENT_BUFFER_LIMIT);
+                if event_buffer.is_empty() {
+                    println!("  No candidate/runtime events observed yet.");
                 } else {
-                    println!("\nBudget:\n  No swarm session active.");
+                    for line in &event_buffer {
+                        println!("  {line}");
+                    }
                 }
             }
 
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    println!("\nStopping live status.");
+                    match render_mode {
+                        LiveRenderMode::Terminal => println!("\nStopping live status."),
+                        LiveRenderMode::JsonStream => {
+                            let stop_event = LiveStatusEvent {
+                                event: "live_stopped",
+                                details: serde_json::json!({
+                                    "mode": render_mode.as_str(),
+                                    "reason": "ctrl_c",
+                                    "interval_ms": interval_ms,
+                                }),
+                            };
+                            emit_live_status_events(
+                                &[stop_event],
+                                render_mode,
+                                &mut event_buffer,
+                            );
+                        }
+                    }
                     break Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -959,9 +1589,30 @@ async fn cmd_fix_with_verify_config(
     let artifact_root = create_run_artifact_root(project_root)?;
     let description_redacted = redact_secrets(description);
     let start_security = security_runtime_context(noninteractive, None);
+    let benchmark_verifier = FixBenchmarkVerifier {
+        parse_before_write: verify_config.parse_before_write,
+        test_after_write: verify_config.test_after_write,
+        lint_after_write: verify_config.lint_after_write,
+        test_command: redact_secrets(&verify_config.test_command),
+        lint_command: redact_secrets(&verify_config.lint_command),
+    };
 
     if let Err(err) = enforce_verifier_allowlist(&verify_config) {
         let error = redact_secrets(&err.to_string());
+        let finished_at = Utc::now();
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let _ = write_fix_failure_artifacts(
+            &artifact_root,
+            &description_redacted,
+            max_agents,
+            max_cost,
+            started_at,
+            finished_at,
+            duration_ms,
+            "rejected_allowlist",
+            &benchmark_verifier,
+            &start_security,
+        );
         let _ = write_audit_event(
             &artifact_root,
             "fix_run_rejected_allowlist",
@@ -1014,385 +1665,426 @@ async fn cmd_fix_with_verify_config(
         println!();
     }
 
-    // Step 1: Init swarm session
-    let _swarm_id = db.init_swarm()?;
+    let run: Result<FixCommandOutcome> = async {
+        // Step 1: Init swarm session
+        let _swarm_id = db.init_swarm()?;
 
-    // Step 2: Index
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "index_repository",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[1/7] Indexing repository...");
-    }
-    let repo_languages = config.repo_languages();
-    let repo_map =
-        repo::build_repo_map_with_languages(&project_root.to_string_lossy(), &repo_languages)?;
-    let repo_map_str = repo::format_repo_map(&repo_map);
-
-    // Step 3: Plan
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "plan_repair",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[2/7] Planning with Mercury 2...");
-        println!("  Grounding repair context...");
-    }
-    let api_key = api::resolve_api_key(&config.api.api_key_env)?;
-    let grounding_client = Mercury2Client::new(api_key.clone())
-        .with_base_url(config.api.mercury2_endpoint.clone())
-        .with_retries(
-            config.scheduler.retry_limit,
-            config.scheduler.backoff_base_ms,
+        // Step 2: Index
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "index_repository",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
         );
-    let grounded_context = verification::gather_grounded_repair_context(
-        &grounding_client,
-        project_root,
-        &verify_config,
-        description,
-        parsed_failure,
-    )
-    .await?;
-    write_json_artifact(
-        &artifact_root.join("grounded-context.json"),
-        &grounded_context,
-    )?;
+        if !noninteractive {
+            println!("[1/7] Indexing repository...");
+        }
+        let repo_languages = config.repo_languages();
+        let repo_map =
+            repo::build_repo_map_with_languages(&project_root.to_string_lossy(), &repo_languages)?;
+        let repo_map_str = repo::format_repo_map(&repo_map);
 
-    let planner_description = format!("{description}\n\n{}", grounded_context.planner_brief());
-
-    let planner_client = Mercury2Client::new(api_key.clone())
-        .with_base_url(config.api.mercury2_endpoint.clone())
-        .with_retries(
-            config.scheduler.retry_limit,
-            config.scheduler.backoff_base_ms,
+        // Step 3: Plan
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "plan_repair",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
         );
-
-    let planner = engine::Planner::new(planner_client, config.constitutional_prompt());
-    let (plan, assessments) = planner.plan(&planner_description, &repo_map_str).await?;
-    if !noninteractive {
-        println!(
-            "  Plan estimate: ${:.4}{}",
-            plan.estimated_cost,
-            plan.estimated_tokens
-                .map(|tokens| format!(" | tokens: {tokens}"))
-                .unwrap_or_default()
-        );
-    }
-
-    store_assessments(db, &plan.steps, &assessments, "fix")?;
-    if !noninteractive {
-        print_assessment_summary(&plan.steps, &assessments);
-    }
-    write_audit_event(
-        &artifact_root,
-        "fix_plan_ready",
-        serde_json::json!({
-            "plan_steps": plan.steps.len(),
-            "estimated_cost_usd": plan.estimated_cost,
-            "estimated_tokens": plan.estimated_tokens,
-            "security": start_security.clone(),
-        }),
-    )?;
-    emit_runtime_event(
-        noninteractive,
-        "fix_plan_ready",
-        serde_json::json!({
-            "plan_steps": plan.steps.len(),
-            "estimated_cost_usd": plan.estimated_cost,
-            "estimated_tokens": plan.estimated_tokens,
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-
-    // Run initial merge
-    let mut sched_config = config.to_scheduler_config();
-    sched_config.max_cost_per_command = max_cost;
-    sched_config.max_concurrency = max_agents;
-    let scheduler = Scheduler::new(sched_config);
-    scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
-
-    // Step 4: Scaffold (cool zones)
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "scaffold_cool_zones",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[3/7] Scaffolding cool zones...");
-    }
-    let cool_zones = db.zones_below(config.thermal.cool_threshold)?;
-    if !noninteractive {
-        println!("  {} cool zone files identified", cool_zones.len());
-    }
-
-    // Step 5: Resolve (hot zones)
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "resolve_hot_zones",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[4/7] Resolving hot zones...");
-    }
-    let hot_zones = db.zones_above(config.thermal.hot_threshold)?;
-    if !noninteractive {
-        println!("  {} hot zone files identified", hot_zones.len());
-    }
-
-    // Step 6: Execute planned edits with verification gating
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "patch_and_verify",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[5/7] Patching and verifying plan steps...");
-    }
-    let edit_client =
-        MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
+        if !noninteractive {
+            println!("[2/7] Planning with Mercury 2...");
+            println!("  Grounding repair context...");
+        }
+        let api_key = api::resolve_api_key(&config.api.api_key_env)?;
+        let grounding_client = Mercury2Client::new(api_key.clone())
+            .with_base_url(config.api.mercury2_endpoint.clone())
             .with_retries(
                 config.scheduler.retry_limit,
                 config.scheduler.backoff_base_ms,
             );
-    let patcher = engine::Patcher::new(edit_client);
-
-    let verifier_client = Mercury2Client::new(api_key.clone())
-        .with_base_url(config.api.mercury2_endpoint.clone())
-        .with_retries(
-            config.scheduler.retry_limit,
-            config.scheduler.backoff_base_ms,
-        );
-    let verifier = Verifier::new(
-        verify_config.clone(),
-        if config.verification.mercury2_critique_on_failure {
-            Some(verifier_client)
-        } else {
-            None
-        },
-    );
-    let benchmark_verifier = FixBenchmarkVerifier {
-        parse_before_write: verify_config.parse_before_write,
-        test_after_write: verify_config.test_after_write,
-        lint_after_write: verify_config.lint_after_write,
-        test_command: redact_secrets(&verify_config.test_command),
-        lint_command: redact_secrets(&verify_config.lint_command),
-    };
-    let execution_summary: StepExecutionSummary =
-        engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
-            .await?;
-    let final_security =
-        security_runtime_context(noninteractive, execution_summary.run_root.as_deref());
-    write_audit_event(
-        &artifact_root,
-        "fix_execution_complete",
-        serde_json::json!({
-            "accepted_steps": execution_summary.accepted,
-            "rejected_steps": execution_summary.rejected,
-            "verification_failures": execution_summary.verification_failures,
-            "applied": execution_summary.applied,
-            "final_bundle_verified": execution_summary.final_bundle_verified,
-            "security": final_security.clone(),
-        }),
-    )?;
-    emit_runtime_event(
-        noninteractive,
-        "fix_execution_complete",
-        serde_json::json!({
-            "accepted_steps": execution_summary.accepted,
-            "rejected_steps": execution_summary.rejected,
-            "verification_failures": execution_summary.verification_failures,
-            "applied": execution_summary.applied,
-            "final_bundle_verified": execution_summary.final_bundle_verified,
-            "artifact_root": artifact_root.display().to_string(),
-            "security": final_security.clone(),
-        }),
-    );
-
-    // Step 7: Anneal + report
-    emit_runtime_event(
-        noninteractive,
-        "fix_stage",
-        serde_json::json!({
-            "stage": "anneal_and_report",
-            "artifact_root": artifact_root.display().to_string(),
-        }),
-    );
-    if !noninteractive {
-        println!("[6/7] Annealing...");
-    }
-    scheduler.run_decay_cycle(db, config.thermal.decay_half_life_seconds)?;
-    scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
-
-    if !noninteractive {
-        println!("[7/7] Complete!");
-    }
-
-    let aggregates = db.get_all_aggregates()?;
-    if !noninteractive && !aggregates.is_empty() {
-        let active = db.get_active_agents()?;
-        println!("\nFinal Thermal Map:");
-        println!("{}", render_heatmap_to_string(&aggregates, &active));
-    }
-
-    if !noninteractive {
-        println!("\nExecution summary:");
-        println!("  Accepted steps: {}", execution_summary.accepted);
-        println!("  Rejected steps: {}", execution_summary.rejected);
-        println!(
-            "  Verification failures: {}",
-            execution_summary.verification_failures
-        );
-
-        println!("\nCost: ${:.4}", scheduler.current_cost());
-        println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
-    }
-
-    let finished_at = Utc::now();
-    let duration_ms = started.elapsed().as_millis() as u64;
-    write_json_artifact(&artifact_root.join("plan.json"), &plan)?;
-    write_json_artifact(&artifact_root.join("assessments.json"), &assessments)?;
-    write_json_artifact(
-        &artifact_root.join("execution-summary.json"),
-        &execution_summary,
-    )?;
-    if let Some(final_verification) = execution_summary.final_verification.as_ref() {
+        let grounded_context = verification::gather_grounded_repair_context(
+            &grounding_client,
+            project_root,
+            &verify_config,
+            description,
+            parsed_failure,
+        )
+        .await?;
         write_json_artifact(
-            &artifact_root.join("final-verification.json"),
-            final_verification,
+            &artifact_root.join("grounded-context.json"),
+            &grounded_context,
         )?;
-    }
-    write_json_artifact(
-        &artifact_root.join("agent-logs.json"),
-        &db.get_agent_logs()?,
-    )?;
-    write_json_artifact(&artifact_root.join("thermal-aggregates.json"), &aggregates)?;
-    if let Some(state) = db.get_swarm_state()? {
-        write_json_artifact(&artifact_root.join("swarm-state.json"), &state)?;
-    }
-    let grounding_tool_calls = grounded_context
-        .rounds
-        .iter()
-        .map(|round| round.tool_calls.len())
-        .sum::<usize>();
-    let total_cost_usd =
-        scheduler.current_cost() + grounded_context.total_usage.cost_usd + plan.estimated_cost;
-    let budget_remaining_usd = (max_cost - total_cost_usd).max(0.0);
-    let sandbox_run_root = execution_summary
-        .run_root
-        .as_ref()
-        .map(|path| path.display().to_string());
-    write_json_artifact(
-        &artifact_root.join("metadata.json"),
-        &FixRunMetadata {
-            description: description_redacted.clone(),
-            max_agents,
-            max_cost,
-            started_at: started_at.to_rfc3339(),
-            finished_at: finished_at.to_rfc3339(),
-            duration_ms,
-            planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
-            grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
-            grounding_rounds: grounded_context.rounds.len(),
-            grounding_tool_calls,
-            grounding_collected: !grounded_context.summary.trim().is_empty()
-                || !grounded_context.rounds.is_empty(),
-            grounding_cost_usd: grounded_context.total_usage.cost_usd,
-            planner_estimated_cost_usd: plan.estimated_cost,
-            final_bundle_verified: execution_summary.final_bundle_verified,
-            applied: execution_summary.applied,
-            sandbox_run_root: sandbox_run_root.clone(),
-            total_cost_usd,
-            budget_remaining_usd,
-            security: final_security.clone(),
-        },
-    )?;
-    let diff_patch_path = artifact_root.join("diff.patch");
-    if let Some(run_root) = execution_summary.run_root.as_ref() {
-        copy_if_exists(&run_root.join("accepted.patch"), &diff_patch_path)?;
-    }
-    let accepted_patch_bytes = patch_size_bytes(&diff_patch_path)?;
-    let accepted_patch = accepted_patch_bytes.is_some_and(|len| len > 0);
-    write_json_artifact(
-        &artifact_root.join("benchmark-run.json"),
-        &FixBenchmarkRun {
-            schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
-            description: description_redacted.clone(),
-            started_at: started_at.to_rfc3339(),
-            finished_at: finished_at.to_rfc3339(),
-            duration_ms,
-            accepted_steps: execution_summary.accepted,
-            rejected_steps: execution_summary.rejected,
-            verification_failures: execution_summary.verification_failures,
-            retry_attempts: execution_summary.retry_attempts,
-            time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
-            time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
-            final_bundle_verified: execution_summary.final_bundle_verified,
-            applied: execution_summary.applied,
-            accepted_patch,
-            accepted_patch_bytes,
-            outcome: classify_fix_benchmark_outcome(
-                execution_summary.final_bundle_verified,
-                accepted_patch,
-            )
-            .to_string(),
-            false_green: false,
-            sandbox_run_root: sandbox_run_root.clone(),
-            total_cost_usd,
-            budget_remaining_usd,
-            verifier: benchmark_verifier,
-            security: final_security.clone(),
-        },
-    )?;
-    write_audit_event(
-        &artifact_root,
-        "fix_run_completed",
-        serde_json::json!({
-            "duration_ms": duration_ms,
-            "total_cost_usd": total_cost_usd,
-            "budget_remaining_usd": budget_remaining_usd,
-            "artifact_root": artifact_root.display().to_string(),
-            "security": final_security.clone(),
-        }),
-    )?;
-    emit_runtime_event(
-        noninteractive,
-        "fix_run_completed",
-        serde_json::json!({
-            "duration_ms": duration_ms,
-            "total_cost_usd": total_cost_usd,
-            "budget_remaining_usd": budget_remaining_usd,
-            "artifact_root": artifact_root.display().to_string(),
-            "security": final_security,
-        }),
-    );
-    if !noninteractive {
-        println!("Artifacts written to {}", artifact_root.display());
-    }
 
-    Ok(FixCommandOutcome {
-        artifact_root,
-        execution_summary,
-        total_cost_usd,
-        budget_remaining_usd,
-    })
+        let planner_description = format!("{description}\n\n{}", grounded_context.planner_brief());
+
+        let planner_client = Mercury2Client::new(api_key.clone())
+            .with_base_url(config.api.mercury2_endpoint.clone())
+            .with_retries(
+                config.scheduler.retry_limit,
+                config.scheduler.backoff_base_ms,
+            );
+
+        let planner = engine::Planner::new(planner_client, config.constitutional_prompt());
+        let (plan, assessments) = planner.plan(&planner_description, &repo_map_str).await?;
+        if !noninteractive {
+            println!(
+                "  Plan estimate: ${:.4}{}",
+                plan.estimated_cost,
+                plan.estimated_tokens
+                    .map(|tokens| format!(" | tokens: {tokens}"))
+                    .unwrap_or_default()
+            );
+        }
+
+        store_assessments(db, &plan.steps, &assessments, "fix")?;
+        if !noninteractive {
+            print_assessment_summary(&plan.steps, &assessments);
+        }
+        write_audit_event(
+            &artifact_root,
+            "fix_plan_ready",
+            serde_json::json!({
+                "plan_steps": plan.steps.len(),
+                "estimated_cost_usd": plan.estimated_cost,
+                "estimated_tokens": plan.estimated_tokens,
+                "security": start_security.clone(),
+            }),
+        )?;
+        emit_runtime_event(
+            noninteractive,
+            "fix_plan_ready",
+            serde_json::json!({
+                "plan_steps": plan.steps.len(),
+                "estimated_cost_usd": plan.estimated_cost,
+                "estimated_tokens": plan.estimated_tokens,
+                "artifact_root": artifact_root.display().to_string(),
+            }),
+        );
+
+        // Run initial merge
+        let mut sched_config = config.to_scheduler_config();
+        sched_config.max_cost_per_command = max_cost;
+        sched_config.max_concurrency = max_agents;
+        let scheduler = Scheduler::new(sched_config);
+        scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
+
+        // Step 4: Scaffold (cool zones)
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "scaffold_cool_zones",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
+        );
+        if !noninteractive {
+            println!("[3/7] Scaffolding cool zones...");
+        }
+        let cool_zones = db.zones_below(config.thermal.cool_threshold)?;
+        if !noninteractive {
+            println!("  {} cool zone files identified", cool_zones.len());
+        }
+
+        // Step 5: Resolve (hot zones)
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "resolve_hot_zones",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
+        );
+        if !noninteractive {
+            println!("[4/7] Resolving hot zones...");
+        }
+        let hot_zones = db.zones_above(config.thermal.hot_threshold)?;
+        if !noninteractive {
+            println!("  {} hot zone files identified", hot_zones.len());
+        }
+
+        // Step 6: Execute planned edits with verification gating
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "patch_and_verify",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
+        );
+        if !noninteractive {
+            println!("[5/7] Patching and verifying plan steps...");
+        }
+        let edit_client =
+            MercuryEditClient::new(api_key.clone(), config.api.mercury_edit_endpoint.clone())
+                .with_retries(
+                    config.scheduler.retry_limit,
+                    config.scheduler.backoff_base_ms,
+                );
+        let patcher = engine::Patcher::new(edit_client);
+
+        let verifier_client = Mercury2Client::new(api_key.clone())
+            .with_base_url(config.api.mercury2_endpoint.clone())
+            .with_retries(
+                config.scheduler.retry_limit,
+                config.scheduler.backoff_base_ms,
+            );
+        let verifier = Verifier::new(
+            verify_config.clone(),
+            if config.verification.mercury2_critique_on_failure {
+                Some(verifier_client)
+            } else {
+                None
+            },
+        );
+        let execution_summary: StepExecutionSummary =
+            engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
+                .await?;
+        let final_security =
+            security_runtime_context(noninteractive, execution_summary.run_root.as_deref());
+        write_audit_event(
+            &artifact_root,
+            "fix_execution_complete",
+            serde_json::json!({
+                "accepted_steps": execution_summary.accepted,
+                "rejected_steps": execution_summary.rejected,
+                "verification_failures": execution_summary.verification_failures,
+                "applied": execution_summary.applied,
+                "final_bundle_verified": execution_summary.final_bundle_verified,
+                "security": final_security.clone(),
+            }),
+        )?;
+        emit_runtime_event(
+            noninteractive,
+            "fix_execution_complete",
+            serde_json::json!({
+                "accepted_steps": execution_summary.accepted,
+                "rejected_steps": execution_summary.rejected,
+                "verification_failures": execution_summary.verification_failures,
+                "applied": execution_summary.applied,
+                "final_bundle_verified": execution_summary.final_bundle_verified,
+                "artifact_root": artifact_root.display().to_string(),
+                "security": final_security.clone(),
+            }),
+        );
+
+        // Step 7: Anneal + report
+        emit_runtime_event(
+            noninteractive,
+            "fix_stage",
+            serde_json::json!({
+                "stage": "anneal_and_report",
+                "artifact_root": artifact_root.display().to_string(),
+            }),
+        );
+        if !noninteractive {
+            println!("[6/7] Annealing...");
+        }
+        scheduler.run_decay_cycle(db, config.thermal.decay_half_life_seconds)?;
+        scheduler.run_merge_cycle(db, config.annealing.initial_temperature)?;
+
+        if !noninteractive {
+            println!("[7/7] Complete!");
+        }
+
+        let aggregates = db.get_all_aggregates()?;
+        if !noninteractive && !aggregates.is_empty() {
+            let active = db.get_active_agents()?;
+            println!("\nFinal Thermal Map:");
+            println!("{}", render_heatmap_to_string(&aggregates, &active));
+        }
+
+        if !noninteractive {
+            println!("\nExecution summary:");
+            println!("  Accepted steps: {}", execution_summary.accepted);
+            println!("  Rejected steps: {}", execution_summary.rejected);
+            println!(
+                "  Verification failures: {}",
+                execution_summary.verification_failures
+            );
+
+            println!("\nCost: ${:.4}", scheduler.current_cost());
+            println!("Budget remaining: ${:.4}", scheduler.budget_remaining());
+        }
+
+        let finished_at = Utc::now();
+        let duration_ms = started.elapsed().as_millis() as u64;
+        write_json_artifact(&artifact_root.join("plan.json"), &plan)?;
+        write_json_artifact(&artifact_root.join("assessments.json"), &assessments)?;
+        write_json_artifact(
+            &artifact_root.join("execution-summary.json"),
+            &execution_summary,
+        )?;
+        if let Some(final_verification) = execution_summary.final_verification.as_ref() {
+            write_json_artifact(
+                &artifact_root.join("final-verification.json"),
+                final_verification,
+            )?;
+        }
+        write_json_artifact(
+            &artifact_root.join("agent-logs.json"),
+            &db.get_agent_logs()?,
+        )?;
+        write_json_artifact(&artifact_root.join("thermal-aggregates.json"), &aggregates)?;
+        if let Some(state) = db.get_swarm_state()? {
+            write_json_artifact(&artifact_root.join("swarm-state.json"), &state)?;
+        }
+        let grounding_tool_calls = grounded_context
+            .rounds
+            .iter()
+            .map(|round| round.tool_calls.len())
+            .sum::<usize>();
+        let total_cost_usd =
+            scheduler.current_cost() + grounded_context.total_usage.cost_usd + plan.estimated_cost;
+        let budget_remaining_usd = (max_cost - total_cost_usd).max(0.0);
+        let sandbox_run_root = execution_summary
+            .run_root
+            .as_ref()
+            .map(|path| path.display().to_string());
+        write_json_artifact(
+            &artifact_root.join("metadata.json"),
+            &FixRunMetadata {
+                description: description_redacted.clone(),
+                max_agents,
+                max_cost,
+                started_at: started_at.to_rfc3339(),
+                finished_at: finished_at.to_rfc3339(),
+                duration_ms,
+                planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+                grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME
+                    .to_string(),
+                grounding_rounds: grounded_context.rounds.len(),
+                grounding_tool_calls,
+                grounding_collected: !grounded_context.summary.trim().is_empty()
+                    || !grounded_context.rounds.is_empty(),
+                grounding_cost_usd: grounded_context.total_usage.cost_usd,
+                planner_estimated_cost_usd: plan.estimated_cost,
+                final_bundle_verified: execution_summary.final_bundle_verified,
+                applied: execution_summary.applied,
+                sandbox_run_root: sandbox_run_root.clone(),
+                total_cost_usd,
+                budget_remaining_usd,
+                security: final_security.clone(),
+            },
+        )?;
+        let diff_patch_path = artifact_root.join("diff.patch");
+        if let Some(run_root) = execution_summary.run_root.as_ref() {
+            copy_if_exists(&run_root.join("accepted.patch"), &diff_patch_path)?;
+        }
+        let accepted_patch_bytes = patch_size_bytes(&diff_patch_path)?;
+        let accepted_patch = accepted_patch_bytes.is_some_and(|len| len > 0);
+        write_json_artifact(
+            &artifact_root.join("benchmark-run.json"),
+            &FixBenchmarkRun {
+                schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
+                description: description_redacted.clone(),
+                started_at: started_at.to_rfc3339(),
+                finished_at: finished_at.to_rfc3339(),
+                duration_ms,
+                accepted_steps: execution_summary.accepted,
+                rejected_steps: execution_summary.rejected,
+                verification_failures: execution_summary.verification_failures,
+                retry_attempts: execution_summary.retry_attempts,
+                time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
+                time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
+                final_bundle_verified: execution_summary.final_bundle_verified,
+                applied: execution_summary.applied,
+                accepted_patch,
+                accepted_patch_bytes,
+                outcome: classify_fix_benchmark_outcome(
+                    execution_summary.final_bundle_verified,
+                    accepted_patch,
+                )
+                .to_string(),
+                // False-green requires an independent rerun outside `fix`; the
+                // benchmark harness derives it later instead of guessing here.
+                false_green: None,
+                sandbox_run_root: sandbox_run_root.clone(),
+                total_cost_usd,
+                budget_remaining_usd,
+                verifier: benchmark_verifier.clone(),
+                security: final_security.clone(),
+            },
+        )?;
+        write_audit_event(
+            &artifact_root,
+            "fix_run_completed",
+            serde_json::json!({
+                "duration_ms": duration_ms,
+                "total_cost_usd": total_cost_usd,
+                "budget_remaining_usd": budget_remaining_usd,
+                "artifact_root": artifact_root.display().to_string(),
+                "security": final_security.clone(),
+            }),
+        )?;
+        emit_runtime_event(
+            noninteractive,
+            "fix_run_completed",
+            serde_json::json!({
+                "duration_ms": duration_ms,
+                "total_cost_usd": total_cost_usd,
+                "budget_remaining_usd": budget_remaining_usd,
+                "artifact_root": artifact_root.display().to_string(),
+                "security": final_security,
+            }),
+        );
+        if !noninteractive {
+            println!("Artifacts written to {}", artifact_root.display());
+        }
+
+        Ok(FixCommandOutcome {
+            artifact_root: artifact_root.clone(),
+            execution_summary,
+            total_cost_usd,
+            budget_remaining_usd,
+        })
+    }
+    .await;
+
+    match run {
+        Ok(outcome) => Ok(outcome),
+        Err(err) => {
+            let finished_at = Utc::now();
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let error = redact_secrets(&err.to_string());
+            let _ = write_fix_failure_artifacts(
+                &artifact_root,
+                &description_redacted,
+                max_agents,
+                max_cost,
+                started_at,
+                finished_at,
+                duration_ms,
+                "fix_failed",
+                &benchmark_verifier,
+                &start_security,
+            );
+            let _ = write_audit_event(
+                &artifact_root,
+                "fix_run_failed",
+                serde_json::json!({
+                    "description": description_redacted,
+                    "error": error,
+                    "artifact_root": artifact_root.display().to_string(),
+                    "security": start_security.clone(),
+                }),
+            );
+            emit_runtime_event(
+                noninteractive,
+                "fix_run_failed",
+                serde_json::json!({
+                    "description": description_redacted,
+                    "error": error,
+                    "artifact_root": artifact_root.display().to_string(),
+                    "security": start_security.clone(),
+                }),
+            );
+            Err(err)
+        }
+    }
 }
 
 async fn cmd_watch(
@@ -1941,7 +2633,7 @@ struct FixRunMetadata {
     security: SecurityRuntimeContext,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FixBenchmarkVerifier {
     parse_before_write: bool,
     test_after_write: bool,
@@ -1968,12 +2660,86 @@ struct FixBenchmarkRun {
     accepted_patch: bool,
     accepted_patch_bytes: Option<u64>,
     outcome: String,
-    false_green: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    false_green: Option<bool>,
     sandbox_run_root: Option<String>,
     total_cost_usd: f64,
     budget_remaining_usd: f64,
     verifier: FixBenchmarkVerifier,
     security: SecurityRuntimeContext,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_fix_failure_artifacts(
+    artifact_root: &Path,
+    description: &str,
+    max_agents: usize,
+    max_cost: f64,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    duration_ms: u64,
+    outcome: &str,
+    verifier: &FixBenchmarkVerifier,
+    security: &SecurityRuntimeContext,
+) -> Result<()> {
+    write_json_artifact(
+        &artifact_root.join("metadata.json"),
+        &FixRunMetadata {
+            description: description.to_string(),
+            max_agents,
+            max_cost,
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms,
+            planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+            grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
+            grounding_rounds: 0,
+            grounding_tool_calls: 0,
+            grounding_collected: false,
+            grounding_cost_usd: 0.0,
+            planner_estimated_cost_usd: 0.0,
+            final_bundle_verified: false,
+            applied: false,
+            sandbox_run_root: None,
+            total_cost_usd: 0.0,
+            budget_remaining_usd: max_cost,
+            security: security.clone(),
+        },
+    )?;
+    write_json_artifact(
+        &artifact_root.join("benchmark-run.json"),
+        &FixBenchmarkRun {
+            schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
+            description: description.to_string(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms,
+            accepted_steps: 0,
+            rejected_steps: 0,
+            verification_failures: 0,
+            retry_attempts: 0,
+            time_to_first_candidate_ms: None,
+            time_to_verified_repair_ms: None,
+            final_bundle_verified: false,
+            applied: false,
+            accepted_patch: false,
+            accepted_patch_bytes: None,
+            outcome: outcome.to_string(),
+            false_green: None,
+            sandbox_run_root: None,
+            total_cost_usd: 0.0,
+            budget_remaining_usd: max_cost,
+            verifier: FixBenchmarkVerifier {
+                parse_before_write: verifier.parse_before_write,
+                test_after_write: verifier.test_after_write,
+                lint_after_write: verifier.lint_after_write,
+                test_command: verifier.test_command.clone(),
+                lint_command: verifier.lint_command.clone(),
+            },
+            security: security.clone(),
+        },
+    )?;
+    Ok(())
 }
 
 fn create_run_artifact_root(project_root: &Path) -> Result<PathBuf> {
@@ -2061,6 +2827,158 @@ fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
     std::fs::write(&temp_path, content)?;
     std::fs::rename(&temp_path, path)?;
     Ok(())
+}
+
+fn supported_config_value_kind(key: &str) -> Option<ConfigValueKind> {
+    SUPPORTED_CONFIG_KEYS
+        .iter()
+        .find_map(|(candidate, kind)| (*candidate == key).then_some(*kind))
+}
+
+fn supported_config_keys_help() -> String {
+    SUPPORTED_CONFIG_KEYS
+        .iter()
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parse_config_item(raw: &str, kind: ConfigValueKind) -> Result<Item> {
+    let item =
+        match kind {
+            ConfigValueKind::String => toml_value(raw),
+            ConfigValueKind::Bool => toml_value(raw.parse::<bool>().with_context(|| {
+                format!("expected a boolean value for config key, got '{raw}'")
+            })?),
+            ConfigValueKind::Integer => toml_value(raw.parse::<i64>().with_context(|| {
+                format!("expected an integer value for config key, got '{raw}'")
+            })?),
+            ConfigValueKind::Float => {
+                toml_value(raw.parse::<f64>().with_context(|| {
+                    format!("expected a float value for config key, got '{raw}'")
+                })?)
+            }
+        };
+    Ok(item)
+}
+
+fn set_toml_key(document: &mut DocumentMut, key: &str, item: Item) -> Result<()> {
+    let parts = key.split('.').collect::<Vec<_>>();
+    let (leaf, parents) = parts
+        .split_last()
+        .ok_or_else(|| anyhow!("config key cannot be empty"))?;
+
+    let mut current = document.as_table_mut();
+    for part in parents {
+        if !current.contains_key(part) {
+            current.insert(part, Item::Table(Table::new()));
+        }
+
+        let next = current
+            .get_mut(part)
+            .and_then(Item::as_table_mut)
+            .ok_or_else(|| {
+                anyhow!("config path '{part}' is not a table and cannot contain '{key}'")
+            })?;
+        current = next;
+    }
+
+    current.insert(leaf, item);
+    Ok(())
+}
+
+fn update_config_key(config_path: &Path, key: &str, raw_value: &str) -> Result<()> {
+    let kind = supported_config_value_kind(key).ok_or_else(|| {
+        anyhow!(
+            "unsupported config key '{key}'. Supported keys: {}",
+            supported_config_keys_help()
+        )
+    })?;
+
+    let content = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let mut document = content
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let item = parse_config_item(raw_value, kind)?;
+    set_toml_key(&mut document, key, item)?;
+
+    let rendered = document.to_string();
+    toml::from_str::<MercuryConfig>(&rendered)
+        .with_context(|| format!("updated config would be invalid after setting {key}"))?;
+    atomic_write_string(config_path, &rendered)?;
+    Ok(())
+}
+
+fn render_numbered_context_window(
+    file_label: &str,
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    highlight_line: usize,
+) -> String {
+    let body = (start_line..=end_line)
+        .map(|line_number| {
+            let marker = if line_number == highlight_line {
+                '>'
+            } else {
+                ' '
+            };
+            let line = lines
+                .get(line_number.saturating_sub(1))
+                .copied()
+                .unwrap_or("");
+            format!("{marker}{line_number:>4} | {line}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{file_label}:{start_line}-{end_line}\n{body}")
+}
+
+fn join_line_window(lines: &[&str], start_line: usize, end_line: usize) -> String {
+    lines[(start_line - 1)..end_line].join("\n")
+}
+
+fn build_next_edit_cli_context(
+    file: &Path,
+    project_root: &Path,
+    content: &str,
+    requested_line: u32,
+) -> Result<NextEditCliContext> {
+    let relative = file_relative_to_project(file, project_root)
+        .unwrap_or_else(|_| file.to_path_buf())
+        .display()
+        .to_string();
+    let lines = content.lines().collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return Ok(NextEditCliContext {
+            current_file_path: relative.clone(),
+            code_to_edit: String::new(),
+            cursor: "1:1".to_string(),
+            recent_snippets: format!("{relative}:1-1\n>   1 | "),
+        });
+    }
+
+    let requested_line = requested_line.max(1) as usize;
+    let clamped_line = requested_line.min(lines.len());
+    let focus_start = clamped_line.saturating_sub(3).max(1);
+    let focus_end = (clamped_line + 3).min(lines.len());
+    let recent_start = clamped_line.saturating_sub(8).max(1);
+    let recent_end = (clamped_line + 8).min(lines.len());
+
+    Ok(NextEditCliContext {
+        current_file_path: relative.clone(),
+        code_to_edit: join_line_window(&lines, focus_start, focus_end),
+        cursor: format!("{}:1", clamped_line - focus_start + 1),
+        recent_snippets: render_numbered_context_window(
+            &relative,
+            &lines,
+            recent_start,
+            recent_end,
+            clamped_line,
+        ),
+    })
 }
 
 fn write_json_artifact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -2206,16 +3124,12 @@ async fn main() -> Result<()> {
             match action {
                 EditAction::Apply {
                     file,
-                    instruction,
+                    update_snippet,
                     dry_run,
                     force,
                 } => {
                     let content = std::fs::read_to_string(&file)?;
-                    // For instruction-based edits, we pass the original as both
-                    // original_code and update_snippet — Mercury Edit infers the
-                    // change from context. For precise edits, callers provide
-                    // the actual update snippet.
-                    let (patched, usage) = patcher.patch(&content, &instruction).await?;
+                    let (patched, usage) = patcher.patch(&content, &update_snippet).await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
@@ -2266,10 +3180,19 @@ async fn main() -> Result<()> {
                     );
                 }
                 EditAction::Next { file } => {
-                    let (path, _) = parse_file_line(&file);
+                    let (path, line) = parse_file_line(&file);
                     let content = std::fs::read_to_string(&path)?;
+                    let context =
+                        build_next_edit_cli_context(&path, &project_root, &content, line)?;
                     let (result, usage) = patcher
-                        .next_edit_with_path(path.to_string_lossy().as_ref(), &content, "")
+                        .next_edit_with_context(
+                            &context.current_file_path,
+                            &content,
+                            &context.code_to_edit,
+                            &context.cursor,
+                            &context.recent_snippets,
+                            "",
+                        )
                         .await?;
                     println!("{result}");
                     println!(
@@ -2331,8 +3254,10 @@ async fn main() -> Result<()> {
                 println!("  {current}");
             }
             ConfigAction::Set { key, value } => {
-                println!("Setting {key} = {value}");
-                println!("(Config set not yet implemented — edit .mercury/config.toml directly)");
+                let mercury_dir = find_mercury_dir()?;
+                let config_path = mercury_dir.join("config.toml");
+                update_config_key(&config_path, &key, &value)?;
+                println!("Updated {}: {key} = {value}", config_path.display());
             }
             ConfigAction::Validate => {
                 let mercury_dir = find_mercury_dir()?;
@@ -2792,6 +3717,55 @@ mod tests {
         }
     }
 
+    fn sample_agent_log_entry(
+        id: i64,
+        status: &str,
+        command: &str,
+        micro_heatmap: Option<Value>,
+    ) -> db::AgentLogEntry {
+        db::AgentLogEntry {
+            id,
+            agent_id: format!("agent-{id:02}"),
+            command: command.to_string(),
+            file_path: format!("src/file_{id}.rs"),
+            status: status.to_string(),
+            micro_heatmap: micro_heatmap.map(|value| value.to_string()),
+            started_at: format!("2026-03-11T12:00:{id:02}Z"),
+            completed_at: matches!(status, "success" | "failed")
+                .then(|| format!("2026-03-11T12:01:{id:02}Z")),
+            tokens_used: id * 100,
+            cost_usd: id as f64 * 0.015,
+        }
+    }
+
+    fn sample_aggregate(
+        file_path: &str,
+        composite_score: f64,
+        agent_density: i32,
+    ) -> db::ThermalAggregate {
+        db::ThermalAggregate {
+            file_path: file_path.to_string(),
+            composite_score,
+            max_score: composite_score,
+            agent_density,
+            last_updated: "2026-03-11T12:00:00Z".to_string(),
+            is_locked: false,
+        }
+    }
+
+    fn sample_swarm_state() -> db::SwarmState {
+        db::SwarmState {
+            id: 1,
+            total_agents_spawned: 5,
+            active_agents: 2,
+            total_tokens_used: 4096,
+            total_cost_usd: 1.25,
+            global_temperature: 0.72,
+            iteration_count: 3,
+            started_at: "2026-03-11T11:59:00Z".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn verify_failure_does_not_mutate_user_worktree() {
         let temp = tempdir().unwrap();
@@ -2806,6 +3780,186 @@ mod tests {
         assert!(result.is_err());
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(after, original);
+    }
+
+    #[test]
+    fn parse_candidate_runtime_metadata_reads_candidate_fields() {
+        let entry = sample_agent_log_entry(
+            1,
+            "running",
+            "repair:verify",
+            Some(serde_json::json!({
+                "phase": "verify",
+                "candidate_source": "critique_retry",
+                "retry_attempts": 2,
+                "outcome": "verification_failed",
+                "reason": "test failure",
+                "failure_stage": "verification",
+                "sandbox_root": ".mercury/worktrees/candidate-1",
+                "fanout": 4,
+                "temperature": 0.61,
+                "touched_lines": 17,
+                "byte_delta": -48
+            })),
+        );
+
+        let metadata = parse_candidate_runtime_metadata(&entry);
+        assert_eq!(metadata.phase.as_deref(), Some("verify"));
+        assert_eq!(metadata.source_lineage.as_deref(), Some("critique_retry"));
+        assert_eq!(metadata.retry_count, Some(2));
+        assert_eq!(metadata.outcome.as_deref(), Some("verification_failed"));
+        assert_eq!(metadata.reason.as_deref(), Some("test failure"));
+        assert_eq!(metadata.failure_stage.as_deref(), Some("verification"));
+        assert_eq!(
+            metadata.sandbox_root.as_deref(),
+            Some(".mercury/worktrees/candidate-1")
+        );
+        assert_eq!(metadata.fanout, Some(4));
+        assert_eq!(metadata.temperature, Some(0.61));
+        assert_eq!(metadata.touched_lines, Some(17));
+        assert_eq!(metadata.byte_delta, Some(-48));
+    }
+
+    #[test]
+    fn initial_live_status_events_include_backlog_candidates_and_runtime() {
+        let plan = sample_agent_log_entry(
+            1,
+            "running",
+            "repair:plan",
+            Some(serde_json::json!({
+                "phase": "plan",
+                "candidate_source": "apply_edit"
+            })),
+        );
+        let verify = sample_agent_log_entry(
+            2,
+            "success",
+            "repair:verify",
+            Some(serde_json::json!({
+                "phase": "verify",
+                "candidate_source": "critique_retry",
+                "outcome": "accepted"
+            })),
+        );
+        let aggregates = vec![sample_aggregate("src/file_2.rs", 0.91, 3)];
+        let active = vec![plan.clone()];
+        let logs = vec![plan, verify];
+        let swarm = sample_swarm_state();
+
+        let snapshot = build_live_status_snapshot(&aggregates, &active, &logs, Some(&swarm));
+        let events = initial_live_status_events(&snapshot, LiveRenderMode::JsonStream, 750);
+
+        assert_eq!(
+            events.first().map(|event| event.event),
+            Some("live_attached")
+        );
+        assert!(events
+            .iter()
+            .any(|event| { event.event == "phase_started" && event.details["phase"] == "plan" }));
+        assert!(events
+            .iter()
+            .any(|event| { event.event == "phase_started" && event.details["phase"] == "verify" }));
+
+        let candidate_events = events
+            .iter()
+            .filter(|event| event.event == "candidate_event")
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_events.len(), 2);
+        assert!(candidate_events
+            .iter()
+            .all(|event| event.details["backlog"] == Value::Bool(true)));
+        assert!(candidate_events.iter().any(|event| {
+            event.details["agent_id"] == "agent-02"
+                && event.details["verification_result"] == "passed"
+        }));
+
+        let runtime_event = events
+            .iter()
+            .find(|event| event.event == "runtime_state")
+            .expect("runtime state event should exist");
+        assert_eq!(runtime_event.details["backlog"], Value::Bool(true));
+        assert_eq!(runtime_event.details["total_agents_spawned"], 5);
+        assert_eq!(runtime_event.details["locked_files"], 0);
+        assert_eq!(runtime_event.details["hottest_file"], "src/file_2.rs");
+    }
+
+    #[test]
+    fn diff_live_status_events_report_candidate_transitions() {
+        let running = sample_agent_log_entry(
+            1,
+            "running",
+            "repair:apply",
+            Some(serde_json::json!({
+                "phase": "apply",
+                "candidate_source": "apply_edit"
+            })),
+        );
+        let previous = build_live_status_snapshot(
+            &[sample_aggregate("src/file_1.rs", 0.45, 1)],
+            std::slice::from_ref(&running),
+            std::slice::from_ref(&running),
+            Some(&sample_swarm_state()),
+        );
+
+        let success = sample_agent_log_entry(
+            1,
+            "success",
+            "repair:apply",
+            Some(serde_json::json!({
+                "phase": "apply",
+                "candidate_source": "apply_edit",
+                "outcome": "accepted"
+            })),
+        );
+        let launched = sample_agent_log_entry(
+            2,
+            "spawned",
+            "repair:verify",
+            Some(serde_json::json!({
+                "phase": "verify",
+                "candidate_source": "exploratory_next_edit"
+            })),
+        );
+        let current = build_live_status_snapshot(
+            &[
+                sample_aggregate("src/file_1.rs", 0.60, 2),
+                sample_aggregate("src/file_2.rs", 0.88, 3),
+            ],
+            std::slice::from_ref(&launched),
+            &[success, launched.clone()],
+            Some(&db::SwarmState {
+                total_agents_spawned: 6,
+                active_agents: 1,
+                total_tokens_used: 8192,
+                total_cost_usd: 2.5,
+                global_temperature: 0.66,
+                iteration_count: 4,
+                ..sample_swarm_state()
+            }),
+        );
+
+        let events = diff_live_status_events(&previous, &current);
+
+        assert!(events
+            .iter()
+            .any(|event| { event.event == "phase_started" && event.details["phase"] == "verify" }));
+        assert!(events.iter().any(|event| {
+            event.event == "candidate_event"
+                && event.details["agent_id"] == "agent-01"
+                && event.details["transition"] == "status_changed"
+                && event.details["verification_result"] == "passed"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "candidate_event"
+                && event.details["agent_id"] == "agent-02"
+                && event.details["transition"] == "launched"
+                && event.details["source_lineage"] == "exploratory_next_edit"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "runtime_state"
+                && event.details["backlog"] == Value::Bool(false)
+                && event.details["total_tokens_used"] == 8192
+        }));
     }
 
     #[test]

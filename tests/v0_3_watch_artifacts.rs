@@ -45,6 +45,29 @@ struct StubServer {
 
 impl StubServer {
     fn start(fixed_source: String) -> Self {
+        Self::start_with_planner_failure(fixed_source, None)
+    }
+
+    fn start_with_planner_error(message: &str) -> Self {
+        Self::start_with_planner_failure(
+            String::new(),
+            Some((
+                "HTTP/1.1 500 Internal Server Error".to_string(),
+                json!({
+                    "error": {
+                        "message": message,
+                        "type": "server_error"
+                    }
+                })
+                .to_string(),
+            )),
+        )
+    }
+
+    fn start_with_planner_failure(
+        fixed_source: String,
+        planner_failure: Option<(String, String)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("stub listener should bind");
         listener
             .set_nonblocking(true)
@@ -64,6 +87,7 @@ impl StubServer {
                         let _ = handle_stub_connection(
                             &mut stream,
                             &fixed_source,
+                            planner_failure.as_ref(),
                             Arc::clone(&thread_requests),
                         );
                     }
@@ -401,6 +425,10 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
         );
         assert!(fix_benchmark["accepted_patch"].is_boolean());
         assert!(
+            fix_benchmark.get("false_green").is_none(),
+            "raw benchmark-run.json should not claim false_green before the independent rerun"
+        );
+        assert!(
             fix_benchmark["verifier"]["test_command"]
                 .as_str()
                 .is_some_and(|command| command.contains("cargo test")),
@@ -484,8 +512,319 @@ fn watch_repair_persistent_failure_emits_confirmation_failure_json() {
     drop(child);
 }
 
+#[test]
+fn config_set_round_trips_supported_scalar_keys_and_validates() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["config", "set", "scheduler.max_concurrency", "7"])
+        .assert()
+        .success();
+
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["config", "set", "verification.test_after_write", "false"])
+        .assert()
+        .success();
+
+    let max_concurrency =
+        run_cli_capture_stdout(temp.path(), ["config", "get", "scheduler.max_concurrency"]);
+    assert!(
+        max_concurrency.contains('7'),
+        "config get should report the updated max_concurrency value"
+    );
+
+    let test_after_write = run_cli_capture_stdout(
+        temp.path(),
+        ["config", "get", "verification.test_after_write"],
+    );
+    assert!(
+        test_after_write.contains("false"),
+        "config get should report the updated test_after_write flag"
+    );
+
+    let config = fs::read_to_string(config_path(temp.path())).expect("config should be readable");
+    assert!(
+        config.contains("max_concurrency = 7"),
+        "config file should persist the updated max_concurrency"
+    );
+    assert!(
+        config.contains("test_after_write = false"),
+        "config file should persist the updated test_after_write flag"
+    );
+
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["config", "validate"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn config_set_rejects_unknown_key_without_mutating_config() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+
+    let config_before =
+        fs::read_to_string(config_path(temp.path())).expect("config should be readable");
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["config", "set", "scheduler.not_a_real_key", "7"])
+        .assert()
+        .failure();
+
+    let config_after =
+        fs::read_to_string(config_path(temp.path())).expect("config should still be readable");
+    assert_eq!(
+        config_after, config_before,
+        "invalid keys should not partially rewrite config.toml"
+    );
+}
+
+#[test]
+fn config_set_rejects_type_mismatch_without_mutating_config() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+
+    let config_before =
+        fs::read_to_string(config_path(temp.path())).expect("config should be readable");
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["config", "set", "scheduler.max_concurrency", "false"])
+        .assert()
+        .failure();
+
+    let config_after =
+        fs::read_to_string(config_path(temp.path())).expect("config should still be readable");
+    assert_eq!(
+        config_after, config_before,
+        "type mismatches should not partially rewrite config.toml"
+    );
+}
+
+#[test]
+fn edit_apply_request_wraps_concrete_replacement_content_in_update_snippet() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+
+    let original = r#"pub fn add(left: i32, right: i32) -> i32 {
+    left - right
+}
+"#;
+    let replacement = r#"pub fn add(left: i32, right: i32) -> i32 {
+    left + right
+}
+"#;
+    fs::create_dir_all(temp.path().join("src")).expect("src directory should be created");
+    fs::write(temp.path().join("src/lib.rs"), original).expect("fixture source should be written");
+
+    let stub = StubServer::start(replacement.to_string());
+    rewrite_config_for_stub(temp.path(), &stub);
+
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .env("INCEPTION_API_KEY", "test-inception-key")
+        .arg("edit")
+        .arg("apply")
+        .arg("src/lib.rs")
+        .arg("--update-snippet")
+        .arg(replacement)
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let requests = stub.recorded_requests();
+    let request = request_for_path(&requests, "/v1/apply/completions");
+    let prompt = request_prompt(request);
+    assert_eq!(
+        extract_tag(&prompt, "original_code")
+            .expect("apply request should include original_code")
+            .trim(),
+        original.trim()
+    );
+    assert_eq!(
+        extract_tag(&prompt, "update_snippet")
+            .expect("apply request should include update_snippet")
+            .trim(),
+        replacement.trim(),
+        "apply requests should forward concrete replacement content as update_snippet"
+    );
+    assert_ne!(
+        extract_tag(&prompt, "original_code")
+            .expect("apply request should include original_code")
+            .trim(),
+        extract_tag(&prompt, "update_snippet")
+            .expect("apply request should include update_snippet")
+            .trim(),
+        "the update_snippet contract should not collapse to the original file content"
+    );
+}
+
+#[test]
+fn edit_next_request_populates_code_cursor_and_recent_snippets_context() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+
+    let source = r#"pub fn add(left: i32, right: i32) -> i32 {
+    let total = left - right;
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_numbers() {
+        assert_eq!(add(2, 2), 4);
+    }
+}
+"#;
+    fs::create_dir_all(temp.path().join("src")).expect("src directory should be created");
+    fs::write(temp.path().join("src/lib.rs"), source).expect("fixture source should be written");
+
+    let stub = StubServer::start("Replace subtraction with addition.".to_string());
+    rewrite_config_for_stub(temp.path(), &stub);
+
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .env("INCEPTION_API_KEY", "test-inception-key")
+        .arg("edit")
+        .arg("next")
+        .arg("src/lib.rs:2")
+        .assert()
+        .success();
+
+    let requests = stub.recorded_requests();
+    let request = request_for_path(&requests, "/v1/edit/completions");
+    let prompt = request_prompt(request);
+    assert!(
+        prompt.contains("current_file_path: src/lib.rs"),
+        "next-edit requests should preserve the current file path"
+    );
+
+    let recent_snippets = extract_tag(&prompt, "recently_viewed_code_snippets")
+        .expect("next-edit request should include recently_viewed_code_snippets");
+    assert!(
+        !recent_snippets.trim().is_empty(),
+        "recent_snippets should be materially populated"
+    );
+    assert!(
+        recent_snippets.contains("src/lib.rs")
+            || recent_snippets.contains("let total = left - right;")
+            || recent_snippets.contains("pub fn add"),
+        "recent_snippets should carry concrete file context"
+    );
+
+    let code_to_edit = extract_tag(&prompt, "code_to_edit")
+        .expect("next-edit request should include code_to_edit");
+    let code_without_cursor = strip_tag(&code_to_edit, "cursor");
+    assert!(
+        !code_without_cursor.trim().is_empty(),
+        "code_to_edit should include concrete code around the cursor"
+    );
+    assert!(
+        code_without_cursor.contains("let total = left - right;")
+            || code_without_cursor.contains("pub fn add"),
+        "code_to_edit should capture current-file source context"
+    );
+
+    let cursor = extract_tag(&prompt, "cursor").expect("next-edit request should include cursor");
+    assert!(
+        !cursor.trim().is_empty(),
+        "cursor should be materially populated"
+    );
+    assert!(
+        !prompt.contains("<|recently_viewed_code_snippets|>\n\n<|/recently_viewed_code_snippets|>"),
+        "next-edit requests should not emit an empty recent_snippets wrapper"
+    );
+    assert!(
+        !prompt.contains("<|cursor|>\n\n<|/cursor|>"),
+        "next-edit requests should not emit an empty cursor wrapper"
+    );
+}
+
+#[test]
+fn fix_failure_writes_benchmark_and_metadata_artifacts() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    init_repo(temp.path());
+    write_failing_rust_library(temp.path());
+
+    let stub = StubServer::start_with_planner_error("planner unavailable");
+    rewrite_config_for_stub(temp.path(), &stub);
+
+    let bin = mercury_bin();
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .env("INCEPTION_API_KEY", "test-inception-key")
+        .args([
+            "fix",
+            "repair the failing Rust test",
+            "--max-agents",
+            "2",
+            "--max-cost",
+            "0.25",
+            "--noninteractive",
+        ])
+        .assert()
+        .failure();
+
+    let artifact_root = wait_for_latest_run_dir(temp.path());
+    assert!(
+        artifact_root.join("metadata.json").exists(),
+        "failed fix runs should still write metadata.json"
+    );
+    assert!(
+        artifact_root.join("benchmark-run.json").exists(),
+        "failed fix runs should still write benchmark-run.json"
+    );
+
+    let metadata = read_json(artifact_root.join("metadata.json"));
+    let benchmark = read_json(artifact_root.join("benchmark-run.json"));
+
+    assert_eq!(
+        benchmark["schema_version"],
+        Value::String("mercury-repair-benchmark-case-v1".to_string())
+    );
+    assert_eq!(
+        benchmark["outcome"],
+        Value::String("fix_failed".to_string())
+    );
+    assert_eq!(benchmark["accepted_patch"], Value::Bool(false));
+    assert_eq!(benchmark["final_bundle_verified"], Value::Bool(false));
+    assert_eq!(benchmark["applied"], Value::Bool(false));
+    assert!(
+        benchmark.get("false_green").is_none(),
+        "failed fix benchmark artifact should not claim false_green"
+    );
+
+    assert_eq!(metadata["final_bundle_verified"], Value::Bool(false));
+    assert_eq!(metadata["applied"], Value::Bool(false));
+    assert_eq!(metadata["planner_estimated_cost_usd"], Value::from(0.0));
+    assert_eq!(metadata["grounding_collected"], Value::Bool(false));
+
+    let requests = stub.recorded_requests();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/v1/chat/completions"),
+        "failing fix run should still reach the planner endpoint before writing failure artifacts"
+    );
+}
+
+fn mercury_bin() -> PathBuf {
+    assert_cmd::cargo::cargo_bin!("mercury-cli").to_path_buf()
+}
+
 fn init_repo(root: &Path) {
-    let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
+    let bin = mercury_bin();
     Command::new(bin)
         .current_dir(root)
         .arg("init")
@@ -577,8 +916,12 @@ mod tests {
     .expect("passing source should be written");
 }
 
+fn config_path(project_root: &Path) -> PathBuf {
+    project_root.join(".mercury").join("config.toml")
+}
+
 fn rewrite_config_for_stub(project_root: &Path, stub: &StubServer) {
-    let config_path = project_root.join(".mercury").join("config.toml");
+    let config_path = config_path(project_root);
     let config = fs::read_to_string(&config_path).expect("config should be readable");
     let config = config.replace(
         "mercury2_endpoint = \"https://api.inceptionlabs.ai/v1/chat/completions\"",
@@ -598,6 +941,20 @@ fn rewrite_config_for_stub(project_root: &Path, stub: &StubServer) {
     fs::write(config_path, config).expect("config should be rewritten");
 }
 
+fn run_cli_capture_stdout<const N: usize>(project_root: &Path, args: [&str; N]) -> String {
+    let output = Command::new(mercury_bin())
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .expect("command should run");
+    assert!(
+        output.status.success(),
+        "command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 fn wait_for_watch_record(project_root: &Path) -> (PathBuf, Value) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let runs_root = project_root.join(".mercury").join("runs");
@@ -610,6 +967,25 @@ fn wait_for_watch_record(project_root: &Path) -> (PathBuf, Value) {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for watch artifact bundle under {}",
+            runs_root.display()
+        );
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_latest_run_dir(project_root: &Path) -> PathBuf {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let runs_root = project_root.join(".mercury").join("runs");
+
+    loop {
+        if let Some(run_dir) = read_latest_run_dir(&runs_root) {
+            return run_dir;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for run artifact bundle under {}",
             runs_root.display()
         );
 
@@ -651,14 +1027,7 @@ fn wait_for_mirrored_repair_artifacts(artifact_root: &Path, fix_artifact_root: &
 }
 
 fn read_latest_watch_record(runs_root: &Path) -> Option<(PathBuf, Value)> {
-    let mut run_dirs = fs::read_dir(runs_root)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect::<Vec<_>>();
-    run_dirs.sort();
-    for artifact_root in run_dirs.into_iter().rev() {
+    for artifact_root in read_run_dirs_descending(runs_root)? {
         let watch_path = artifact_root.join("watch.json");
         if !watch_path.exists() {
             continue;
@@ -671,9 +1040,61 @@ fn read_latest_watch_record(runs_root: &Path) -> Option<(PathBuf, Value)> {
     None
 }
 
+fn read_latest_run_dir(runs_root: &Path) -> Option<PathBuf> {
+    read_run_dirs_descending(runs_root)?.into_iter().next()
+}
+
+fn read_run_dirs_descending(runs_root: &Path) -> Option<Vec<PathBuf>> {
+    let mut run_dirs = fs::read_dir(runs_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    run_dirs.sort();
+    run_dirs.reverse();
+    Some(run_dirs)
+}
+
+fn request_for_path<'a>(requests: &'a [RecordedRequest], path: &str) -> &'a RecordedRequest {
+    requests
+        .iter()
+        .find(|request| request.path == path)
+        .unwrap_or_else(|| panic!("expected request for path {path}, saw: {requests:?}"))
+}
+
+fn request_prompt(request: &RecordedRequest) -> String {
+    let body: Value =
+        serde_json::from_str(&request.body).expect("recorded request body should parse as JSON");
+    body["messages"][0]["content"]
+        .as_str()
+        .expect("chat request should include a text prompt")
+        .to_string()
+}
+
+fn extract_tag(content: &str, tag: &str) -> Option<String> {
+    let start = format!("<|{tag}|>\n");
+    let end = format!("\n<|/{tag}|>");
+    let from = content.find(&start)? + start.len();
+    let rest = &content[from..];
+    let to = rest.find(&end)?;
+    Some(rest[..to].to_string())
+}
+
+fn strip_tag(content: &str, tag: &str) -> String {
+    let start = format!("<|{tag}|>\n");
+    let end = format!("\n<|/{tag}|>");
+    if let Some(inner) = extract_tag(content, tag) {
+        content.replacen(&(start + &inner + &end), "", 1)
+    } else {
+        content.to_string()
+    }
+}
+
 fn handle_stub_connection(
     stream: &mut TcpStream,
     fixed_source: &str,
+    planner_failure: Option<&(String, String)>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -689,78 +1110,101 @@ fn handle_stub_connection(
             body,
         });
 
-    let response_body = match path.as_str() {
-        "/v1/chat/completions" => json!({
-            "choices": [{
-                "message": {
-                    "content": serde_json::to_string(&json!({
-                        "schema_version": "planner-response-v1",
-                        "steps": [{
-                            "file_path": "src/lib.rs",
-                            "instruction": "Replace the broken subtraction with addition so the Rust test passes.",
-                            "priority": 1.0,
-                            "estimated_tokens": 128
+    let (status_line, response_body) = match path.as_str() {
+        "/v1/chat/completions" => {
+            if let Some((status_line, response_body)) = planner_failure {
+                (status_line.clone(), response_body.clone())
+            } else {
+                (
+                    "HTTP/1.1 200 OK".to_string(),
+                    json!({
+                        "choices": [{
+                            "message": {
+                                "content": serde_json::to_string(&json!({
+                                    "schema_version": "planner-response-v1",
+                                    "steps": [{
+                                        "file_path": "src/lib.rs",
+                                        "instruction": "Replace the broken subtraction with addition so the Rust test passes.",
+                                        "priority": 1.0,
+                                        "estimated_tokens": 128
+                                    }],
+                                    "assessments": [{
+                                        "complexity_score": 0.2,
+                                        "dependency_score": 0.1,
+                                        "risk_score": 0.2,
+                                        "churn_score": 0.1,
+                                        "suggested_action": "refactor",
+                                        "reasoning": "Single-file Rust test repair."
+                                    }]
+                                }))
+                                .expect("planner payload should serialize")
+                            }
                         }],
-                        "assessments": [{
-                            "complexity_score": 0.2,
-                            "dependency_score": 0.1,
-                            "risk_score": 0.2,
-                            "churn_score": 0.1,
-                            "suggested_action": "refactor",
-                            "reasoning": "Single-file Rust test repair."
-                        }]
-                    }))
-                    .expect("planner payload should serialize")
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30,
-                "cached_input_tokens": 0
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 20,
+                            "total_tokens": 30,
+                            "cached_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                )
             }
-        })
-        .to_string(),
-        "/v1/apply/completions" => json!({
-            "choices": [{
-                "message": {
-                    "content": fixed_source
+        }
+        "/v1/apply/completions" => (
+            "HTTP/1.1 200 OK".to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": fixed_source
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 24,
+                    "total_tokens": 36,
+                    "cached_input_tokens": 0
                 }
-            }],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 24,
-                "total_tokens": 36,
-                "cached_input_tokens": 0
-            }
-        })
-        .to_string(),
-        _ => json!({
-            "choices": [{
-                "message": {
-                    "content": ""
+            })
+            .to_string(),
+        ),
+        "/v1/edit/completions" => (
+            "HTTP/1.1 200 OK".to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": fixed_source
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 16,
+                    "total_tokens": 24,
+                    "cached_input_tokens": 0
                 }
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "cached_input_tokens": 0
-            }
-        })
-        .to_string(),
+            })
+            .to_string(),
+        ),
+        _ => (
+            "HTTP/1.1 404 Not Found".to_string(),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": ""
+                    }
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "cached_input_tokens": 0
+                }
+            })
+            .to_string(),
+        ),
     };
 
-    let status_line = if matches!(
-        path.as_str(),
-        "/v1/chat/completions" | "/v1/apply/completions"
-    ) {
-        "HTTP/1.1 200 OK"
-    } else {
-        "HTTP/1.1 404 Not Found"
-    };
-
-    write_http_response(stream, status_line, "application/json", &response_body)
+    write_http_response(stream, &status_line, "application/json", &response_body)
 }
 
 fn read_http_request(stream: &mut TcpStream) -> std::io::Result<Option<(String, String)>> {

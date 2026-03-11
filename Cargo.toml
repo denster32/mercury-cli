@@ -23,6 +23,7 @@ serde_json = "1"
 
 # Configuration
 toml = "0.8"
+toml_edit = "0.22"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
