@@ -2,15 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on Keep a Changelog, and this project aims to follow Semantic Versioning once release tagging begins.
+The format is based on Keep a Changelog, and this project follows Semantic Versioning for tagged releases.
 
 ## [Unreleased]
+
+### Added
+
+No entries yet.
+
+## [1.0.0]
 
 ### Added
 
 - release-ready GitHub Actions workflows for CI, build artifacts, and tagged releases
 - issue templates for bugs, eval corpus additions, and scoped feature requests
 - contributor and security policy documents for triage, release, and disclosure flow
+- Mercury-native CI auto-repair runtime with isolated candidate execution, atomic acceptance, and run artifact bundles
+- TypeScript eval-lane coverage alongside the Rust repair and verifier path
 
 ### Changed
 

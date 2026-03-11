@@ -116,7 +116,7 @@ fn watch_rejects_non_allowlisted_command_before_cycle() {
     init_repo(temp.path());
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
-    Command::new(&bin)
+    Command::new(bin)
         .current_dir(temp.path())
         .arg("watch")
         .arg("false")
@@ -140,7 +140,7 @@ fn watch_without_repair_records_passed_decision_for_allowlisted_success_command(
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
     let child = ChildGuard::spawn(
-        Command::new(&bin)
+        Command::new(bin)
             .current_dir(temp.path())
             .arg("watch")
             .arg("cargo test --quiet")
@@ -193,7 +193,7 @@ fn watch_repair_rejects_non_allowlisted_command_before_cycle() {
     init_repo(temp.path());
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
-    Command::new(&bin)
+    Command::new(bin)
         .current_dir(temp.path())
         .arg("watch")
         .arg("false")
@@ -218,7 +218,7 @@ fn watch_without_repair_supported_env_wrapped_command_writes_initial_failure_jso
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
     let child = ChildGuard::spawn(
-        Command::new(&bin)
+        Command::new(bin)
             .current_dir(temp.path())
             .arg("watch")
             .arg("env RUST_BACKTRACE=1 cargo test --quiet")
@@ -260,7 +260,7 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
     let child = ChildGuard::spawn(
-        Command::new(&bin)
+        Command::new(bin)
             .current_dir(temp.path())
             .env("INCEPTION_API_KEY", "test-inception-key")
             .arg("watch")
@@ -413,7 +413,7 @@ fn watch_repair_persistent_failure_emits_confirmation_failure_json() {
 
     let bin = assert_cmd::cargo::cargo_bin!("mercury-cli");
     let child = ChildGuard::spawn(
-        Command::new(&bin)
+        Command::new(bin)
             .current_dir(temp.path())
             .env("INCEPTION_API_KEY", "test-inception-key")
             .arg("watch")

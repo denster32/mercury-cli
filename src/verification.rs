@@ -407,30 +407,33 @@ fn verifier_policy_json(
     })
 }
 
-fn verifier_audit_json(
-    event: &str,
-    tool: &str,
-    command: &str,
-    command_kind: &VerifierCommandKind,
-    project_root: &Path,
-    workspace_root: &Path,
-    decision: &str,
+struct VerifierAuditEntry<'a> {
+    event: &'a str,
+    tool: &'a str,
+    command: &'a str,
+    command_kind: &'a VerifierCommandKind,
+    project_root: &'a Path,
+    workspace_root: &'a Path,
+    decision: &'a str,
     exit_code: Option<i32>,
-    rejection_reason: Option<&str>,
-) -> Value {
+    rejection_reason: Option<&'a str>,
+}
+
+fn verifier_audit_json(entry: VerifierAuditEntry<'_>) -> Value {
     let runtime_mode = verifier_runtime_mode();
     json!({
-        "event": event,
-        "tool": tool,
-        "decision": decision,
-        "command": redact_sensitive_text(command),
-        "command_kind": command_kind,
-        "exit_code": exit_code,
-        "rejection_reason": rejection_reason,
+        "event": entry.event,
+        "tool": entry.tool,
+        "decision": entry.decision,
+        "command": redact_sensitive_text(entry.command),
+        "command_kind": entry.command_kind,
+        "exit_code": entry.exit_code,
+        "rejection_reason": entry.rejection_reason,
         "ci": runtime_mode.ci,
         "noninteractive": runtime_mode.noninteractive,
-        "isolation_mode": verifier_isolation_mode(project_root, workspace_root),
-        "workspace_isolated": verifier_isolation_mode(project_root, workspace_root) == "repo_copy",
+        "isolation_mode": verifier_isolation_mode(entry.project_root, entry.workspace_root),
+        "workspace_isolated": verifier_isolation_mode(entry.project_root, entry.workspace_root)
+            == "repo_copy",
     })
 }
 
@@ -506,17 +509,17 @@ fn build_tool_error_output(
             workspace_root,
             &injected_env,
         ),
-        "audit": verifier_audit_json(
-            "verifier_command_rejected",
+        "audit": verifier_audit_json(VerifierAuditEntry {
+            event: "verifier_command_rejected",
             tool,
-            &command,
-            &command_kind,
+            command: &command,
+            command_kind: &command_kind,
             project_root,
             workspace_root,
-            "rejected",
-            None,
-            Some(verifier_rejection_reason(error)),
-        ),
+            decision: "rejected",
+            exit_code: None,
+            rejection_reason: Some(verifier_rejection_reason(error)),
+        }),
     })
 }
 
@@ -906,17 +909,17 @@ impl RepoToolExecutor {
                 &self.workspace_root,
                 &injected_env,
             ),
-            "audit": verifier_audit_json(
-                "verifier_command_completed",
-                RUN_TESTS_TOOL,
+            "audit": verifier_audit_json(VerifierAuditEntry {
+                event: "verifier_command_completed",
+                tool: RUN_TESTS_TOOL,
                 command,
-                &invocation.command_kind,
-                &self.project_root,
-                &self.workspace_root,
+                command_kind: &invocation.command_kind,
+                project_root: &self.project_root,
+                workspace_root: &self.workspace_root,
                 decision,
-                output.status.code(),
-                None,
-            ),
+                exit_code: output.status.code(),
+                rejection_reason: None,
+            }),
         }))
     }
 
@@ -1382,9 +1385,11 @@ mod tests {
 
     use crate::api::{ApiUsage, Mercury2Api, ToolCall, ToolCallFunction};
 
+    type ToolResponses = Arc<Mutex<Vec<(String, Vec<ToolCall>)>>>;
+
     #[derive(Clone)]
     struct FakeMercuryApi {
-        responses: Arc<Mutex<Vec<(String, Vec<ToolCall>)>>>,
+        responses: ToolResponses,
     }
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));

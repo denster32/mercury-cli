@@ -565,7 +565,6 @@ impl<A: Mercury2Api> Verifier<A> {
 
         Ok(CommandOutput {
             command: trimmed.to_string(),
-            command_parts,
             success: output.status.success(),
             exit_code: output.status.code(),
             stdout,
@@ -860,13 +859,15 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
                 async move {
                     execute_dispatch_work_item(
                         work_item,
-                        patcher,
-                        verifier,
-                        scheduler,
-                        db,
-                        project_root,
                         &run_root,
-                        &telemetry,
+                        DispatchContext {
+                            patcher,
+                            verifier,
+                            scheduler,
+                            db,
+                            project_root,
+                            telemetry: &telemetry,
+                        },
                     )
                     .await
                 }
@@ -1011,6 +1012,15 @@ struct StepDispatchResult {
     winner: Option<AcceptedCandidate>,
 }
 
+struct DispatchContext<'a, E: MercuryEditApi, A: Mercury2Api> {
+    patcher: &'a Patcher<E>,
+    verifier: &'a Verifier<A>,
+    scheduler: &'a Scheduler,
+    db: &'a ThermalDb,
+    project_root: &'a Path,
+    telemetry: &'a ExecutionTelemetry,
+}
+
 fn build_dispatch_batch(
     file_states: &BTreeMap<String, FileExecutionState>,
     accepted_snapshot: &HashMap<PathBuf, String>,
@@ -1108,13 +1118,8 @@ fn build_dispatch_batch(
 
 async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     work_item: DispatchWorkItem,
-    patcher: &Patcher<E>,
-    verifier: &Verifier<A>,
-    scheduler: &Scheduler,
-    db: &ThermalDb,
-    project_root: &Path,
     run_root: &Path,
-    telemetry: &ExecutionTelemetry,
+    context: DispatchContext<'_, E, A>,
 ) -> Result<StepDispatchResult, EngineError> {
     let mut summary = StepExecutionSummary::default();
     let step_root = run_root.join("candidates").join(format!(
@@ -1130,13 +1135,13 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             work_item.phase,
             &work_item.latest_state,
             &work_item.accepted_snapshot,
-            patcher,
-            verifier,
-            scheduler,
-            db,
-            project_root,
+            context.patcher,
+            context.verifier,
+            context.scheduler,
+            context.db,
+            context.project_root,
             &step_root,
-            telemetry,
+            context.telemetry,
         )
     }))
     .buffer_unordered(work_item.fanout)
@@ -1166,7 +1171,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "retry_attempts": outcome.retry_attempts,
                 "phase": work_item.phase.to_string(),
             });
-            db.update_agent_status(
+            context.db.update_agent_status(
                 outcome.log_id,
                 "failed",
                 outcome.total_tokens,
@@ -1196,7 +1201,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "retry_attempts": outcome.retry_attempts,
                 "phase": work_item.phase.to_string(),
             });
-            db.update_agent_status(
+            context.db.update_agent_status(
                 outcome.log_id,
                 "failed",
                 outcome.total_tokens,
@@ -1225,7 +1230,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             "touched_lines": duplicate.change_footprint.touched_lines,
             "byte_delta": duplicate.change_footprint.byte_delta,
         });
-        db.update_agent_status(
+        context.db.update_agent_status(
             duplicate.log_id,
             "failed",
             duplicate.total_tokens,
@@ -1254,7 +1259,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             "touched_lines": winner.change_footprint.touched_lines,
             "byte_delta": winner.change_footprint.byte_delta,
         });
-        db.update_agent_status(
+        context.db.update_agent_status(
             winner.log_id,
             "success",
             winner.total_tokens,
@@ -1276,7 +1281,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "touched_lines": loser.change_footprint.touched_lines,
                 "byte_delta": loser.change_footprint.byte_delta,
             });
-            db.update_agent_status(
+            context.db.update_agent_status(
                 loser.log_id,
                 "failed",
                 loser.total_tokens,
@@ -1295,11 +1300,11 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 .expect("accepted winner must carry a state hash"),
         })
     } else {
-        telemetry.sync(
-            db,
-            scheduler,
+        context.telemetry.sync(
+            context.db,
+            context.scheduler,
             phase_temperature,
-            scheduler.active_count() as i64,
+            context.scheduler.active_count() as i64,
         )?;
         None
     };
@@ -1738,8 +1743,6 @@ fn sanitize_path_component(file_path: &str) -> String {
 
 struct CommandOutput {
     command: String,
-    #[cfg_attr(not(test), allow(dead_code))]
-    command_parts: Vec<String>,
     success: bool,
     exit_code: Option<i32>,
     stdout: String,

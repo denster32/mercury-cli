@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -338,7 +338,7 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     tool_calls: Vec<ToolCall>,
 }
 
@@ -370,6 +370,14 @@ impl ToolCallFunction {
 struct ChatResponse {
     choices: Vec<ChatChoice>,
     usage: Option<UsageBlock>,
+}
+
+fn deserialize_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Fill-In-the-Middle request body for `/v1/fim/completions`.
@@ -1847,6 +1855,32 @@ mod tests {
             "src/lib.rs"
         );
         assert_eq!(usage.tokens_used, 14);
+    }
+
+    #[test]
+    fn parse_chat_response_with_tools_tolerates_null_tool_calls() {
+        let raw = br#"{
+            "choices": [
+                {
+                    "message": {
+                        "content": "OK",
+                        "tool_calls": null
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 6,
+                "completion_tokens": 1,
+                "total_tokens": 7,
+                "cached_input_tokens": 0
+            }
+        }"#;
+
+        let (content, tool_calls, usage) =
+            parse_chat_response_with_tools(raw).expect("parse should succeed in test");
+        assert_eq!(content, "OK");
+        assert!(tool_calls.is_empty());
+        assert_eq!(usage.tokens_used, 7);
     }
 
     #[test]

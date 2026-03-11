@@ -849,7 +849,7 @@ fn workflow_input_block(workflow: &str, scope: &str, input: &str) -> String {
 }
 
 fn workflow_secret_block(workflow: &str, secret: &str) -> String {
-    let anchor = format!("workflow_call:\n    inputs:");
+    let anchor = "workflow_call:\n    inputs:".to_string();
     let start = workflow
         .find(&anchor)
         .unwrap_or_else(|| panic!("workflow should contain anchor `{anchor}`"));

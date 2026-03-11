@@ -2,7 +2,7 @@
 
 Mercury CLI is Mercury-native CI auto-repair for teams using Inception Labs models.
 
-The current repo state is v1.0-in-progress with implemented runtime support across Rust and selected TypeScript verifier paths: local `watch --repair` works for supported Rust verifier commands, `fix` and CI repair flows operate on direct allowlisted Rust/TypeScript verifier commands, artifact bundles are real, `fix --max-agents N` materially changes phased runtime dispatch with real parallel candidate execution, `status --live` streams summary swarm state, verifier commands are allowlisted by default, run output redaction targets known API-key markers and configured API-key env names, and fix/watch flows emit audit logs. Candidate verification isolation is repo-copy/worktree based under `.mercury/worktrees/` (not a stronger process/container sandbox claim). `.github/workflows/repair.yml` only opens or updates draft PRs for verified repairs when `dry_run=false` and same-repo write permissions are available.
+The current branch is aligned to the Mercury CLI `1.0.0` runtime surface across Rust and selected TypeScript verifier paths: local `watch --repair` works for supported Rust verifier commands, `fix` and CI repair flows operate on direct allowlisted Rust/TypeScript verifier commands, artifact bundles are real, `fix --max-agents N` materially changes phased runtime dispatch with real parallel candidate execution, `status --live` streams summary swarm state, verifier commands are allowlisted by default, run output redaction targets known API-key markers and configured API-key env names, and fix/watch flows emit audit logs. Candidate verification isolation is repo-copy/worktree based under `.mercury/worktrees/` (not a stronger process/container sandbox claim). `.github/workflows/repair.yml` only opens or updates draft PRs for verified repairs when `dry_run=false` and same-repo write permissions are available.
 
 ## Install
 
@@ -98,7 +98,7 @@ Examples below assume you built from source in this repo, so command invocations
 | Eval corpus | Available | `evals/v0/manifest.json` (Rust) and `evals/v1_typescript/manifest.json` (TypeScript lane) each contain 50 logical cases backed by 10 canonical fixture paths. |
 | Published repair benchmark report | Not yet | The corpus exists, but the repo does not yet publish a full public repair benchmark with accepted-patch and false-green claims. |
 | `./target/release/mercury-cli fix --max-agents N` | Available with limits | Materially changes phased runtime dispatch with real parallel candidate execution and isolated candidate fanout. The current repo still does not publish benchmark-backed speedup numbers or broad overlapping-edit convergence claims from that setting. |
-| Generic workflow DSL / `agent run` | Not planned before v1.0 | Intentionally deferred until the repair workflow is stronger. |
+| Generic workflow DSL / `agent run` | Out of scope for 1.0.0 | Intentionally deferred until the repair workflow is stronger. |
 
 ## Safety Model
 
@@ -134,7 +134,7 @@ Repair runs are expected to leave behind an artifact bundle under `.mercury/runs
 
 ## Artifact Bundle
 
-A successful watch-repair cycle in the current v1.0-in-progress runtime should leave enough evidence to replay the decision:
+A successful watch-repair cycle in the current `1.0.0` runtime should leave enough evidence to replay the decision:
 
 - `watch.json` with the watched command, decision, timestamps, and repair record
 - `initial.stdout.txt` and `initial.stderr.txt` from the failing command
@@ -203,8 +203,8 @@ What it does not mean yet:
 
 ## Versioning and Migration Notes
 
-- Runtime and docs are still in `v1.0-in-progress`; stable GA semantics should be tied to tagged releases, not branch head.
-- Install from source remains the most reliable path for this branch state.
+- The current branch is aligned to `1.0.0`, but tagged releases remain the stable binary contract for published artifacts and migration expectations.
+- Install from source remains the most reliable path until the matching `v1.0.0` release tag is cut and published.
 - `INCEPTION_API_KEY` is provider-preferred; `MERCURY_API_KEY` remains backward-compatible fallback.
 - TypeScript second-language support currently includes corpus, parser/repo-map coverage, failure classification, and selected direct verifier-command support in `fix` and CI repair paths. `watch --repair` remains Rust-only.
 

@@ -73,7 +73,7 @@ Release checklist:
 1. update `CHANGELOG.md`
 2. confirm CI is green
 3. confirm docs match actual behavior
-4. create and push a tag such as `v0.2.0`, or run the release workflow manually with an explicit version
+4. create and push a tag such as `v1.0.0`, or run the release workflow manually with an explicit version
 5. verify the release workflow uploaded macOS and Linux archives plus checksum files
 6. smoke-test the packaged `mercury` command from one release archive before announcing the tag
 

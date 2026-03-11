@@ -1,6 +1,6 @@
 # Mercury CLI Eval Harness v1 TypeScript (v1.0 lane)
 
-This harness is the TypeScript second-language eval lane for v1.0-in-progress.
+This harness is the TypeScript second-language eval lane for the current 1.0.0 branch contract.
 
 Contents:
 - `manifest.json`: canonical 50-case TypeScript baseline corpus contract

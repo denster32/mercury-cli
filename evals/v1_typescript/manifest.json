@@ -4,7 +4,7 @@
   "language": "typescript",
   "version": 1,
   "artifact_schema_version": "mercury-eval-report-v0",
-  "description": "TypeScript seeded baseline corpus for v1.0-in-progress second-language support",
+  "description": "TypeScript seeded baseline corpus for the 1.0.0 second-language support lane",
   "default_timeout_seconds": 60,
   "supported_modes": [
     "baseline"

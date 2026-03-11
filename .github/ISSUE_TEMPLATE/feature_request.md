@@ -30,5 +30,5 @@ Choose one:
 
 - [ ] v0.2 repair core
 - [ ] v0.3 CI auto-repair
-- [ ] v1.0 swarm runtime
+- [ ] post-1.0 runtime
 - [ ] other

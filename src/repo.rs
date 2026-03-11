@@ -1059,15 +1059,6 @@ fn advance_past_body_or_semicolon(tokens: &[TsToken], start_idx: usize) -> usize
     tokens.len()
 }
 
-fn find_terminator(tokens: &[TsToken], start_idx: usize, stop_on_semicolon: bool) -> Option<usize> {
-    find_terminator_with_limit(
-        tokens,
-        start_idx,
-        tokens.len().saturating_sub(1),
-        stop_on_semicolon,
-    )
-}
-
 fn find_terminator_with_limit(
     tokens: &[TsToken],
     start_idx: usize,

@@ -1,6 +1,6 @@
-# Mercury CLI Architecture (v1.0 In Progress, Rust + TypeScript Runtime)
+# Mercury CLI Architecture (1.0.0 Runtime Scope, Rust + TypeScript Runtime)
 
-This document describes the current runtime and trust boundaries for Mercury CLI in the v1.0-in-progress lane, with implemented repair behavior across Rust and selected TypeScript verifier paths plus current observability/hardening surfaces.
+This document describes the current runtime and trust boundaries for Mercury CLI in the 1.0.0 branch scope, with implemented repair behavior across Rust and selected TypeScript verifier paths plus current observability and hardening surfaces.
 
 Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
@@ -49,7 +49,7 @@ For CI-safe logs, `fix` and `watch` also support `--noninteractive`, and the CI 
 
 ## Safety Model
 
-The v1.0-in-progress safety boundary is workflow-first and evidence-first.
+The 1.0.0 safety boundary is workflow-first and evidence-first.
 
 ### Candidate isolation
 
@@ -107,7 +107,7 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 - Noninteractive mode is available for CI-oriented output surfaces.
 - End-to-end `fix` and CI repair targeting support allowlisted Rust/TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
 
-## Known v1.0-In-Progress Limits
+## Known 1.0.0 Limits
 
 - Local `watch --repair` remains Rust-only.
 - `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout, but the repo does not yet publish benchmark-backed speedup claims or broad overlapping-edit convergence claims from that setting.

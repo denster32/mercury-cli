@@ -1,8 +1,8 @@
-# Mercury CLI Quality Contract (Current v1.0-in-progress, Rust + TypeScript runtime)
+# Mercury CLI Quality Contract (Current 1.0.0 Branch Contract, Rust + TypeScript Runtime)
 
 This document describes what quality automation exists in the repository today.
 
-It is intentionally scope-limited to current workflows and test surfaces. It does not claim zero defects or complete v1.0 feature coverage.
+It is intentionally scope-limited to current workflows and test surfaces. It does not claim zero defects or complete coverage beyond the implemented 1.0.0 runtime scope.
 
 ## Current CI Gates
 

@@ -1,8 +1,8 @@
 [package]
 name = "mercury-cli"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "The first diffusion-native CLI for autonomous code synthesis"
+description = "Mercury-native CI auto-repair CLI with local verification and evidence"
 license-file = "LICENSE"
 repository = "https://github.com/denster32/mercury-cli"
 

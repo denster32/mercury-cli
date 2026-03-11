@@ -16,18 +16,23 @@ use mercury_cli::verification::{
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
-static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+type ToolResponses = Arc<Mutex<Vec<(String, Vec<ToolCall>)>>>;
 
-fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+static ENV_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+fn lock_env() -> AsyncMutexGuard<'static, ()> {
+    ENV_LOCK.blocking_lock()
+}
+
+async fn lock_env_async() -> AsyncMutexGuard<'static, ()> {
+    ENV_LOCK.lock().await
 }
 
 #[derive(Clone)]
 struct FakeMercuryApi {
-    responses: Arc<Mutex<Vec<(String, Vec<ToolCall>)>>>,
+    responses: ToolResponses,
 }
 
 impl FakeMercuryApi {
@@ -268,7 +273,7 @@ fn run_tests_rejection_emits_structured_audit_metadata() {
 
 #[tokio::test]
 async fn grounded_context_redacts_verifier_commands_and_tool_arguments() {
-    let _guard = lock_env();
+    let _guard = lock_env_async().await;
     let saved = save_env(&[
         "CI",
         "GITHUB_ACTIONS",

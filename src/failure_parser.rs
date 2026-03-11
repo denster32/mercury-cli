@@ -580,13 +580,12 @@ fn parse_typescript_compile_failure(stdout: &str, stderr: &str) -> ParsedFailure
         .filter(|line| !line.is_empty())
     {
         if let Some((location, error_code, message)) = parse_typescript_error_line(line) {
-            let mut target = FailureTarget::default();
-            target.file_path = Some(location.file_path);
-            target.line = Some(location.line);
-            target.column = Some(location.column);
-            if let Some(symbol) = extract_quoted_symbol(message) {
-                target.symbol = Some(symbol);
-            }
+            let target = FailureTarget {
+                file_path: Some(location.file_path),
+                line: Some(location.line),
+                column: Some(location.column),
+                symbol: extract_quoted_symbol(message),
+            };
 
             failures.push(ParsedFailure {
                 error_class: classify_typescript_compile_error(error_code, message),

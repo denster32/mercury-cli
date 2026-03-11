@@ -918,28 +918,42 @@ async fn cmd_fix(
         config,
         db,
         project_root,
-        description,
-        max_agents,
-        max_cost,
-        build_verify_config(config),
-        None,
-        noninteractive,
+        FixCommandRequest {
+            description,
+            max_agents,
+            max_cost,
+            verify_config: build_verify_config(config),
+            parsed_failure: None,
+            noninteractive,
+        },
     )
     .await?;
     Ok(())
+}
+
+struct FixCommandRequest<'a> {
+    description: &'a str,
+    max_agents: usize,
+    max_cost: f64,
+    verify_config: VerifyConfig,
+    parsed_failure: Option<&'a failure_parser::ParsedFailureReport>,
+    noninteractive: bool,
 }
 
 async fn cmd_fix_with_verify_config(
     config: &MercuryConfig,
     db: &ThermalDb,
     project_root: &Path,
-    description: &str,
-    max_agents: usize,
-    max_cost: f64,
-    verify_config: VerifyConfig,
-    parsed_failure: Option<&failure_parser::ParsedFailureReport>,
-    noninteractive: bool,
+    request: FixCommandRequest<'_>,
 ) -> Result<FixCommandOutcome> {
+    let FixCommandRequest {
+        description,
+        max_agents,
+        max_cost,
+        verify_config,
+        parsed_failure,
+        noninteractive,
+    } = request;
     let started_at = Utc::now();
     let started = Instant::now();
     let artifact_root = create_run_artifact_root(project_root)?;
@@ -1361,7 +1375,7 @@ async fn cmd_watch(
             "command": watch_command,
             "continuous": continuous_mode,
             "repair_requested": repair,
-            "repair_supported": classify_rust_repair_command_parts(&watch_parts).is_some(),
+            "repair_supported": classify_rust_repair_command(&normalized_watch_command).is_some(),
             "security": security_runtime_context(noninteractive, None),
         }),
     );
@@ -1513,7 +1527,7 @@ async fn execute_watch_cycle(
     if !initial_run.success {
         if !repair {
             decision = "failed_without_repair".to_string();
-        } else if let Some(target) = classify_rust_repair_command_parts(command_parts) {
+        } else if let Some(target) = classify_rust_repair_command(&command_display) {
             let verify_config = build_watch_verify_config(config, &target);
             let description = build_watch_repair_description(&command_display, &initial_run);
             emit_runtime_event(
@@ -1535,12 +1549,14 @@ async fn execute_watch_cycle(
                 config,
                 db,
                 project_root,
-                &description,
-                config.scheduler.max_concurrency,
-                config.scheduler.max_cost_per_command,
-                verify_config,
-                initial_run.parsed_failure.as_ref(),
-                noninteractive,
+                FixCommandRequest {
+                    description: &description,
+                    max_agents: config.scheduler.max_concurrency,
+                    max_cost: config.scheduler.max_cost_per_command,
+                    verify_config,
+                    parsed_failure: initial_run.parsed_failure.as_ref(),
+                    noninteractive,
+                },
             )
             .await
             {
@@ -2299,24 +2315,6 @@ fn classify_rust_repair_command(command: &str) -> Option<RustRepairTarget> {
     })
 }
 
-fn classify_rust_repair_command_parts(command_parts: &[String]) -> Option<RustRepairTarget> {
-    if command_parts.is_empty() {
-        return None;
-    }
-
-    let command_kind = failure_parser::classify_cargo_command(command_parts);
-    let mode = match command_kind {
-        CargoCommandKind::Test | CargoCommandKind::Check => RustRepairMode::TestLike,
-        CargoCommandKind::Clippy => RustRepairMode::Lint,
-        CargoCommandKind::Unknown => return None,
-    };
-
-    Some(RustRepairTarget {
-        verifier_command: command_parts.join(" "),
-        mode,
-    })
-}
-
 fn build_watch_repair_description(command: &str, result: &WatchCommandResult) -> String {
     let command = redact_secrets(command);
     let mut description = format!(
@@ -2740,15 +2738,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_rust_repair_command_parts_supports_direct_cargo_vectors() {
-        let parts = vec![
+    fn classify_rust_repair_command_supports_direct_cargo_vectors() {
+        let parts = [
             "env".to_string(),
             "RUST_BACKTRACE=1".to_string(),
             "cargo".to_string(),
             "check".to_string(),
             "--workspace".to_string(),
         ];
-        let target = classify_rust_repair_command_parts(&parts).expect("command should classify");
+        let target =
+            classify_rust_repair_command(&parts.join(" ")).expect("command should classify");
         assert_eq!(target.mode, RustRepairMode::TestLike);
         assert_eq!(
             target.verifier_command,
