@@ -1417,7 +1417,7 @@ async fn cmd_plan(
     let planner = engine::Planner::new(client, config.constitutional_prompt());
 
     println!("Planning with Mercury 2...");
-    let (plan, assessments) = planner.plan(goal, &repo_map_str).await?;
+    let (plan, assessments) = planner.plan(goal, &repo_map_str, Path::new(".")).await?;
 
     store_assessments(db, &plan.steps, &assessments, "plan")?;
 
@@ -1729,7 +1729,9 @@ async fn cmd_fix_with_verify_config(
             );
 
         let planner = engine::Planner::new(planner_client, config.constitutional_prompt());
-        let (plan, assessments) = planner.plan(&planner_description, &repo_map_str).await?;
+        let (plan, assessments) = planner
+            .plan(&planner_description, &repo_map_str, project_root)
+            .await?;
         if !noninteractive {
             println!(
                 "  Plan estimate: ${:.4}{}",
@@ -1840,9 +1842,16 @@ async fn cmd_fix_with_verify_config(
                 None
             },
         );
-        let execution_summary: StepExecutionSummary =
-            engine::execute_plan_steps(&plan, &patcher, &verifier, &scheduler, db, project_root)
-                .await?;
+        let execution_summary: StepExecutionSummary = engine::execute_plan_steps(
+            &plan,
+            &patcher,
+            &verifier,
+            &scheduler,
+            db,
+            project_root,
+            grounded_context.parsed_failure.as_ref(),
+        )
+        .await?;
         let final_security =
             security_runtime_context(noninteractive, execution_summary.run_root.as_deref());
         write_audit_event(
@@ -1987,6 +1996,10 @@ async fn cmd_fix_with_verify_config(
                 accepted_steps: execution_summary.accepted,
                 rejected_steps: execution_summary.rejected,
                 verification_failures: execution_summary.verification_failures,
+                generation_failures: execution_summary.generation_failures,
+                safety_failures: execution_summary.safety_failures,
+                candidate_verification_failures: execution_summary.candidate_verification_failures,
+                final_bundle_failures: execution_summary.final_bundle_failures,
                 retry_attempts: execution_summary.retry_attempts,
                 time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
                 time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
@@ -1999,6 +2012,11 @@ async fn cmd_fix_with_verify_config(
                     accepted_patch,
                 )
                 .to_string(),
+                failure_attribution: classify_fix_failure_attribution(
+                    &execution_summary,
+                    accepted_patch,
+                )
+                .map(str::to_string),
                 // False-green requires an independent rerun outside `fix`; the
                 // benchmark harness derives it later instead of guessing here.
                 false_green: None,
@@ -2467,8 +2485,8 @@ async fn execute_watch_cycle(
         duration_ms: started.elapsed().as_millis() as u64,
     };
 
-    write_json_artifact(&artifact_root.join("watch.json"), &record)?;
     write_watch_output_artifacts(&artifact_root, &record)?;
+    write_json_artifact(&artifact_root.join("watch.json"), &record)?;
     write_audit_event(
         &artifact_root,
         "watch_cycle_completed",
@@ -2652,6 +2670,10 @@ struct FixBenchmarkRun {
     accepted_steps: usize,
     rejected_steps: usize,
     verification_failures: usize,
+    generation_failures: usize,
+    safety_failures: usize,
+    candidate_verification_failures: usize,
+    final_bundle_failures: usize,
     retry_attempts: usize,
     time_to_first_candidate_ms: Option<u64>,
     time_to_verified_repair_ms: Option<u64>,
@@ -2660,6 +2682,8 @@ struct FixBenchmarkRun {
     accepted_patch: bool,
     accepted_patch_bytes: Option<u64>,
     outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_attribution: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     false_green: Option<bool>,
     sandbox_run_root: Option<String>,
@@ -2717,6 +2741,10 @@ fn write_fix_failure_artifacts(
             accepted_steps: 0,
             rejected_steps: 0,
             verification_failures: 0,
+            generation_failures: 0,
+            safety_failures: 0,
+            candidate_verification_failures: 0,
+            final_bundle_failures: 0,
             retry_attempts: 0,
             time_to_first_candidate_ms: None,
             time_to_verified_repair_ms: None,
@@ -2725,6 +2753,7 @@ fn write_fix_failure_artifacts(
             accepted_patch: false,
             accepted_patch_bytes: None,
             outcome: outcome.to_string(),
+            failure_attribution: Some(outcome.to_string()),
             false_green: None,
             sandbox_run_root: None,
             total_cost_usd: 0.0,
@@ -3018,6 +3047,28 @@ fn classify_fix_benchmark_outcome(
     } else {
         "no_patch"
     }
+}
+
+fn classify_fix_failure_attribution(
+    summary: &StepExecutionSummary,
+    accepted_patch: bool,
+) -> Option<&'static str> {
+    if summary.final_bundle_verified {
+        return None;
+    }
+    if summary.final_bundle_failures > 0 || accepted_patch {
+        return Some("final_bundle_verification_failed");
+    }
+    if summary.candidate_verification_failures > 0 {
+        return Some("candidate_failed_verifier");
+    }
+    if summary.safety_failures > 0 {
+        return Some("candidate_failed_safety");
+    }
+    if summary.generation_failures > 0 {
+        return Some("patch_generation_failed");
+    }
+    Some("no_patch_emitted")
 }
 
 // ---------------------------------------------------------------------------

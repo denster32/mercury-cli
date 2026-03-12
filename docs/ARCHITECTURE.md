@@ -1,10 +1,10 @@
-# Mercury CLI Architecture (1.0.0-beta.1 Pre-Release Scope, Rust-First Repair + Scoped TypeScript Support)
+# Mercury CLI Architecture (1.0.0-beta.1 Pre-Release Scope, Rust-First Repair + Scoped Experimental TypeScript Support)
 
-This document describes the current runtime and trust boundaries for Mercury CLI in the `1.0.0-beta.1` pre-release branch scope, with repair quality centered on Rust, scoped selected TypeScript verifier-path support, and current observability and hardening surfaces.
+This document describes the current runtime and trust boundaries for Mercury CLI in the `1.0.0-beta.1` pre-release branch scope, with repair quality centered on Rust, scoped experimental selected TypeScript verifier-path support, and current observability and hardening surfaces.
 
 Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
 
-- start from a failing direct allowlisted verifier command, with Rust as the primary repair-quality target and selected TypeScript commands supported in scoped `fix` and CI flows
+- start from a failing direct allowlisted verifier command, with Rust as the primary repair-quality target and selected experimental TypeScript commands supported in scoped `fix` and CI flows
 - attempt bounded repair with Mercury models
 - verify locally in isolation before acceptance
 - emit a reviewable evidence bundle
@@ -99,20 +99,21 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 
 - Workflow decision/environment payloads are JSON with stable keys used by docs/tests.
 - Eval harnesses (`evals/v0` for Rust and `evals/v1_typescript` for TypeScript lane) are manifest-driven and emit schema/version metadata in reports.
+- Rust repository analysis is parser-backed; the current TypeScript lane relies on token-aware repository scanning plus failure parsing rather than a real TypeScript parser.
 - Planner critique text remains advisory prose and should not be treated as a strict machine contract.
 
 ## Enterprise Hardening Baselines
 
-- Verifier allowlist enforces direct Rust cargo verifier commands and selected direct TypeScript verifier invocations by default (including supported env-prefix forms).
+- Verifier allowlist enforces direct Rust cargo verifier commands and selected direct experimental TypeScript verifier invocations by default (including supported env-prefix forms).
 - Shell composition in verifier commands is blocked unless `MERCURY_ALLOW_UNSAFE_VERIFIER_COMMANDS=1` is set explicitly.
 - Noninteractive mode is available for CI-oriented output surfaces.
-- End-to-end `fix` and CI repair targeting support allowlisted Rust direct verifier commands plus scoped selected TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
+- End-to-end `fix` and CI repair targeting support allowlisted Rust direct verifier commands plus scoped selected experimental TypeScript direct verifier commands; local `watch --repair` remains Rust-only.
 
 ## Known 1.0.0-beta.1 Limits
 
 - Local `watch --repair` remains Rust-only.
 - `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout. The repo now publishes scoped Rust benchmark speedup data under `docs/benchmarks/`, but it still does not claim broad overlapping-edit convergence from that setting.
-- TypeScript support is intentionally scoped: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited; this is not parity with the Rust repair surface.
+- TypeScript support is intentionally scoped and experimental: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited; the repo does not ship a real TypeScript parser, so this is not parity with the Rust repair surface.
 - Live observability now exposes candidate/phase/runtime events, but it is still not a full conflict-telemetry or merge-decision explanation surface.
 - CI automation is draft-PR oriented, not autonomous merge.
 - Public benchmark reporting now exists under `docs/benchmarks/` for the selected Rust corpus, emitted by the dedicated repair benchmark workflow and publisher. Those checked-in numbers are bounded to the exact run ids and corpus selection documented there.

@@ -312,6 +312,7 @@ async fn test_fix_executes_verification_gate() {
         execute_plan_steps, ExecutionPlan, Patcher, PlanStep, Scheduler, SchedulerConfig, Verifier,
         VerifyConfig,
     };
+    use mercury_cli::repo::RepoRelativePath;
     use mercury_cli::{api::Mercury2Api, api::MercuryEditApi};
     use std::future::Future;
     use std::path::Path;
@@ -401,13 +402,13 @@ async fn test_fix_executes_verification_gate() {
     let plan = ExecutionPlan {
         steps: vec![
             PlanStep {
-                file_path: "sample.rs".to_string(),
+                file_path: RepoRelativePath::new("sample.rs").unwrap(),
                 instruction: "fn bad( {".to_string(),
                 priority: 1.0,
                 estimated_tokens: 64,
             },
             PlanStep {
-                file_path: "sample.rs".to_string(),
+                file_path: RepoRelativePath::new("sample.rs").unwrap(),
                 instruction: "
 fn hello() {} // PASS"
                     .to_string(),
@@ -446,6 +447,7 @@ fn hello() {} // PASS"
         &scheduler,
         &db,
         Path::new(project_root),
+        None,
     )
     .await
     .unwrap();

@@ -351,6 +351,8 @@ fn repair_benchmark_runner_lists_filtered_cases_as_json() {
         .arg("--list-json")
         .arg("--stage")
         .arg("lint")
+        .arg("--difficulty")
+        .arg("easy")
         .arg("--limit")
         .arg("2")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -372,6 +374,7 @@ fn repair_benchmark_runner_lists_filtered_cases_as_json() {
     );
     assert!(listed.len() <= 2, "limit should cap returned cases");
     assert!(listed.iter().all(|case| case["failure_stage"] == "lint"));
+    assert!(listed.iter().all(|case| case["difficulty"] == "easy"));
 }
 
 #[test]
@@ -996,7 +999,8 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "selected_case_ids": ["rust_type_mismatch"],
             "selected_unique_fixture_paths": 2,
             "requested_limit": serde_json::Value::Null,
-            "requested_stages": ["compile"]
+            "requested_stages": ["compile"],
+            "requested_difficulties": []
         },
         "started_at": "2026-03-11T00:00:00Z",
         "finished_at": "2026-03-11T00:05:00Z",
@@ -1016,6 +1020,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "median_cost_per_verified_repair_usd": 0.18,
             "mean_cost_per_verified_repair_usd": 0.21
         },
+        "failure_attribution": {},
         "speedup_curve": [{
             "agent_count": 4,
             "attempted_cases": 10,
@@ -1064,7 +1069,8 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "selected_case_ids": ["rust_type_mismatch"],
             "selected_unique_fixture_paths": 2,
             "requested_limit": 4,
-            "requested_stages": ["compile", "test"]
+            "requested_stages": ["compile", "test"],
+            "requested_difficulties": []
         },
         "started_at": "2026-03-11T01:00:00Z",
         "finished_at": "2026-03-11T01:05:00Z",
@@ -1083,6 +1089,9 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "mean_cost_per_attempted_case_usd": 0.13,
             "median_cost_per_verified_repair_usd": 0.16,
             "mean_cost_per_verified_repair_usd": 0.19
+        },
+        "failure_attribution": {
+            "candidate_failed_verifier": 1
         },
         "speedup_curve": [
             {
@@ -1148,6 +1157,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "case_id": "rust_type_mismatch",
             "agent_count": 8,
             "verified_repair": false,
+            "failure_attribution": "candidate_failed_verifier",
             "benchmark_run_path": "/tmp/sweep/cases/rust_type_mismatch/agents-8/benchmark-run.json",
             "candidate_workspace": "/tmp/sweep/workspaces/rust_type_mismatch-agents-8"
         }]
@@ -1213,6 +1223,10 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
     assert_eq!(
         copied_agent_sweep["selection"]["manifest_path"],
         "evals/v0/manifest.json"
+    );
+    assert_eq!(
+        copied_agent_sweep["failure_attribution"]["candidate_failed_verifier"],
+        1
     );
     assert_public_benchmark_report_is_scrubbed(&copied_quality);
     assert_public_benchmark_report_is_scrubbed(&copied_agent_sweep);
@@ -1822,6 +1836,10 @@ fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
     assert_eq!(result["false_green"], true);
     assert_eq!(result["verified_repair"], false);
     assert_eq!(result["outcome"], "false_green");
+    assert_eq!(
+        result["failure_attribution"],
+        "mercury_verified_but_independent_rerun_failed"
+    );
     assert_eq!(result["final_bundle_verified"], true);
     assert_eq!(result["accepted_patch"], true);
     assert_eq!(result["independent_rerun_success"], false);
@@ -1858,6 +1876,10 @@ fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
     assert_eq!(report["schema_version"], "mercury-repair-benchmark-v1");
     assert_eq!(report["metrics"]["false_greens"], 1);
     assert_eq!(report["metrics"]["verified_repairs"], 0);
+    assert_eq!(
+        report["failure_attribution"]["mercury_verified_but_independent_rerun_failed"],
+        1
+    );
     assert_eq!(report["keep_workspaces"], false);
 }
 
@@ -2100,6 +2122,10 @@ sys.exit(1)
         result["outcome"],
         Value::String("missing_benchmark_run".to_string()),
         "timed-out runs without benchmark artifacts should still produce a result"
+    );
+    assert_eq!(
+        result["failure_attribution"],
+        Value::String("missing_benchmark_run".to_string())
     );
 }
 

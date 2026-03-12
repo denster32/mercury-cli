@@ -23,6 +23,21 @@ DEFAULT_MAX_COST_USD = 0.5
 DEFAULT_QUALITY_AGENT_COUNT = 4
 DEFAULT_AGENT_SWEEP = [1, 2, 4, 8]
 DEFAULT_REPRESENTATIVE_COUNT = 10
+DIFFICULTY_ORDER = ["easy", "medium", "hard", "unknown"]
+FAILURE_ATTRIBUTION_ORDER = [
+    "baseline_not_reproduced",
+    "missing_benchmark_run",
+    "fix_failed",
+    "rejected_allowlist",
+    "patch_generation_failed",
+    "candidate_failed_safety",
+    "candidate_failed_verifier",
+    "final_bundle_verification_failed",
+    "no_patch_emitted",
+    "accepted_patch_failed_independent_rerun",
+    "mercury_verified_but_independent_rerun_failed",
+    "runner_error",
+]
 
 
 def now_utc() -> datetime:
@@ -106,6 +121,7 @@ def select_cases(
     case_ids: Optional[list[str]],
     stages: Optional[list[str]],
     failure_classes: Optional[list[str]],
+    difficulties: Optional[list[str]],
     tags: Optional[list[str]],
     limit: Optional[int],
 ) -> list[dict[str, Any]]:
@@ -123,6 +139,14 @@ def select_cases(
 
     if failure_classes:
         selected = [case for case in selected if case["failure_class"] in set(failure_classes)]
+
+    if difficulties:
+        requested_difficulties = {normalize_difficulty_label(value) for value in difficulties}
+        selected = [
+            case
+            for case in selected
+            if normalize_difficulty_label(case.get("difficulty")) in requested_difficulties
+        ]
 
     if tags:
         tag_set = set(tags)
@@ -364,6 +388,12 @@ def median_or_none(values: list[Union[float, int]]) -> Optional[float]:
     return float(statistics.median(values))
 
 
+def normalize_difficulty_label(value: Any) -> str:
+    if isinstance(value, str) and value in {"easy", "medium", "hard"}:
+        return value
+    return "unknown"
+
+
 def compute_repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for result in results:
@@ -371,6 +401,104 @@ def compute_repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[s
         label = outcome if isinstance(outcome, str) and outcome else "unknown"
         counts[label] = counts.get(label, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def failure_attribution_label(result: dict[str, Any]) -> Optional[str]:
+    if result.get("verified_repair"):
+        return None
+
+    explicit = result.get("failure_attribution")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    outcome = result.get("outcome")
+    if outcome == "accepted_patch_unverified":
+        return "accepted_patch_failed_independent_rerun"
+    if outcome == "baseline_not_reproduced":
+        return "baseline_not_reproduced"
+    if outcome == "false_green":
+        return "mercury_verified_but_independent_rerun_failed"
+    if outcome == "missing_benchmark_run":
+        return "missing_benchmark_run"
+    if outcome == "no_patch":
+        return "no_patch_emitted"
+    if outcome == "runner_error":
+        return "runner_error"
+    if isinstance(outcome, str) and outcome:
+        return outcome
+    return "unknown_failure"
+
+
+def classify_failure_attribution(
+    benchmark_run: dict[str, Any],
+    outcome: str,
+    accepted_patch: bool,
+    mercury_verified: bool,
+    rerun_success: bool,
+) -> Optional[str]:
+    if outcome == "verified_repair":
+        return None
+
+    explicit = benchmark_run.get("failure_attribution")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    if mercury_verified and not rerun_success:
+        return "mercury_verified_but_independent_rerun_failed"
+    if accepted_patch and not rerun_success:
+        return "accepted_patch_failed_independent_rerun"
+    if outcome == "baseline_not_reproduced":
+        return "baseline_not_reproduced"
+    if outcome == "missing_benchmark_run":
+        return "missing_benchmark_run"
+    if outcome == "runner_error":
+        return "runner_error"
+    if outcome == "no_patch":
+        return "no_patch_emitted"
+    if isinstance(outcome, str) and outcome:
+        return outcome
+    return "unknown_failure"
+
+
+def compute_failure_attribution(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        label = failure_attribution_label(result)
+        if label is None:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+
+    ordered = [label for label in FAILURE_ATTRIBUTION_ORDER if label in counts]
+    extras = sorted(label for label in counts if label not in FAILURE_ATTRIBUTION_ORDER)
+    return {label: counts[label] for label in ordered + extras}
+
+
+def bucket_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    attempted_cases = len(results)
+    verified_repairs = sum(1 for result in results if result["verified_repair"])
+    accepted_patches = sum(1 for result in results if result["accepted_patch"])
+    false_greens = sum(1 for result in results if result["false_green"])
+    return {
+        "attempted_cases": attempted_cases,
+        "verified_repairs": verified_repairs,
+        "accepted_patches": accepted_patches,
+        "false_greens": false_greens,
+        "verified_repair_rate": verified_repairs / attempted_cases if attempted_cases else 0.0,
+        "accepted_patch_rate": accepted_patches / attempted_cases if attempted_cases else 0.0,
+        "false_green_rate": false_greens / attempted_cases if attempted_cases else 0.0,
+        "repair_outcome_distribution": compute_repair_outcome_distribution(results),
+    }
+
+
+def compute_difficulty_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_difficulty: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        label = normalize_difficulty_label(result.get("difficulty"))
+        by_difficulty.setdefault(label, []).append(result)
+
+    ordered = [label for label in DIFFICULTY_ORDER if label in by_difficulty]
+    extras = sorted(label for label in by_difficulty if label not in DIFFICULTY_ORDER)
+    return {label: bucket_metrics(by_difficulty[label]) for label in ordered + extras}
 
 
 def compute_agent_curves(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -461,6 +589,30 @@ def summarize_report(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## Difficulty-Class Breakdown",
+            "",
+        ]
+    )
+
+    for difficulty, bucket in report["difficulty_breakdown"].items():
+        lines.append(
+            f"- {difficulty}: attempted={bucket['attempted_cases']}, verified={bucket['verified_repairs']}, accepted={bucket['accepted_patches']}, false_greens={bucket['false_greens']}, verified_rate={bucket['verified_repair_rate']:.3f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Failure Attribution",
+            "",
+        ]
+    )
+
+    for label, count in report["failure_attribution"].items():
+        lines.append(f"- {label}: {count}")
+
+    lines.extend(
+        [
+            "",
         "## Speedup Curve",
         "",
         ]
@@ -480,7 +632,7 @@ def summarize_report(report: dict[str, Any]) -> str:
     lines.extend(["", "## Case Results", ""])
     for result in report["results"]:
         lines.append(
-            f"- {result['case_id']} @ {result['agent_count']} agents: outcome={result['outcome']}, verified_repair={result['verified_repair']}, false_green={result['false_green']}, total_cost_usd={result['total_cost_usd']}"
+            f"- {result['case_id']} [{normalize_difficulty_label(result.get('difficulty'))}] @ {result['agent_count']} agents: outcome={result['outcome']}, verified_repair={result['verified_repair']}, false_green={result['false_green']}, total_cost_usd={result['total_cost_usd']}"
         )
 
     lines.append("")
@@ -501,6 +653,7 @@ def render_selection(
         "requested_case_ids": args.case or [],
         "requested_stages": args.stage or [],
         "requested_failure_classes": args.failure_class or [],
+        "requested_difficulties": args.difficulty or [],
         "requested_tags": args.tag or [],
         "requested_limit": args.limit,
         "selected_case_ids": [case["id"] for case in selected_cases],
@@ -558,6 +711,7 @@ def build_runner_error_result(
         "case_id": case["id"],
         "case_title": case["title"],
         "case_path": case["path"],
+        "difficulty": normalize_difficulty_label(case.get("difficulty")),
         "failure_stage": case["failure_stage"],
         "failure_class": case["failure_class"],
         "agent_count": agent_count,
@@ -567,6 +721,7 @@ def build_runner_error_result(
         "accepted_patch_bytes": 0,
         "verified_repair": False,
         "false_green": False,
+        "failure_attribution": "runner_error",
         "fix_exit_code": None,
         "fix_timed_out": False,
         "fix_duration_ms": 0,
@@ -618,6 +773,8 @@ def build_report(
         if result["verified_repair"]
     ]
     repair_outcome_distribution = compute_repair_outcome_distribution(results)
+    difficulty_breakdown = compute_difficulty_breakdown(results)
+    failure_attribution = compute_failure_attribution(results)
     speedup_curve, cost_curve = compute_agent_curves(results)
 
     return {
@@ -661,6 +818,8 @@ def build_report(
             "mean_cost_per_verified_repair_usd": mean_or_none(verified_costs),
         },
         "repair_outcome_distribution": repair_outcome_distribution,
+        "difficulty_breakdown": difficulty_breakdown,
+        "failure_attribution": failure_attribution,
         "speedup_curve": speedup_curve,
         "cost_curve": cost_curve,
         "results": results,
@@ -699,6 +858,7 @@ def evaluate_case(
                 "case_id": case["id"],
                 "case_title": case["title"],
                 "case_path": case["path"],
+                "difficulty": normalize_difficulty_label(case.get("difficulty")),
                 "failure_stage": case["failure_stage"],
                 "failure_class": case["failure_class"],
                 "agent_count": agent_count,
@@ -707,6 +867,7 @@ def evaluate_case(
                 "accepted_patch": False,
                 "verified_repair": False,
                 "false_green": False,
+                "failure_attribution": "baseline_not_reproduced",
                 "total_cost_usd": 0.0,
                 "fix_duration_ms": 0,
                 "time_to_first_candidate_ms": None,
@@ -789,12 +950,20 @@ def evaluate_case(
             mercury_verified,
             rerun_success,
         )
+        failure_attribution = classify_failure_attribution(
+            benchmark_run,
+            outcome,
+            accepted_patch,
+            mercury_verified,
+            rerun_success,
+        )
 
         result = {
             "schema_version": BENCHMARK_RESULT_SCHEMA_VERSION,
             "case_id": case["id"],
             "case_title": case["title"],
             "case_path": case["path"],
+            "difficulty": normalize_difficulty_label(case.get("difficulty")),
             "failure_stage": case["failure_stage"],
             "failure_class": case["failure_class"],
             "agent_count": agent_count,
@@ -804,6 +973,7 @@ def evaluate_case(
             "accepted_patch_bytes": int(benchmark_run.get("accepted_patch_bytes") or 0),
             "verified_repair": verified_repair,
             "false_green": false_green,
+            "failure_attribution": failure_attribution,
             "fix_exit_code": fix_result.get("exit_code"),
             "fix_timed_out": fix_result.get("timed_out"),
             "fix_duration_ms": int(benchmark_run.get("duration_ms") or fix_result["duration_ms"]),
@@ -904,6 +1074,12 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help="Repeatable failure_class filter.",
     )
+    parser.add_argument(
+        "--difficulty",
+        action="append",
+        choices=DIFFICULTY_ORDER,
+        help="Repeatable difficulty filter.",
+    )
     parser.add_argument("--tag", action="append", help="Repeatable tag filter.")
     parser.add_argument("--limit", type=int, help="Maximum number of selected cases.")
     parser.add_argument(
@@ -966,6 +1142,7 @@ def main() -> int:
         args.case,
         args.stage,
         args.failure_class,
+        args.difficulty,
         args.tag,
         args.limit,
     )

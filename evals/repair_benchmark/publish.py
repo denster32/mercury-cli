@@ -4,7 +4,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "docs" / "benchmarks"
@@ -14,6 +14,21 @@ TRACK_MARKDOWN = "rust-v0-repair-benchmark.md"
 QUALITY_REPORT_NAME = "rust-v0-quality.report.json"
 AGENT_SWEEP_REPORT_NAME = "rust-v0-agent-sweep.report.json"
 PENDING_STATUS = "pending first checked-in secret-backed run."
+DIFFICULTY_ORDER = ["easy", "medium", "hard", "unknown"]
+FAILURE_ATTRIBUTION_ORDER = [
+    "baseline_not_reproduced",
+    "missing_benchmark_run",
+    "fix_failed",
+    "rejected_allowlist",
+    "patch_generation_failed",
+    "candidate_failed_safety",
+    "candidate_failed_verifier",
+    "final_bundle_verification_failed",
+    "no_patch_emitted",
+    "accepted_patch_failed_independent_rerun",
+    "mercury_verified_but_independent_rerun_failed",
+    "runner_error",
+]
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -71,6 +86,14 @@ def sanitize_public_report(report: dict[str, Any]) -> dict[str, Any]:
         sanitized_results.append(public_result)
     sanitized["results"] = sanitized_results
     sanitized["repair_outcome_distribution"] = repair_outcome_distribution(sanitized_results)
+    if "difficulty_breakdown" in report:
+        sanitized["difficulty_breakdown"] = compute_difficulty_breakdown(sanitized_results)
+    else:
+        sanitized.pop("difficulty_breakdown", None)
+    if "failure_attribution" in report:
+        sanitized["failure_attribution"] = compute_failure_attribution(sanitized_results)
+    else:
+        sanitized.pop("failure_attribution", None)
 
     return sanitized
 
@@ -99,6 +122,7 @@ def selection_summary(report: dict[str, Any]) -> list[str]:
         f"- Selected cases: `{selection['selected_count']}`",
         f"- Unique fixture paths: `{selection['selected_unique_fixture_paths']}`",
         f"- Requested stages: `{', '.join(selection['requested_stages']) if selection['requested_stages'] else 'all selected Rust stages'}`",
+        f"- Requested difficulties: `{', '.join(selection.get('requested_difficulties', [])) if selection.get('requested_difficulties') else 'all difficulties'}`",
         f"- Requested limit: `{selection['requested_limit'] if selection['requested_limit'] is not None else 'none'}`",
     ]
 
@@ -147,6 +171,79 @@ def repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]
     return dict(sorted(counts.items()))
 
 
+def normalize_difficulty_label(value: Any) -> str:
+    if isinstance(value, str) and value in {"easy", "medium", "hard"}:
+        return value
+    return "unknown"
+
+
+def failure_attribution_label(result: dict[str, Any]) -> Optional[str]:
+    if result.get("verified_repair"):
+        return None
+
+    explicit = result.get("failure_attribution")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    outcome = result.get("outcome")
+    if outcome == "accepted_patch_unverified":
+        return "accepted_patch_failed_independent_rerun"
+    if outcome == "baseline_not_reproduced":
+        return "baseline_not_reproduced"
+    if outcome == "false_green":
+        return "mercury_verified_but_independent_rerun_failed"
+    if outcome == "missing_benchmark_run":
+        return "missing_benchmark_run"
+    if outcome == "no_patch":
+        return "no_patch_emitted"
+    if outcome == "runner_error":
+        return "runner_error"
+    if isinstance(outcome, str) and outcome:
+        return outcome
+    return "unknown_failure"
+
+
+def compute_failure_attribution(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        label = failure_attribution_label(result)
+        if label is None:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+
+    ordered = [label for label in FAILURE_ATTRIBUTION_ORDER if label in counts]
+    extras = sorted(label for label in counts if label not in FAILURE_ATTRIBUTION_ORDER)
+    return {label: counts[label] for label in ordered + extras}
+
+
+def bucket_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    attempted_cases = len(results)
+    verified_repairs = sum(1 for result in results if result.get("verified_repair"))
+    accepted_patches = sum(1 for result in results if result.get("accepted_patch"))
+    false_greens = sum(1 for result in results if result.get("false_green"))
+    return {
+        "attempted_cases": attempted_cases,
+        "verified_repairs": verified_repairs,
+        "accepted_patches": accepted_patches,
+        "false_greens": false_greens,
+        "verified_repair_rate": verified_repairs / attempted_cases if attempted_cases else 0.0,
+        "accepted_patch_rate": accepted_patches / attempted_cases if attempted_cases else 0.0,
+        "false_green_rate": false_greens / attempted_cases if attempted_cases else 0.0,
+        "repair_outcome_distribution": repair_outcome_distribution(results),
+    }
+
+
+def compute_difficulty_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_difficulty: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        label = normalize_difficulty_label(result.get("difficulty"))
+        by_difficulty.setdefault(label, []).append(result)
+
+    ordered = [label for label in DIFFICULTY_ORDER if label in by_difficulty]
+    extras = sorted(label for label in by_difficulty if label not in DIFFICULTY_ORDER)
+    return {label: bucket_metrics(by_difficulty[label]) for label in ordered + extras}
+
+
 def render_outcome_table(quality: dict[str, Any], agent_sweep: dict[str, Any]) -> list[str]:
     quality_counts = quality["repair_outcome_distribution"]
     agent_counts = agent_sweep["repair_outcome_distribution"]
@@ -161,6 +258,65 @@ def render_outcome_table(quality: dict[str, Any], agent_sweep: dict[str, Any]) -
                 outcome=outcome,
                 quality_count=quality_counts.get(outcome, 0),
                 agent_count=agent_counts.get(outcome, 0),
+            )
+        )
+    return lines
+
+
+def ordered_labels(
+    primary_order: list[str], first: dict[str, Any], second: dict[str, Any]
+) -> list[str]:
+    labels = set(first) | set(second)
+    ordered = [label for label in primary_order if label in labels]
+    extras = sorted(label for label in labels if label not in primary_order)
+    return ordered + extras
+
+
+def render_difficulty_table(title: str, report: dict[str, Any]) -> list[str]:
+    breakdown = report.get("difficulty_breakdown", {})
+    lines = [
+        f"### {title}",
+        "",
+        "| difficulty | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for label in ordered_labels(DIFFICULTY_ORDER, breakdown, {}):
+        bucket = breakdown[label]
+        outcome_summary = ", ".join(
+            f"{outcome}={count}" for outcome, count in bucket["repair_outcome_distribution"].items()
+        )
+        lines.append(
+            "| {difficulty} | {attempted} | {verified} | {accepted} | {false_greens} | {verified_rate} | {accepted_rate} | {false_green_rate} | {outcomes} |".format(
+                difficulty=label,
+                attempted=bucket["attempted_cases"],
+                verified=bucket["verified_repairs"],
+                accepted=bucket["accepted_patches"],
+                false_greens=bucket["false_greens"],
+                verified_rate=format_metric(bucket["verified_repair_rate"]),
+                accepted_rate=format_metric(bucket["accepted_patch_rate"]),
+                false_green_rate=format_metric(bucket["false_green_rate"]),
+                outcomes=outcome_summary or "n/a",
+            )
+        )
+    return lines
+
+
+def render_failure_attribution_table(
+    quality: dict[str, Any], agent_sweep: dict[str, Any]
+) -> list[str]:
+    quality_counts = quality.get("failure_attribution", {})
+    agent_counts = agent_sweep.get("failure_attribution", {})
+    labels = ordered_labels(FAILURE_ATTRIBUTION_ORDER, quality_counts, agent_counts)
+    lines = [
+        "| failure attribution | quality count | agent-sweep count |",
+        "| --- | ---: | ---: |",
+    ]
+    for label in labels:
+        lines.append(
+            "| {label} | {quality_count} | {agent_count} |".format(
+                label=label,
+                quality_count=quality_counts.get(label, 0),
+                agent_count=agent_counts.get(label, 0),
             )
         )
     return lines
@@ -207,6 +363,8 @@ def render_pending_markdown() -> str:
         "- accepted patch rate",
         "- false-green rate",
         "- repair outcome distribution",
+        "- difficulty-class breakdown",
+        "- failure attribution",
         "- median time to first candidate",
         "- median time to verified repair",
         "- median and mean cost per attempted case",
@@ -261,6 +419,30 @@ def render_published_markdown(quality: dict[str, Any], agent_sweep: dict[str, An
         "",
     ]
     lines.extend(render_outcome_table(quality, agent_sweep))
+    if quality.get("difficulty_breakdown") or agent_sweep.get("difficulty_breakdown"):
+        lines.extend(
+            [
+                "",
+                "## Difficulty-Class Breakdown",
+                "",
+            ]
+        )
+        lines.extend(render_difficulty_table("Quality report", quality))
+        lines.extend(
+            [
+                "",
+            ]
+        )
+        lines.extend(render_difficulty_table("Agent-sweep report", agent_sweep))
+    if quality.get("failure_attribution") or agent_sweep.get("failure_attribution"):
+        lines.extend(
+            [
+                "",
+                "## Failure Attribution",
+                "",
+            ]
+        )
+        lines.extend(render_failure_attribution_table(quality, agent_sweep))
     lines.extend(
         [
             "",

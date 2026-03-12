@@ -8,10 +8,12 @@
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use git2::Repository;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tree_sitter::Parser;
 
@@ -37,10 +39,191 @@ pub enum RepoError {
     /// A git command failed while preparing an isolated workspace.
     #[error("git command failed (`{command}`): {stderr}")]
     GitCommandFailed { command: String, stderr: String },
+
+    /// A planner or runtime path was not a safe repo-relative path.
+    #[error("invalid repo-relative path `{path}`: {reason}")]
+    InvalidRepoRelativePath { path: String, reason: String },
 }
 
 /// Convenience alias used throughout this module.
 pub type Result<T> = std::result::Result<T, RepoError>;
+
+/// A validated path that is always relative to a repository root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepoRelativePath(String);
+
+impl RepoRelativePath {
+    /// Validate a repo-relative path without a specific filesystem root.
+    pub fn new(path: impl AsRef<str>) -> Result<Self> {
+        let normalized = normalize_repo_relative_path(path.as_ref())?;
+        Ok(Self(normalized))
+    }
+
+    /// Validate a repo-relative path against an existing repository root.
+    pub fn from_planner_path(project_root: &Path, path: impl AsRef<str>) -> Result<Self> {
+        let relative = Self::new(path)?;
+        relative.ensure_within_root(project_root)?;
+        Ok(relative)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+
+    pub fn resolve_under(&self, root: &Path) -> Result<PathBuf> {
+        resolve_repo_relative_path(root, self.as_path(), self.as_str())
+    }
+
+    pub fn ensure_within_root(&self, root: &Path) -> Result<()> {
+        self.resolve_under(root).map(|_| ())
+    }
+}
+
+impl std::fmt::Display for RepoRelativePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Serialize for RepoRelativePath {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RepoRelativePath {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+fn normalize_repo_relative_path(raw: &str) -> Result<String> {
+    if raw.trim().is_empty() {
+        return Err(invalid_repo_relative_path(raw, "path cannot be empty"));
+    }
+    if raw.contains('\0') {
+        return Err(invalid_repo_relative_path(raw, "path contains NUL byte"));
+    }
+    if looks_like_windows_absolute_path(raw) {
+        return Err(invalid_repo_relative_path(
+            raw,
+            "absolute Windows paths are not allowed",
+        ));
+    }
+
+    let normalized_separators = raw.replace('\\', "/");
+    let candidate = Path::new(&normalized_separators);
+    if candidate.is_absolute() {
+        return Err(invalid_repo_relative_path(
+            raw,
+            "absolute paths are not allowed",
+        ));
+    }
+
+    let mut components = Vec::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => components.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(invalid_repo_relative_path(
+                    raw,
+                    "parent-directory traversal is not allowed",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid_repo_relative_path(
+                    raw,
+                    "path must stay relative to the repository root",
+                ));
+            }
+        }
+    }
+
+    if components.is_empty() {
+        return Err(invalid_repo_relative_path(
+            raw,
+            "path must point to a repository file",
+        ));
+    }
+
+    Ok(components.join("/"))
+}
+
+fn looks_like_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || path.starts_with("\\\\")
+}
+
+fn resolve_repo_relative_path(root: &Path, relative: &Path, raw: &str) -> Result<PathBuf> {
+    let root = fs::canonicalize(root)?;
+    let mut current = root.clone();
+    let mut components = relative.components().peekable();
+
+    while let Some(component) = components.next() {
+        let Component::Normal(part) = component else {
+            return Err(invalid_repo_relative_path(
+                raw,
+                "path contains unsupported components",
+            ));
+        };
+        let next = current.join(part);
+        match fs::symlink_metadata(&next) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    let target = fs::canonicalize(&next)?;
+                    if !target.starts_with(&root) {
+                        return Err(invalid_repo_relative_path(
+                            raw,
+                            "symlink escapes the repository root",
+                        ));
+                    }
+                    current = target;
+                } else {
+                    if components.peek().is_some() && !metadata.is_dir() {
+                        return Err(invalid_repo_relative_path(
+                            raw,
+                            "path traverses through a file",
+                        ));
+                    }
+                    current = next;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                current = next;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    if !current.starts_with(&root) {
+        return Err(invalid_repo_relative_path(
+            raw,
+            "path resolves outside the repository root",
+        ));
+    }
+
+    Ok(current)
+}
+
+fn invalid_repo_relative_path(path: &str, reason: &str) -> RepoError {
+    RepoError::InvalidRepoRelativePath {
+        path: path.to_string(),
+        reason: reason.to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Symbol types
@@ -224,7 +407,7 @@ impl RepoLanguages {
 pub fn prepare_repair_workspace(
     project_root: &Path,
     workspace_root: &Path,
-    accepted_states: &HashMap<PathBuf, String>,
+    accepted_states: &HashMap<RepoRelativePath, String>,
 ) -> Result<()> {
     if workspace_root.exists() {
         let _ = cleanup_repair_workspace(project_root, workspace_root);
@@ -241,7 +424,7 @@ pub fn prepare_repair_workspace(
     }
 
     for (relative_path, content) in accepted_states {
-        let destination = workspace_root.join(relative_path);
+        let destination = relative_path.resolve_under(workspace_root)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1983,7 +2166,10 @@ const ViewModel = class InternalViewModel {};
             .join("candidate-01");
 
         let mut accepted = HashMap::new();
-        accepted.insert(PathBuf::from("src/lib.rs"), "fn patched() {}\n".to_string());
+        accepted.insert(
+            RepoRelativePath::new("src/lib.rs").unwrap(),
+            "fn patched() {}\n".to_string(),
+        );
         prepare_repair_workspace(dir.path(), &workspace_root, &accepted)
             .expect("prepare workspace");
 
@@ -2023,6 +2209,46 @@ const ViewModel = class InternalViewModel {};
             !workspace_root.join(".git").exists(),
             "fallback copy mode should not synthesize git metadata"
         );
+    }
+
+    #[test]
+    fn test_repo_relative_path_rejects_parent_traversal() {
+        let err = RepoRelativePath::new("../../etc/passwd").expect_err("path should be rejected");
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err.to_string().contains("parent-directory traversal"));
+    }
+
+    #[test]
+    fn test_repo_relative_path_rejects_absolute_path() {
+        let err = RepoRelativePath::new("/tmp/file").expect_err("path should be rejected");
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err.to_string().contains("absolute paths are not allowed"));
+    }
+
+    #[test]
+    fn test_repo_relative_path_rejects_windows_absolute_path() {
+        let err = RepoRelativePath::new(r"C:\temp\file.rs").expect_err("path should be rejected");
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err
+            .to_string()
+            .contains("absolute Windows paths are not allowed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_repo_relative_path_rejects_symlink_escape_targets() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        symlink(outside.path(), repo.path().join("escape")).expect("create escape symlink");
+
+        let err = RepoRelativePath::from_planner_path(repo.path(), "escape/file.rs")
+            .expect_err("symlink escape should be rejected");
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err
+            .to_string()
+            .contains("symlink escapes the repository root"));
     }
 
     fn init_git_repo(path: &Path) {

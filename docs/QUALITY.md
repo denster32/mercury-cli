@@ -1,4 +1,4 @@
-# Mercury CLI Quality Contract (Current 1.0.0-beta.1 Pre-Release Branch Contract, Rust-First Repair + Scoped TypeScript Support)
+# Mercury CLI Quality Contract (Current 1.0.0-beta.1 Pre-Release Branch Contract, Rust-First Repair + Scoped Experimental TypeScript Support)
 
 This document describes what quality automation exists in the repository today.
 
@@ -17,6 +17,7 @@ Current caveats:
 
 - CI success means this command set passed for that commit; it is not a guarantee of no regressions outside covered paths.
 - The matrix includes Windows for tests, but release packaging workflows currently publish Linux x86_64 and macOS arm64 archives only.
+- There is no official Windows release archive in the current repo; treat Windows as CI-tested/source-build territory rather than a published binary contract.
 
 ## Repair Workflow Quality Gate
 
@@ -60,7 +61,7 @@ This is the active contract. Do not infer unlisted module/property tests from th
 
 Current behavior should be documented and reviewed as:
 
-- end-to-end `fix` and CI repair scope is Rust-first for direct allowlisted verifier command paths, with scoped selected TypeScript verifier-command support
+- end-to-end `fix` and CI repair scope is Rust-first for direct allowlisted verifier command paths, with scoped experimental selected TypeScript verifier-command support
 - local `watch --repair` scope remains Rust-only
 - direct verifier command targeting for the repair loop (`cargo test`, `cargo check`, `cargo clippy`, including env-prefix forms)
 - verifier allowlisting for direct Rust cargo commands plus selected direct TypeScript verifier invocations, without shell composition by default
@@ -70,9 +71,9 @@ Current behavior should be documented and reviewed as:
 
 TypeScript lane status:
 
-- token-aware repo mapping/symbol extraction, failure parsing, and selected verifier support exist in the current branch
+- the current TypeScript lane uses token-aware repo mapping/symbol extraction plus failure parsing; the repo does not currently ship a real TypeScript parser
 - `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for scoped-support harness coverage
-- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it is scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
+- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it remains experimental scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
 
 ## Eval Harness Coverage
 
@@ -81,7 +82,7 @@ Current corpus contracts:
 - `evals/v0`: Rust v0.3 baseline harness (50 logical cases)
 - `evals/v1_typescript`: TypeScript scoped-support baseline harness (50 logical cases)
 
-Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality.
+Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality, and the TypeScript harness should be read as experimental-lane baseline evidence rather than parser-backed repair proof.
 
 The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to the selected Rust corpus and exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence, and the public report now includes both the false-green policy and repair outcome distribution used to interpret those numbers.
 
@@ -91,6 +92,7 @@ Current release/build workflows:
 
 - `.github/workflows/build.yml`: build archives for Linux x86_64 and macOS arm64 on push/PR/manual dispatch
 - `.github/workflows/release.yml`: publish Linux x86_64 and macOS arm64 assets on tag/manual release
+- Windows remains part of the CI test matrix, but it is not part of the current published binary matrix
 
 If broader binary coverage is required, treat it as roadmap work, not current quality-gate fact.
 

@@ -31,7 +31,7 @@ use crate::failure_parser::{
     classify_verifier_command, parse_command_parts, parse_verifier_failure, ParsedFailureReport,
     VerifierCommandKind,
 };
-use crate::repo::{prepare_repair_workspace, RepoError};
+use crate::repo::{prepare_repair_workspace, RepoError, RepoRelativePath};
 use crate::swarm::DensityController;
 use crate::thermal::{self, ThermalError};
 use crate::verification::build_allowlisted_verifier_command;
@@ -95,10 +95,18 @@ pub struct ExecutionPlan {
 /// A single step in an execution plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStep {
-    pub file_path: String,
+    pub file_path: RepoRelativePath,
     pub instruction: String,
     pub priority: f64,
     pub estimated_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawPlanStep {
+    file_path: String,
+    instruction: String,
+    priority: f64,
+    estimated_tokens: u32,
 }
 
 /// Planner: takes a goal and repo map, calls Mercury 2, returns an execution plan.
@@ -121,6 +129,7 @@ impl<A: Mercury2Api> Planner<A> {
         &self,
         goal: &str,
         repo_map: &str,
+        project_root: &Path,
     ) -> Result<(ExecutionPlan, Vec<ThermalAssessment>), EngineError> {
         let mut total_usage = ApiUsage::default();
 
@@ -154,8 +163,21 @@ impl<A: Mercury2Api> Planner<A> {
             .into());
         }
 
+        let steps = parsed
+            .steps
+            .into_iter()
+            .map(|step| {
+                Ok(PlanStep {
+                    file_path: RepoRelativePath::from_planner_path(project_root, step.file_path)?,
+                    instruction: step.instruction,
+                    priority: step.priority,
+                    estimated_tokens: step.estimated_tokens,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, RepoError>>()?;
+
         let plan = ExecutionPlan {
-            steps: parsed.steps,
+            steps,
             constitutional_prompt: self.constitutional_prompt.clone(),
             estimated_cost: total_usage.cost_usd,
             estimated_tokens: Some(total_usage.tokens_used),
@@ -169,7 +191,7 @@ impl<A: Mercury2Api> Planner<A> {
 struct PlannerResponse {
     schema_version: String,
     #[serde(default)]
-    steps: Vec<PlanStep>,
+    steps: Vec<RawPlanStep>,
     #[serde(default)]
     assessments: Vec<ThermalAssessment>,
 }
@@ -428,7 +450,7 @@ impl<A: Mercury2Api> Verifier<A> {
     /// candidate files to evaluate.
     pub async fn verify_workspace(
         &self,
-        accepted_states: &HashMap<PathBuf, String>,
+        accepted_states: &HashMap<RepoRelativePath, String>,
         workspace_root: &Path,
     ) -> Result<VerifyResult, EngineError> {
         let mut result = VerifyResult {
@@ -442,21 +464,20 @@ impl<A: Mercury2Api> Verifier<A> {
 
         if self.config.parse_before_write {
             for (relative_path, content) in accepted_states {
-                match self.check_parse(relative_path, content) {
+                match self.check_parse(relative_path.as_path(), content) {
                     Ok(true) => {}
                     Ok(false) => {
                         result.parse_ok = false;
                         result.errors.push(format!(
                             "tree-sitter parse produced errors for {}",
-                            relative_path.display()
+                            relative_path
                         ));
                     }
                     Err(err) => {
                         result.parse_ok = false;
-                        result.errors.push(format!(
-                            "parse check failed for {}: {err}",
-                            relative_path.display()
-                        ));
+                        result
+                            .errors
+                            .push(format!("parse check failed for {}: {err}", relative_path));
                     }
                 }
             }
@@ -514,9 +535,7 @@ impl<A: Mercury2Api> Verifier<A> {
             if let Some(ref api) = self.critique_api {
                 let changed_code = accepted_states
                     .iter()
-                    .map(|(relative_path, content)| {
-                        format!("// {}\n{}", relative_path.display(), content)
-                    })
+                    .map(|(relative_path, content)| format!("// {}\n{}", relative_path, content))
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let critique = self.get_critique(api, &changed_code, &result.errors).await;
@@ -646,6 +665,10 @@ pub struct StepExecutionSummary {
     pub accepted: usize,
     pub rejected: usize,
     pub verification_failures: usize,
+    pub generation_failures: usize,
+    pub safety_failures: usize,
+    pub candidate_verification_failures: usize,
+    pub final_bundle_failures: usize,
     pub retry_attempts: usize,
     pub time_to_first_candidate_ms: Option<u64>,
     pub time_to_verified_repair_ms: Option<u64>,
@@ -664,6 +687,10 @@ impl StepExecutionSummary {
         self.accepted += other.accepted;
         self.rejected += other.rejected;
         self.verification_failures += other.verification_failures;
+        self.generation_failures += other.generation_failures;
+        self.safety_failures += other.safety_failures;
+        self.candidate_verification_failures += other.candidate_verification_failures;
+        self.final_bundle_failures += other.final_bundle_failures;
         self.retry_attempts += other.retry_attempts;
         self.time_to_first_candidate_ms = merge_min_duration(
             self.time_to_first_candidate_ms,
@@ -751,6 +778,7 @@ struct ChangeFootprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum CandidateSource {
     ApplyEdit,
+    GroundedNextEdit,
     CritiqueRetry,
     ExploratoryNextEdit,
 }
@@ -759,6 +787,7 @@ impl CandidateSource {
     fn as_str(self) -> &'static str {
         match self {
             CandidateSource::ApplyEdit => "apply_edit",
+            CandidateSource::GroundedNextEdit => "grounded_next_edit",
             CandidateSource::CritiqueRetry => "critique_retry",
             CandidateSource::ExploratoryNextEdit => "exploratory_next_edit",
         }
@@ -799,6 +828,13 @@ struct CandidateOutcome {
     reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct FocusedEditContext {
+    code_to_edit: String,
+    cursor: String,
+    recent_snippets: String,
+}
+
 /// Execute a plan's steps by patching and verifying each candidate edit.
 pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     plan: &ExecutionPlan,
@@ -807,9 +843,11 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
     scheduler: &Scheduler,
     db: &ThermalDb,
     project_root: &Path,
+    parsed_failure: Option<&ParsedFailureReport>,
 ) -> Result<StepExecutionSummary, EngineError> {
     let run_root = create_run_root(project_root)?;
     let started = Instant::now();
+    let parsed_failure = parsed_failure.cloned();
     let swarm_state = db.get_swarm_state()?;
     let swarm_id = swarm_state
         .as_ref()
@@ -835,7 +873,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
 
     for (index, step) in plan.steps.iter().cloned().enumerate() {
         grouped_steps
-            .entry(step.file_path.clone())
+            .entry(step.file_path.as_str().to_string())
             .or_default()
             .push(IndexedPlanStep { index, step });
     }
@@ -854,7 +892,10 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
                 .map(|indexed| indexed.step.priority)
                 .unwrap_or_default(),
         )?;
-        let relative_path = PathBuf::from(&file_key);
+        let relative_path = steps
+            .first()
+            .map(|indexed| indexed.step.file_path.clone())
+            .expect("grouped steps must contain at least one step");
         let latest_state = read_workspace_file(project_root, &relative_path)?;
         file_states.insert(
             file_key.clone(),
@@ -867,8 +908,8 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
         ..StepExecutionSummary::default()
     };
 
-    let mut accepted_snapshot = HashMap::<PathBuf, String>::new();
-    let mut accepted_candidates = BTreeMap::<PathBuf, AcceptedCandidate>::new();
+    let mut accepted_snapshot = HashMap::<RepoRelativePath, String>::new();
+    let mut accepted_candidates = BTreeMap::<RepoRelativePath, AcceptedCandidate>::new();
     for phase in [
         thermal::ExecutionPhase::Scaffolding,
         thermal::ExecutionPhase::Resolution,
@@ -891,6 +932,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
             let partials = stream::iter(batch.into_iter().map(|work_item| {
                 let run_root = run_root.clone();
                 let telemetry = Arc::clone(&telemetry);
+                let parsed_failure = parsed_failure.clone();
                 async move {
                     execute_dispatch_work_item(
                         work_item,
@@ -903,6 +945,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
                             project_root,
                             telemetry: &telemetry,
                             started_at: started,
+                            parsed_failure,
                         },
                     )
                     .await
@@ -961,6 +1004,7 @@ pub async fn execute_plan_steps<E: MercuryEditApi, A: Mercury2Api>(
         summary.applied = true;
     } else {
         summary.verification_failures += 1;
+        summary.final_bundle_failures += 1;
     }
 
     telemetry.sync(db, scheduler, 0.0, scheduler.active_count() as i64)?;
@@ -984,7 +1028,7 @@ struct IndexedPlanStep {
 #[derive(Debug)]
 struct FileExecutionState {
     file_key: String,
-    relative_path: PathBuf,
+    relative_path: RepoRelativePath,
     steps: VecDeque<IndexedPlanStep>,
     latest_state: String,
     seen_hashes: HashSet<String>,
@@ -993,7 +1037,7 @@ struct FileExecutionState {
 impl FileExecutionState {
     fn new(
         file_key: String,
-        relative_path: PathBuf,
+        relative_path: RepoRelativePath,
         steps: Vec<IndexedPlanStep>,
         latest_state: String,
     ) -> Self {
@@ -1024,19 +1068,19 @@ impl FileExecutionState {
 #[derive(Debug)]
 struct DispatchWorkItem {
     file_key: String,
-    relative_path: PathBuf,
+    relative_path: RepoRelativePath,
     indexed_step: IndexedPlanStep,
     phase: thermal::ExecutionPhase,
     fanout: usize,
     latest_state: String,
     seen_hashes: HashSet<String>,
-    accepted_snapshot: HashMap<PathBuf, String>,
+    accepted_snapshot: HashMap<RepoRelativePath, String>,
 }
 
 #[derive(Debug, Clone)]
 struct AcceptedCandidate {
     file_key: String,
-    relative_path: PathBuf,
+    relative_path: RepoRelativePath,
     content: String,
     agent_id: String,
     state_hash: String,
@@ -1057,11 +1101,12 @@ struct DispatchContext<'a, E: MercuryEditApi, A: Mercury2Api> {
     project_root: &'a Path,
     telemetry: &'a ExecutionTelemetry,
     started_at: Instant,
+    parsed_failure: Option<ParsedFailureReport>,
 }
 
 fn build_dispatch_batch(
     file_states: &BTreeMap<String, FileExecutionState>,
-    accepted_snapshot: &HashMap<PathBuf, String>,
+    accepted_snapshot: &HashMap<RepoRelativePath, String>,
     scheduler: &Scheduler,
     db: &ThermalDb,
     phase: thermal::ExecutionPhase,
@@ -1163,7 +1208,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     let step_root = run_root.join("candidates").join(format!(
         "step-{:04}-{}",
         work_item.indexed_step.index + 1,
-        sanitize_path_component(&work_item.indexed_step.step.file_path)
+        sanitize_path_component(work_item.indexed_step.step.file_path.as_str())
     ));
     let phase_temperature = phase_temperature(work_item.phase);
     let outcomes = stream::iter((0..work_item.fanout).map(|candidate_index| {
@@ -1180,6 +1225,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             context.project_root,
             &step_root,
             context.telemetry,
+            context.parsed_failure.as_ref(),
         )
     }))
     .buffer_unordered(work_item.fanout)
@@ -1194,11 +1240,18 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             verified_candidates.push(outcome);
         } else {
             summary.rejected += 1;
-            if matches!(
-                outcome.failure_stage,
-                Some(CandidateFailureStage::Verification)
-            ) {
-                summary.verification_failures += 1;
+            match outcome.failure_stage {
+                Some(CandidateFailureStage::Generation) => {
+                    summary.generation_failures += 1;
+                }
+                Some(CandidateFailureStage::Safety) => {
+                    summary.safety_failures += 1;
+                }
+                Some(CandidateFailureStage::Verification) => {
+                    summary.verification_failures += 1;
+                    summary.candidate_verification_failures += 1;
+                }
+                None => {}
             }
             let metadata = serde_json::json!({
                 "outcome":"rejected",
@@ -1358,8 +1411,11 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     })
 }
 
-fn read_workspace_file(project_root: &Path, relative_path: &Path) -> Result<String, EngineError> {
-    let full_path = project_root.join(relative_path);
+fn read_workspace_file(
+    project_root: &Path,
+    relative_path: &RepoRelativePath,
+) -> Result<String, EngineError> {
+    let full_path = relative_path.resolve_under(project_root)?;
     match std::fs::read_to_string(&full_path) {
         Ok(content) => Ok(content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
@@ -1372,7 +1428,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
     indexed_step: &IndexedPlanStep,
     phase: thermal::ExecutionPhase,
     latest_state: &str,
-    accepted_snapshot: &HashMap<PathBuf, String>,
+    accepted_snapshot: &HashMap<RepoRelativePath, String>,
     patcher: &Patcher<E>,
     verifier: &Verifier<A>,
     scheduler: &Scheduler,
@@ -1380,6 +1436,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
     project_root: &Path,
     step_root: &Path,
     telemetry: &ExecutionTelemetry,
+    initial_parsed_failure: Option<&ParsedFailureReport>,
 ) -> Result<CandidateOutcome, EngineError> {
     let agent_id = format!(
         "fix-step-{:04}-candidate-{:02}",
@@ -1389,14 +1446,14 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
     let log_id = db.log_agent_spawn(
         &agent_id,
         &format!("fix:{}", phase),
-        &indexed_step.step.file_path,
+        indexed_step.step.file_path.as_str(),
     )?;
     db.update_agent_status(log_id, "running", 0, 0.0, None)?;
     telemetry.record_spawn();
     telemetry.next_iteration();
 
     let permit = SchedulerPermit::new(scheduler.acquire().await?, scheduler);
-    db.increment_density(&indexed_step.step.file_path)?;
+    db.increment_density(indexed_step.step.file_path.as_str())?;
     telemetry.sync(
         db,
         scheduler,
@@ -1408,15 +1465,56 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
         let mut total_tokens = 0i64;
         let mut total_cost = 0.0;
         let sandbox_root = step_root.join(format!("candidate-{:02}", candidate_index + 1));
-        let seed_history = build_seed_history(indexed_step, phase, candidate_index);
+        let step_failures =
+            select_parsed_failures_for_step(&indexed_step.step.file_path, initial_parsed_failure);
+        let focused_context = build_focused_edit_context(
+            &indexed_step.step.file_path,
+            latest_state,
+            step_failures.as_ref(),
+        );
+        let seed_history =
+            build_seed_history(indexed_step, phase, candidate_index, step_failures.as_ref());
+        let use_grounded_first_attempt = candidate_index == 0
+            && focused_context.is_some()
+            && !instruction_uses_explicit_apply_surface(&indexed_step.step.instruction);
+        let primary_source = candidate_source(candidate_index, false, use_grounded_first_attempt);
 
-        let primary = if candidate_index == 0 {
+        let primary = if use_grounded_first_attempt {
+            let context = focused_context
+                .as_ref()
+                .expect("grounded first attempt requires focused edit context");
+            patcher
+                .next_edit_with_context(
+                    indexed_step.step.file_path.as_str(),
+                    latest_state,
+                    &context.code_to_edit,
+                    &context.cursor,
+                    &context.recent_snippets,
+                    &seed_history,
+                )
+                .await
+        } else if candidate_index == 0 {
             patcher
                 .patch(latest_state, &indexed_step.step.instruction)
                 .await
+        } else if let Some(context) = focused_context.as_ref() {
+            patcher
+                .next_edit_with_context(
+                    indexed_step.step.file_path.as_str(),
+                    latest_state,
+                    &context.code_to_edit,
+                    &context.cursor,
+                    &context.recent_snippets,
+                    &seed_history,
+                )
+                .await
         } else {
             patcher
-                .next_edit_with_path(&indexed_step.step.file_path, latest_state, &seed_history)
+                .next_edit_with_path(
+                    indexed_step.step.file_path.as_str(),
+                    latest_state,
+                    &seed_history,
+                )
                 .await
         };
 
@@ -1427,7 +1525,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                     agent_id,
                     log_id,
                     sandbox_root: sandbox_root.join("attempt-1"),
-                    source: candidate_source(candidate_index, false),
+                    source: primary_source,
                     candidate: None,
                     retry_attempts: 0,
                     total_tokens,
@@ -1460,7 +1558,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                 agent_id,
                 log_id,
                 sandbox_root: sandbox_root.join("attempt-1"),
-                source: candidate_source(candidate_index, false),
+                source: primary_source,
                 candidate: None,
                 retry_attempts: 0,
                 total_tokens,
@@ -1471,19 +1569,19 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                 failure_stage: Some(CandidateFailureStage::Safety),
                 reason: Some(format!(
                     "{} candidate rejected: {reason}",
-                    candidate_source(candidate_index, false).as_str()
+                    primary_source.as_str()
                 )),
             });
         }
 
         let attempt_one_root = sandbox_root.join("attempt-1");
         prepare_workspace(project_root, &attempt_one_root, accepted_snapshot)?;
+        let attempt_one_file = indexed_step
+            .step
+            .file_path
+            .resolve_under(&attempt_one_root)?;
         let verify = verifier
-            .verify(
-                &attempt_one_root.join(&indexed_step.step.file_path),
-                &candidate,
-                &attempt_one_root,
-            )
+            .verify(&attempt_one_file, &candidate, &attempt_one_root)
             .await?;
 
         if verify.is_ok() {
@@ -1491,7 +1589,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                 agent_id,
                 log_id,
                 sandbox_root: attempt_one_root,
-                source: candidate_source(candidate_index, false),
+                source: primary_source,
                 candidate: Some(candidate.clone()),
                 retry_attempts: 0,
                 total_tokens,
@@ -1506,6 +1604,14 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
 
         if candidate_index == 0 {
             if let Some(critique) = verify.critique.as_deref() {
+                let retry_failures =
+                    select_verification_failures_for_step(&indexed_step.step.file_path, &verify)
+                        .or(step_failures.clone());
+                let retry_focused_context = build_focused_edit_context(
+                    &indexed_step.step.file_path,
+                    &candidate,
+                    retry_failures.as_ref(),
+                );
                 let retry_history = format!(
                     "{}\n\n{}",
                     seed_history,
@@ -1525,7 +1631,23 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                     ),
                 )?;
                 match patcher
-                    .next_edit_with_path(&indexed_step.step.file_path, &candidate, &retry_history)
+                    .next_edit_with_context(
+                        indexed_step.step.file_path.as_str(),
+                        &candidate,
+                        &retry_focused_context
+                            .as_ref()
+                            .map(|context| context.code_to_edit.as_str())
+                            .unwrap_or(""),
+                        &retry_focused_context
+                            .as_ref()
+                            .map(|context| context.cursor.as_str())
+                            .unwrap_or(""),
+                        &retry_focused_context
+                            .as_ref()
+                            .map(|context| context.recent_snippets.as_str())
+                            .unwrap_or(""),
+                        &retry_history,
+                    )
                     .await
                 {
                     Ok((retry_candidate, retry_usage)) => {
@@ -1546,7 +1668,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                                 agent_id,
                                 log_id,
                                 sandbox_root: sandbox_root.join("attempt-2"),
-                                source: candidate_source(candidate_index, true),
+                                source: candidate_source(candidate_index, true, false),
                                 candidate: None,
                                 retry_attempts: 1,
                                 total_tokens,
@@ -1557,16 +1679,20 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                                 failure_stage: Some(CandidateFailureStage::Safety),
                                 reason: Some(format!(
                                     "{} candidate rejected: {reason}",
-                                    candidate_source(candidate_index, true).as_str()
+                                    candidate_source(candidate_index, true, false).as_str()
                                 )),
                             });
                         }
 
                         let attempt_two_root = sandbox_root.join("attempt-2");
                         prepare_workspace(project_root, &attempt_two_root, accepted_snapshot)?;
+                        let attempt_two_file = indexed_step
+                            .step
+                            .file_path
+                            .resolve_under(&attempt_two_root)?;
                         let retry_verify = verifier
                             .verify_internal(
-                                &attempt_two_root.join(&indexed_step.step.file_path),
+                                &attempt_two_file,
                                 &retry_candidate,
                                 &attempt_two_root,
                                 false,
@@ -1578,7 +1704,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                                 agent_id,
                                 log_id,
                                 sandbox_root: attempt_two_root,
-                                source: candidate_source(candidate_index, true),
+                                source: candidate_source(candidate_index, true, false),
                                 candidate: Some(retry_candidate.clone()),
                                 retry_attempts: 1,
                                 total_tokens,
@@ -1595,7 +1721,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                             agent_id,
                             log_id,
                             sandbox_root: attempt_two_root,
-                            source: candidate_source(candidate_index, true),
+                            source: candidate_source(candidate_index, true, false),
                             candidate: None,
                             retry_attempts: 1,
                             total_tokens,
@@ -1615,7 +1741,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                             agent_id,
                             log_id,
                             sandbox_root: attempt_one_root,
-                            source: candidate_source(candidate_index, true),
+                            source: candidate_source(candidate_index, true, false),
                             candidate: None,
                             retry_attempts: 1,
                             total_tokens,
@@ -1638,7 +1764,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
             agent_id,
             log_id,
             sandbox_root: attempt_one_root,
-            source: candidate_source(candidate_index, false),
+            source: primary_source,
             candidate: None,
             retry_attempts: 0,
             total_tokens,
@@ -1655,7 +1781,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
     }
     .await;
 
-    db.decrement_density(&indexed_step.step.file_path)?;
+    db.decrement_density(indexed_step.step.file_path.as_str())?;
     drop(permit);
     telemetry.sync(
         db,
@@ -1676,7 +1802,7 @@ fn create_run_root(project_root: &Path) -> Result<PathBuf, EngineError> {
 fn prepare_workspace(
     project_root: &Path,
     workspace_root: &Path,
-    accepted_states: &HashMap<PathBuf, String>,
+    accepted_states: &HashMap<RepoRelativePath, String>,
 ) -> Result<(), EngineError> {
     prepare_repair_workspace(project_root, workspace_root, accepted_states)?;
     Ok(())
@@ -1714,13 +1840,13 @@ fn write_bundle_diff(
 
 fn apply_changes_atomically(
     project_root: &Path,
-    accepted_states: &HashMap<PathBuf, String>,
+    accepted_states: &HashMap<RepoRelativePath, String>,
 ) -> Result<(), EngineError> {
     let mut originals = HashMap::<PathBuf, Option<Vec<u8>>>::new();
     let mut staged_writes = Vec::<(PathBuf, PathBuf)>::new();
 
     for (relative_path, content) in accepted_states {
-        let target_path = project_root.join(relative_path);
+        let target_path = relative_path.resolve_under(project_root)?;
         let original = match std::fs::read(&target_path) {
             Ok(bytes) => Some(bytes),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -1892,14 +2018,159 @@ fn unsafe_candidate_reason(before: &str, after: &str) -> Option<&'static str> {
     None
 }
 
-fn candidate_source(candidate_index: usize, retry: bool) -> CandidateSource {
+fn candidate_source(
+    candidate_index: usize,
+    retry: bool,
+    grounded_first_attempt: bool,
+) -> CandidateSource {
     if retry {
         CandidateSource::CritiqueRetry
+    } else if candidate_index == 0 && grounded_first_attempt {
+        CandidateSource::GroundedNextEdit
     } else if candidate_index == 0 {
         CandidateSource::ApplyEdit
     } else {
         CandidateSource::ExploratoryNextEdit
     }
+}
+
+fn instruction_uses_explicit_apply_surface(instruction: &str) -> bool {
+    let trimmed = instruction.trim_start();
+    trimmed.starts_with("REPLACE:")
+        || trimmed.starts_with("APPEND:")
+        || trimmed.starts_with("PATCH:")
+        || trimmed.starts_with("diff --git ")
+        || trimmed.starts_with("--- ")
+        || trimmed.starts_with("@@ ")
+}
+
+fn select_parsed_failures_for_step(
+    relative_path: &RepoRelativePath,
+    parsed_failure: Option<&ParsedFailureReport>,
+) -> Option<ParsedFailureReport> {
+    let parsed_failure = parsed_failure?;
+    let mut exact_matches = Vec::new();
+    let mut unscoped = Vec::new();
+
+    for failure in &parsed_failure.failures {
+        match failure.target.file_path.as_deref() {
+            Some(file_path) if failure_matches_step_path(relative_path, file_path) => {
+                exact_matches.push(failure.clone());
+            }
+            Some(_) => {}
+            None => unscoped.push(failure.clone()),
+        }
+    }
+
+    let failures = if !exact_matches.is_empty() {
+        exact_matches
+    } else if !unscoped.is_empty() {
+        unscoped
+    } else {
+        return None;
+    };
+
+    Some(ParsedFailureReport {
+        command: parsed_failure.command.clone(),
+        stage: parsed_failure.stage.clone(),
+        failures,
+    })
+}
+
+fn select_verification_failures_for_step(
+    relative_path: &RepoRelativePath,
+    verify: &VerifyResult,
+) -> Option<ParsedFailureReport> {
+    verify
+        .command_results
+        .iter()
+        .filter_map(|result| {
+            select_parsed_failures_for_step(relative_path, result.parsed_failure.as_ref())
+        })
+        .next()
+}
+
+fn failure_matches_step_path(relative_path: &RepoRelativePath, candidate: &str) -> bool {
+    let expected = normalize_match_path(relative_path.as_str());
+    let candidate = normalize_match_path(candidate);
+    expected == candidate
+        || expected.ends_with(&format!("/{candidate}"))
+        || candidate.ends_with(&format!("/{expected}"))
+}
+
+fn normalize_match_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn build_focused_edit_context(
+    relative_path: &RepoRelativePath,
+    file_content: &str,
+    parsed_failure: Option<&ParsedFailureReport>,
+) -> Option<FocusedEditContext> {
+    let parsed_failure = parsed_failure?;
+    let (line, column) = parsed_failure
+        .failures
+        .iter()
+        .find_map(|failure| Some((failure.target.line?, failure.target.column.unwrap_or(1))))?;
+    let lines = file_content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Some(FocusedEditContext {
+            code_to_edit: String::new(),
+            cursor: "1:1".to_string(),
+            recent_snippets: format!("{}:1-1\n>   1 | ", relative_path.as_str()),
+        });
+    }
+
+    let line = (line as usize).max(1).min(lines.len());
+    let focus_start = line.saturating_sub(3).max(1);
+    let focus_end = (line + 3).min(lines.len());
+    let recent_start = line.saturating_sub(8).max(1);
+    let recent_end = (line + 8).min(lines.len());
+
+    Some(FocusedEditContext {
+        code_to_edit: join_line_window(&lines, focus_start, focus_end),
+        cursor: format!("{}:{}", line - focus_start + 1, column.max(1)),
+        recent_snippets: render_numbered_context_window(
+            relative_path.as_str(),
+            &lines,
+            recent_start,
+            recent_end,
+            line,
+        ),
+    })
+}
+
+fn render_numbered_context_window(
+    file_label: &str,
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    highlight_line: usize,
+) -> String {
+    let body = (start_line..=end_line)
+        .map(|line_number| {
+            let marker = if line_number == highlight_line {
+                '>'
+            } else {
+                ' '
+            };
+            let line = lines
+                .get(line_number.saturating_sub(1))
+                .copied()
+                .unwrap_or("");
+            format!("{marker}{line_number:>4} | {line}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{file_label}:{start_line}-{end_line}\n{body}")
+}
+
+fn join_line_window(lines: &[&str], start_line: usize, end_line: usize) -> String {
+    lines[(start_line - 1)..end_line].join("\n")
 }
 
 fn rank_candidate_outcomes(candidates: &mut [CandidateOutcome]) {
@@ -2003,6 +2274,7 @@ fn build_seed_history(
     indexed_step: &IndexedPlanStep,
     phase: thermal::ExecutionPhase,
     candidate_index: usize,
+    parsed_failure: Option<&ParsedFailureReport>,
 ) -> String {
     let instruction = indexed_step
         .step
@@ -2019,7 +2291,7 @@ fn build_seed_history(
         instruction
     };
 
-    format!(
+    let mut sections = vec![format!(
         concat!(
             "--- a/{path}\n",
             "+++ b/{path}\n",
@@ -2035,7 +2307,15 @@ fn build_seed_history(
         candidate = candidate_index + 1,
         priority = indexed_step.step.priority,
         instruction = instruction,
-    )
+    )];
+
+    if let Some(parsed_failure) = parsed_failure {
+        let structured =
+            serde_json::to_string_pretty(parsed_failure).unwrap_or_else(|_| "{}".to_string());
+        sections.push(format!("grounded_failures:\n{structured}"));
+    }
+
+    sections.join("\n\n")
 }
 
 fn join_verification_errors(errors: &[String]) -> String {
@@ -2309,11 +2589,41 @@ mod tests {
         };
         let planner = Planner::new(api, "constitution".to_string());
 
-        let (plan, _assessments) = planner.plan("goal", "repo").await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (plan, _assessments) = planner.plan("goal", "repo", temp.path()).await.unwrap();
 
         assert!(plan.estimated_cost > 0.0);
         assert_eq!(plan.estimated_cost, 0.0123);
         assert_eq!(plan.estimated_tokens, Some(321));
+    }
+
+    #[tokio::test]
+    async fn test_planner_rejects_repo_escape_paths() {
+        let api = MockPlannerApi {
+            response: serde_json::json!({
+                "schema_version": PLANNER_RESPONSE_SCHEMA_NAME,
+                "steps": [{
+                    "file_path": "../../etc/passwd",
+                    "instruction": "Do thing",
+                    "priority": 0.9,
+                    "estimated_tokens": 150
+                }],
+                "assessments": []
+            }),
+            usage: ApiUsage {
+                tokens_used: 321,
+                cost_usd: 0.0123,
+            },
+        };
+        let planner = Planner::new(api, "constitution".to_string());
+        let temp = tempfile::tempdir().unwrap();
+
+        let err = planner.plan("goal", "repo", temp.path()).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            EngineError::Repo(RepoError::InvalidRepoRelativePath { .. })
+        ));
     }
 
     #[test]

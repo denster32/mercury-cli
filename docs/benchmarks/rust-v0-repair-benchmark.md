@@ -60,6 +60,7 @@ These numbers apply only to the selected Rust corpus and the exact run ids liste
 - Selected cases: `50`
 - Unique fixture paths: `10`
 - Requested stages: `all selected Rust stages`
+- Requested difficulties: `all difficulties`
 - Requested limit: `none`
 - Agent-sweep representative cases: `10`
 
