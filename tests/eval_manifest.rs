@@ -8,11 +8,22 @@ use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const PENDING_BENCHMARK_STATUS: &str = "Status: pending first checked-in secret-backed run.";
+const PENDING_BENCHMARK_STATUS: &str =
+    "Status: pending first checked-in secret-backed Tier 1 Rust beta run.";
 const PUBLISHED_BENCHMARK_STATUS: &str = "Status: published from benchmark runner artifacts.";
+const EXECUTION_DIAGNOSTIC_FIELDS: [&str; 4] = [
+    "generation_failures",
+    "safety_failures",
+    "candidate_verification_failures",
+    "final_bundle_failures",
+];
 
 fn manifest() -> Value {
     manifest_at("evals/v0/manifest.json")
+}
+
+fn tier1_manifest() -> Value {
+    manifest_at("evals/v0/tier1-manifest.json")
 }
 
 fn typescript_manifest() -> Value {
@@ -44,6 +55,18 @@ fn assert_public_benchmark_report_is_scrubbed(report: &Value) {
             .is_some_and(|value| !value.is_empty()),
         "public benchmark report should keep a non-empty repair outcome distribution"
     );
+    let execution_diagnostics = report["execution_diagnostics"]
+        .as_object()
+        .expect("public benchmark report should expose execution_diagnostics");
+    for field in EXECUTION_DIAGNOSTIC_FIELDS {
+        assert!(
+            execution_diagnostics
+                .get(field)
+                .and_then(Value::as_u64)
+                .is_some(),
+            "public benchmark report should expose numeric execution diagnostics for {field}"
+        );
+    }
 
     if let Some(manifest_path) = report["selection"]["manifest_path"].as_str() {
         assert!(
@@ -64,6 +87,16 @@ fn assert_public_benchmark_report_is_scrubbed(report: &Value) {
             result.get("candidate_workspace").is_none(),
             "public benchmark result should not expose candidate_workspace"
         );
+        assert!(
+            result["accepted_patch_bytes"].as_u64().is_some(),
+            "public benchmark result should expose normalized accepted_patch_bytes"
+        );
+        for field in EXECUTION_DIAGNOSTIC_FIELDS {
+            assert!(
+                result.get(field).and_then(Value::as_u64).is_some(),
+                "public benchmark result should expose numeric execution diagnostics for {field}"
+            );
+        }
     }
 }
 
@@ -318,6 +351,90 @@ fn eval_manifest_matches_v0_shape() {
 }
 
 #[test]
+fn eval_tier1_manifest_matches_beta_shape() {
+    let full_manifest = manifest();
+    let full_case_ids: BTreeSet<_> = full_manifest["cases"]
+        .as_array()
+        .expect("v0 cases must be an array")
+        .iter()
+        .map(|case| case["id"].as_str().expect("case id must be a string"))
+        .collect();
+
+    let manifest = tier1_manifest();
+    assert_eq!(manifest["schema_version"], "mercury-evals-v0");
+    assert_eq!(manifest["suite_id"], "rust-v0.3-tier1");
+    assert_eq!(manifest["language"], "rust");
+    assert_eq!(manifest["version"], 3);
+    assert_eq!(
+        manifest["description"],
+        "Tier 1 Rust repair beta lane focused on solvable single-file compile, assertion, logic, and clippy failures."
+    );
+
+    let supported_modes = manifest["supported_modes"]
+        .as_array()
+        .expect("supported_modes must be an array");
+    assert_eq!(supported_modes.len(), 1);
+    assert_eq!(supported_modes[0], "baseline");
+
+    let cases = manifest["cases"]
+        .as_array()
+        .expect("cases must be an array");
+    assert_eq!(cases.len(), 35, "tier1 corpus should contain 35 logical case ids");
+
+    let mut ids = BTreeSet::new();
+    let mut stage_counts = BTreeMap::new();
+    let mut failure_class_counts = BTreeMap::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("case id must be a string");
+        assert!(ids.insert(id.to_string()), "tier1 case ids must be unique");
+        assert!(
+            full_case_ids.contains(id),
+            "tier1 case `{id}` should exist in the seeded v0 corpus"
+        );
+
+        let stage = case["failure_stage"]
+            .as_str()
+            .expect("failure_stage must be a string");
+        *stage_counts.entry(stage.to_string()).or_insert(0usize) += 1;
+
+        let failure_class = case["failure_class"]
+            .as_str()
+            .expect("failure_class must be a string");
+        assert!(
+            !matches!(failure_class, "parser" | "trait_bound" | "panic_unwrap"),
+            "tier1 should exclude unsolved failure class `{failure_class}`"
+        );
+        *failure_class_counts
+            .entry(failure_class.to_string())
+            .or_insert(0usize) += 1;
+    }
+
+    assert_eq!(stage_counts.get("compile"), Some(&15usize));
+    assert_eq!(stage_counts.get("test"), Some(&10usize));
+    assert_eq!(stage_counts.get("lint"), Some(&10usize));
+    assert!(
+        !stage_counts.contains_key("parse"),
+        "tier1 should exclude parse-stage cases"
+    );
+
+    for failure_class in [
+        "type_mismatch",
+        "missing_symbol",
+        "unknown_field",
+        "test_assertion",
+        "logic_off_by_one",
+        "clippy_needless_return",
+        "clippy_identity_op",
+    ] {
+        assert_eq!(
+            failure_class_counts.get(failure_class),
+            Some(&5usize),
+            "tier1 should keep five cases for `{failure_class}`"
+        );
+    }
+}
+
+#[test]
 fn eval_runner_lists_filtered_cases_as_json() {
     let output = Command::new("python3")
         .arg("evals/v0/run.py")
@@ -566,6 +683,7 @@ fn repair_benchmark_workflow_contract_exposes_expected_inputs_and_artifacts() {
     for expected in [
         "evals/repair_benchmark/run.py",
         "evals/repair_benchmark/publish.py",
+        "evals/v0/tier1-manifest.json",
         "--mode quality",
         "--mode agent-sweep",
         "--agent-count 1",
@@ -578,6 +696,8 @@ fn repair_benchmark_workflow_contract_exposes_expected_inputs_and_artifacts() {
         "rust-v0-quality.report.json",
         "rust-v0-agent-sweep.report.json",
         "mercury-repair-benchmark-v1",
+        "execution_diagnostics",
+        "Publish Tier 1 Rust repair benchmark artifacts",
         "Render public benchmark surface",
         "Upload benchmark artifacts",
         "Validate benchmark artifact contract",
@@ -777,7 +897,7 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             ("QUALITY", quality.as_str()),
         ] {
             assert!(
-                !text.contains("secret-backed Rust"),
+                !text.contains("secret-backed Tier 1 Rust beta"),
                 "{label} should stop describing the benchmark as unpublished once reports are checked in"
             );
             assert!(
@@ -788,14 +908,26 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
                 text.contains("rust-v0-agent-sweep.report.json"),
                 "{label} should point to the checked-in agent-sweep aggregate"
             );
+            assert!(
+                text.contains("evals/v0/tier1-manifest.json"),
+                "{label} should describe the Tier 1 Rust beta manifest"
+            );
         }
         assert!(
             benchmark_readme.contains("repair outcome distribution"),
             "docs/benchmarks/README.md should describe the published repair outcome distribution"
         );
         assert!(
+            benchmark_readme.contains("execution diagnostics"),
+            "docs/benchmarks/README.md should describe the published execution diagnostics"
+        );
+        assert!(
             benchmark_report.contains("## Repair Outcome Distribution"),
             "published benchmark markdown should include the repair outcome distribution section"
+        );
+        assert!(
+            benchmark_report.contains("## Execution Diagnostics"),
+            "published benchmark markdown should include the execution diagnostics section"
         );
     } else {
         for (label, text) in [
@@ -804,7 +936,7 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             ("QUALITY", quality.as_str()),
         ] {
             assert!(
-                text.contains("secret-backed Rust"),
+                text.contains("secret-backed Tier 1 Rust beta"),
                 "{label} should keep the checked-in benchmark truth aligned"
             );
         }
@@ -976,7 +1108,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
     let quality_report = json!({
         "schema_version": "mercury-repair-benchmark-v1",
         "description": "Public Mercury repair benchmark aggregate report",
-        "suite_id": "rust-v0.3-seeded",
+        "suite_id": "rust-v0.3-tier1",
         "language": "rust",
         "mode": "quality",
         "generated_at": "2026-03-11T00:00:00Z",
@@ -994,7 +1126,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "supported_modes": ["baseline"]
         },
         "selection": {
-            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "manifest_path": repo_root.join("evals/v0/tier1-manifest.json"),
             "selected_count": 10,
             "selected_case_ids": ["rust_type_mismatch"],
             "selected_unique_fixture_paths": 2,
@@ -1021,6 +1153,12 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "mean_cost_per_verified_repair_usd": 0.21
         },
         "failure_attribution": {},
+        "execution_diagnostics": {
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 1,
+            "final_bundle_failures": 0
+        },
         "speedup_curve": [{
             "agent_count": 4,
             "attempted_cases": 10,
@@ -1038,7 +1176,13 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         "results": [{
             "case_id": "rust_type_mismatch",
             "agent_count": 4,
+            "outcome": "verified_repair",
             "verified_repair": true,
+            "accepted_patch_bytes": 128,
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 0,
+            "final_bundle_failures": 0,
             "benchmark_run_path": "/tmp/quality/cases/rust_type_mismatch/agents-4/benchmark-run.json",
             "candidate_workspace": "/tmp/quality/workspaces/rust_type_mismatch-agents-4"
         }]
@@ -1046,7 +1190,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
     let agent_sweep_report = json!({
         "schema_version": "mercury-repair-benchmark-v1",
         "description": "Public Mercury repair benchmark aggregate report",
-        "suite_id": "rust-v0.3-seeded",
+        "suite_id": "rust-v0.3-tier1",
         "language": "rust",
         "mode": "agent-sweep",
         "generated_at": "2026-03-11T01:00:00Z",
@@ -1064,7 +1208,7 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "supported_modes": ["baseline"]
         },
         "selection": {
-            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "manifest_path": repo_root.join("evals/v0/tier1-manifest.json"),
             "selected_count": 4,
             "selected_case_ids": ["rust_type_mismatch"],
             "selected_unique_fixture_paths": 2,
@@ -1092,6 +1236,12 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         },
         "failure_attribution": {
             "candidate_failed_verifier": 1
+        },
+        "execution_diagnostics": {
+            "generation_failures": 1,
+            "safety_failures": 0,
+            "candidate_verification_failures": 3,
+            "final_bundle_failures": 1
         },
         "speedup_curve": [
             {
@@ -1156,8 +1306,14 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         "results": [{
             "case_id": "rust_type_mismatch",
             "agent_count": 8,
+            "outcome": "accepted_patch_unverified",
             "verified_repair": false,
             "failure_attribution": "candidate_failed_verifier",
+            "accepted_patch_bytes": 64,
+            "generation_failures": 1,
+            "safety_failures": 0,
+            "candidate_verification_failures": 3,
+            "final_bundle_failures": 1,
             "benchmark_run_path": "/tmp/sweep/cases/rust_type_mismatch/agents-8/benchmark-run.json",
             "candidate_workspace": "/tmp/sweep/workspaces/rust_type_mismatch-agents-8"
         }]
@@ -1202,6 +1358,18 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         "published benchmark markdown should include quality run metadata"
     );
     assert!(
+        markdown.contains("evals/v0/tier1-manifest.json"),
+        "published benchmark markdown should include the Tier 1 manifest path"
+    );
+    assert!(
+        markdown.contains("## Execution Diagnostics"),
+        "published benchmark markdown should include the execution diagnostics section"
+    );
+    assert!(
+        markdown.contains("| candidate_verification_failures | 1 | 3 |"),
+        "published benchmark markdown should render the execution diagnostics table"
+    );
+    assert!(
         markdown.contains("| 8 | 4 | 2 | 5000 | 4300 | 1.600 |"),
         "published benchmark markdown should render the speedup curve table"
     );
@@ -1218,12 +1386,17 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
     assert_eq!(copied_agent_sweep["run_id"], "sweep-demo");
     assert_eq!(
         copied_quality["selection"]["manifest_path"],
-        "evals/v0/manifest.json"
+        "evals/v0/tier1-manifest.json"
     );
     assert_eq!(
         copied_agent_sweep["selection"]["manifest_path"],
-        "evals/v0/manifest.json"
+        "evals/v0/tier1-manifest.json"
     );
+    assert_eq!(
+        copied_quality["execution_diagnostics"]["candidate_verification_failures"],
+        1
+    );
+    assert_eq!(copied_agent_sweep["execution_diagnostics"]["generation_failures"], 1);
     assert_eq!(
         copied_agent_sweep["failure_attribution"]["candidate_failed_verifier"],
         1

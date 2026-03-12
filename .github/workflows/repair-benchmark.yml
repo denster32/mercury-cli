@@ -9,11 +9,11 @@ on:
         default: 4
         type: number
       quality_case_limit:
-        description: Optional case cap for the quality run. Leave empty for the full selected Rust suite.
+        description: Optional case cap for the quality run. Leave empty for the full Tier 1 Rust beta lane.
         required: false
         type: string
       representative_count:
-        description: Representative Rust subset size for the agent sweep.
+        description: Representative Tier 1 Rust subset size for the agent sweep.
         required: false
         default: 10
         type: number
@@ -41,7 +41,7 @@ env:
 
 jobs:
   benchmark:
-    name: Publish Rust repair benchmark artifacts
+    name: Publish Tier 1 Rust repair benchmark artifacts
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(
-            --suite evals/v0/manifest.json
+            --suite evals/v0/tier1-manifest.json
             --binary target/release/mercury-cli
             --mode quality
             --agent-count "${{ inputs.quality_agent_count }}"
@@ -83,7 +83,7 @@ jobs:
           INCEPTION_API_KEY: ${{ secrets.inception_api_key || secrets.INCEPTION_API_KEY || secrets.MERCURY_API_KEY }}
         run: |
           python3 evals/repair_benchmark/run.py \
-            --suite evals/v0/manifest.json \
+            --suite evals/v0/tier1-manifest.json \
             --binary target/release/mercury-cli \
             --mode agent-sweep \
             --representative-count "${{ inputs.representative_count }}" \
@@ -122,6 +122,7 @@ jobs:
               assert "speedup_curve" in report
               assert "cost_curve" in report
               assert "metrics" in report
+              assert "execution_diagnostics" in report
           summary_path = Path("docs/benchmarks/rust-v0-repair-benchmark.md")
           quality_path = Path("docs/benchmarks/rust-v0-quality.report.json")
           agent_sweep_path = Path("docs/benchmarks/rust-v0-agent-sweep.report.json")

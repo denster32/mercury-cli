@@ -61,30 +61,31 @@ This is the active contract. Do not infer unlisted module/property tests from th
 
 Current behavior should be documented and reviewed as:
 
-- end-to-end `fix` and CI repair scope is Rust-first for direct allowlisted verifier command paths, with scoped experimental selected TypeScript verifier-command support
+- end-to-end `fix` and CI repair scope is Rust-first for direct allowlisted verifier command paths, with frozen experimental selected TypeScript verifier-command support
 - local `watch --repair` scope remains Rust-only
 - direct verifier command targeting for the repair loop (`cargo test`, `cargo check`, `cargo clippy`, including env-prefix forms)
 - verifier allowlisting for direct Rust cargo commands plus selected direct TypeScript verifier invocations, without shell composition by default
 - watch command allowlist rejects shell composition and wrapper commands before cycle execution by default
-- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout; `docs/benchmarks/` now publishes selected-Rust runtime and cost curves for that setting, but the repo still does not claim broad overlapping-edit convergence or verified-repair improvement from those numbers alone
+- `--max-agents` materially affects phased runtime dispatch and isolated candidate fanout; `docs/benchmarks/` now publishes Tier 1 Rust runtime and cost curves for that setting, but the repo still does not claim broad overlapping-edit convergence or verified-repair improvement from those numbers alone
 - `status --live` now exposes candidate, phase, and runtime events via a TTY event pane or JSONL stream; it is still not a full conflict-telemetry or merge-decision explanation surface
 
 TypeScript lane status:
 
 - the current TypeScript lane uses token-aware repo mapping/symbol extraction plus failure parsing; the repo does not currently ship a real TypeScript parser
 - `evals/v1_typescript` adds a 50-case baseline corpus and manifest-driven runner for scoped-support harness coverage
-- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it remains experimental scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
+- TypeScript repair support is implemented for selected direct verifier commands in `fix`/CI paths, but it remains frozen experimental scoped support rather than parity with Rust repair quality; watch-repair and broader command classes remain limited
 
 ## Eval Harness Coverage
 
 Current corpus contracts:
 
 - `evals/v0`: Rust v0.3 baseline harness (50 logical cases)
+- `evals/v0/tier1-manifest.json`: Tier 1 Rust repair beta lane (35 logical cases focused on solvable compile, test, and lint failures)
 - `evals/v1_typescript`: TypeScript scoped-support baseline harness (50 logical cases)
 
-Both harnesses validate expected-red baseline behavior and emit reproducible run bundles. Neither harness alone is evidence of accepted-patch rate, false-green rate, or end-to-end repair quality, and the TypeScript harness should be read as experimental-lane baseline evidence rather than parser-backed repair proof.
+The baseline harnesses validate expected-red behavior and emit reproducible run bundles. The Tier 1 manifest narrows the public Rust repair claim to a solvable beta lane that can be rerun and diagnosed honestly. The TypeScript harness should still be read as frozen experimental baseline evidence rather than parser-backed repair proof.
 
-The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to the selected Rust corpus and exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence, and the public report now includes both the false-green policy and repair outcome distribution used to interpret those numbers.
+The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to `evals/v0/tier1-manifest.json` and the exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence, and the public report now includes the false-green policy, repair outcome distribution, and execution diagnostics used to interpret misses.
 
 ## Release Artifact Reality
 

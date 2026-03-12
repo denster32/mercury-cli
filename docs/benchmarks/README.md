@@ -4,7 +4,7 @@ This directory is the checked-in publication surface for Mercury repair benchmar
 
 Current scope:
 
-- Rust-first repair-quality publication based on `evals/v0`
+- Rust-first repair-quality publication based on `evals/v0/tier1-manifest.json`
 - machine-readable aggregate output from `evals/repair_benchmark/run.py`
 - stable public render targets produced by `evals/repair_benchmark/publish.py`
 - GitHub workflow entrypoint at `.github/workflows/repair-benchmark.yml`
@@ -24,8 +24,8 @@ Stable publication targets for the Rust-first track:
 
 Current truth:
 
-- the repo includes checked-in machine-readable quality and agent-sweep aggregates plus the rendered markdown report for run ids `20260311-quality` and `20260311-agent-sweep`
-- the published numbers are limited to the selected `evals/v0` Rust corpus and exact run ids documented in `rust-v0-repair-benchmark.md`
+- the repo includes checked-in machine-readable quality and agent-sweep aggregates plus the rendered markdown report for the exact run ids documented in `rust-v0-repair-benchmark.md`
+- the published numbers are limited to the Tier 1 Rust beta lane in `evals/v0/tier1-manifest.json` and exact run ids documented in `rust-v0-repair-benchmark.md`
 - the public JSON aggregates intentionally omit local run roots, candidate workspace paths, and API-key env metadata
-- the public report documents the false-green policy and repair outcome distribution alongside the quality and `--max-agents` tables
-- the current checked-in runs recorded zero verified repairs, so the publication should be read as scoped evidence rather than broad repair-quality proof
+- the public report documents the false-green policy, repair outcome distribution, and execution diagnostics alongside the quality and `--max-agents` tables
+- the publication should be read as scoped evidence for the Tier 1 Rust beta lane rather than broad repair-quality proof or TypeScript parity

@@ -10,7 +10,7 @@ Reproduce failure in CI conditions, run isolated Mercury repair, verify locally,
 
 ## Preconditions
 
-- branch with a reproducible failing direct allowlisted verifier command (Rust or selected TypeScript forms)
+- branch with a reproducible failing direct allowlisted verifier command (preferably Rust; selected TypeScript forms remain a frozen experimental lane)
 - repository or organization secret configured for repair jobs as `INCEPTION_API_KEY`, `MERCURY_API_KEY`, or `inception_api_key`
 - same-repository workflow context with `contents: write` and `pull-requests: write` so the workflow can push a repair branch and mutate a PR when eligible
 - if that write path is unavailable, plan to use `dry_run=true` and perform the PR handoff manually
@@ -60,7 +60,7 @@ Workflow behavior:
 - creates an isolated detached worktree on the runner
 - reproduces the baseline failure first
 - runs `target/release/mercury-cli fix ... --noninteractive` only when baseline is red and API key is present
-- repair targeting supports direct allowlisted Rust and selected direct TypeScript verifier commands; unsupported command shapes may still produce artifacts but will not produce a verified repair
+- repair targeting supports direct allowlisted Rust and selected direct TypeScript verifier commands; the TypeScript path remains a frozen experimental lane, and unsupported command shapes may still produce artifacts but will not produce a verified repair
 - local `watch --repair` remains Rust-only; this CI case study documents the `fix`/workflow path
 - uploads an evidence bundle and run summary for every terminal state
 - only attempts branch push and draft-PR mutation when repair is verified, the diff is non-empty, and `dry_run != true`

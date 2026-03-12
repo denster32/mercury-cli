@@ -4,6 +4,7 @@ This is the v0.3 Rust eval harness for the runtime trust gate.
 
 Contents:
 - `manifest.json`: canonical 50-case Rust eval corpus contract
+- `tier1-manifest.json`: 35-case Tier 1 Rust repair beta manifest derived from the canonical corpus
 - `cases/*`: 10 canonical red fixture crates reused across 50 logical case ids
 - `run.py`: manifest-driven baseline runner that validates selected cases and emits a report bundle
 - `reports/.gitkeep`: checked-in scaffold for CI artifact output
@@ -19,6 +20,7 @@ Usage:
 Corpus shape:
 - 50 manifest case ids across parse, compile, test, and lint failure stages
 - stage distribution is fixed in v0.3: parse=5, compile=20, test=15, lint=10
+- `tier1-manifest.json` narrows the repair beta lane to 35 logical case ids across compile=15, test=10, and lint=10 by excluding parse, trait-bound, and panic-unwrap classes
 - 10 unique fixture directories under `cases/`
 - each fixture family appears 5 times in the manifest: the seed case plus variants `v2` through `v5`
 - only ids ending in an explicit `_v<digits>` suffix count as variants; ids with embedded `_v` elsewhere are treated as seed ids
@@ -55,5 +57,6 @@ Notes:
 - this harness validates the red-state corpus contract and artifact reproducibility
 - it does not execute the full repair runtime; CI repair orchestration lives in `.github/workflows/repair.yml`
 - cases are currently 50 logical ids backed by 10 physical fixture crates; promote to 50 physical fixtures only if needed for future benchmarking
-- this harness should be treated as baseline-failure validation infrastructure, not as published repair-success benchmarking
+- `tier1-manifest.json` is the public Rust repair beta lane used by `evals/repair_benchmark/run.py` and the checked-in `docs/benchmarks/` report surface
+- this harness should be treated as baseline-failure validation infrastructure, not as published broad repair-success benchmarking
 - the TypeScript lane has a parallel baseline harness at `evals/v1_typescript/`

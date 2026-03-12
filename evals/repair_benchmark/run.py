@@ -13,7 +13,7 @@ from typing import Any, Iterable, Optional, Union
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HARNESS_ROOT = Path(__file__).resolve().parent
-DEFAULT_MANIFEST_PATH = REPO_ROOT / "evals" / "v0" / "manifest.json"
+DEFAULT_MANIFEST_PATH = REPO_ROOT / "evals" / "v0" / "tier1-manifest.json"
 DEFAULT_OUTPUT_DIR = HARNESS_ROOT / "reports"
 RUN_ID_FORMAT = "%Y%m%dT%H%M%SZ"
 BENCHMARK_SCHEMA_VERSION = "mercury-repair-benchmark-v1"
@@ -37,6 +37,12 @@ FAILURE_ATTRIBUTION_ORDER = [
     "accepted_patch_failed_independent_rerun",
     "mercury_verified_but_independent_rerun_failed",
     "runner_error",
+]
+EXECUTION_DIAGNOSTIC_FIELDS = [
+    "generation_failures",
+    "safety_failures",
+    "candidate_verification_failures",
+    "final_bundle_failures",
 ]
 
 
@@ -394,6 +400,28 @@ def normalize_difficulty_label(value: Any) -> str:
     return "unknown"
 
 
+def normalized_execution_diagnostics(source: dict[str, Any]) -> dict[str, int]:
+    return {
+        field: int(source.get(field) or 0)
+        for field in EXECUTION_DIAGNOSTIC_FIELDS
+    }
+
+
+def normalized_case_result(result: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(result)
+    normalized["accepted_patch_bytes"] = int(normalized.get("accepted_patch_bytes") or 0)
+    normalized.update(normalized_execution_diagnostics(normalized))
+    return normalized
+
+
+def compute_execution_diagnostics(results: list[dict[str, Any]]) -> dict[str, int]:
+    totals = {field: 0 for field in EXECUTION_DIAGNOSTIC_FIELDS}
+    for result in results:
+        for field, value in normalized_execution_diagnostics(result).items():
+            totals[field] += value
+    return totals
+
+
 def compute_repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for result in results:
@@ -613,8 +641,19 @@ def summarize_report(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-        "## Speedup Curve",
-        "",
+            "## Execution Diagnostics",
+            "",
+        ]
+    )
+
+    for label in EXECUTION_DIAGNOSTIC_FIELDS:
+        lines.append(f"- {label}: {report['execution_diagnostics'].get(label, 0)}")
+
+    lines.extend(
+        [
+            "",
+            "## Speedup Curve",
+            "",
         ]
     )
 
@@ -696,7 +735,7 @@ def load_existing_result(result_path: Path) -> Optional[dict[str, Any]]:
         raise ValueError(
             f"benchmark result at {result_path} declared unsupported schema version {payload['schema_version']}"
         )
-    return payload
+    return normalized_case_result(payload)
 
 
 def build_runner_error_result(
@@ -739,6 +778,7 @@ def build_runner_error_result(
         "workspace_preserved": keep_workspaces,
         "runner_error_message": message,
         "runner_error_traceback": traceback_text,
+        **normalized_execution_diagnostics({}),
     }
 
 
@@ -752,30 +792,32 @@ def build_report(
     finished_at: datetime,
     api_key_env: Optional[str],
 ) -> dict[str, Any]:
-    attempted_cases = len(results)
-    verified_repairs = sum(1 for result in results if result["verified_repair"])
-    false_greens = sum(1 for result in results if result["false_green"])
-    accepted_patches = sum(1 for result in results if result["accepted_patch"])
+    normalized_results = [normalized_case_result(result) for result in results]
+    attempted_cases = len(normalized_results)
+    verified_repairs = sum(1 for result in normalized_results if result["verified_repair"])
+    false_greens = sum(1 for result in normalized_results if result["false_green"])
+    accepted_patches = sum(1 for result in normalized_results if result["accepted_patch"])
     first_candidate_times = [
         result["time_to_first_candidate_ms"]
-        for result in results
+        for result in normalized_results
         if result["time_to_first_candidate_ms"] is not None
     ]
     verified_times = [
         result["time_to_verified_repair_ms"]
-        for result in results
+        for result in normalized_results
         if result["time_to_verified_repair_ms"] is not None and result["verified_repair"]
     ]
-    attempted_costs = [float(result["total_cost_usd"]) for result in results]
+    attempted_costs = [float(result["total_cost_usd"]) for result in normalized_results]
     verified_costs = [
         float(result["total_cost_usd"])
-        for result in results
+        for result in normalized_results
         if result["verified_repair"]
     ]
-    repair_outcome_distribution = compute_repair_outcome_distribution(results)
-    difficulty_breakdown = compute_difficulty_breakdown(results)
-    failure_attribution = compute_failure_attribution(results)
-    speedup_curve, cost_curve = compute_agent_curves(results)
+    repair_outcome_distribution = compute_repair_outcome_distribution(normalized_results)
+    difficulty_breakdown = compute_difficulty_breakdown(normalized_results)
+    failure_attribution = compute_failure_attribution(normalized_results)
+    execution_diagnostics = compute_execution_diagnostics(normalized_results)
+    speedup_curve, cost_curve = compute_agent_curves(normalized_results)
 
     return {
         "schema_version": BENCHMARK_SCHEMA_VERSION,
@@ -820,9 +862,10 @@ def build_report(
         "repair_outcome_distribution": repair_outcome_distribution,
         "difficulty_breakdown": difficulty_breakdown,
         "failure_attribution": failure_attribution,
+        "execution_diagnostics": execution_diagnostics,
         "speedup_curve": speedup_curve,
         "cost_curve": cost_curve,
-        "results": results,
+        "results": normalized_results,
     }
 
 
@@ -865,6 +908,7 @@ def evaluate_case(
                 "baseline_reproduced": False,
                 "outcome": "baseline_not_reproduced",
                 "accepted_patch": False,
+                "accepted_patch_bytes": 0,
                 "verified_repair": False,
                 "false_green": False,
                 "failure_attribution": "baseline_not_reproduced",
@@ -874,6 +918,7 @@ def evaluate_case(
                 "time_to_verified_repair_ms": None,
                 "candidate_workspace": None,
                 "workspace_preserved": args.keep_workspaces,
+                **normalized_execution_diagnostics({}),
             }
             write_json(result_root / "result.json", result)
             return result
@@ -974,6 +1019,7 @@ def evaluate_case(
             "verified_repair": verified_repair,
             "false_green": false_green,
             "failure_attribution": failure_attribution,
+            **normalized_execution_diagnostics(benchmark_run),
             "fix_exit_code": fix_result.get("exit_code"),
             "fix_timed_out": fix_result.get("timed_out"),
             "fix_duration_ms": int(benchmark_run.get("duration_ms") or fix_result["duration_ms"]),
@@ -1042,7 +1088,7 @@ def parse_args() -> argparse.Namespace:
         "--suite",
         type=Path,
         default=DEFAULT_MANIFEST_PATH,
-        help="Path to the eval manifest to benchmark (default: evals/v0/manifest.json).",
+        help="Path to the eval manifest to benchmark (default: evals/v0/tier1-manifest.json).",
     )
     parser.add_argument(
         "--binary",

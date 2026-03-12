@@ -8,7 +8,7 @@ This harness turns the public eval corpus into a repair-quality benchmark by:
 - independently rerunning the verifier against the sandboxed `final-bundle`
 - deriving false-greens from that independent rerun and aggregating accepted-patch, timing, and cost metrics under `mercury-repair-benchmark-v1`
 
-Current publication scope is Rust-first. The default suite is `evals/v0/manifest.json`.
+Current publication scope is Rust-first. The default suite is `evals/v0/tier1-manifest.json`.
 
 ## Examples
 
@@ -34,6 +34,13 @@ Each run writes `run-<id>/` with:
 
 The aggregate report schema is `mercury-repair-benchmark-v1`.
 
+Aggregate reports include execution diagnostics for:
+
+- `generation_failures`
+- `safety_failures`
+- `candidate_verification_failures`
+- `final_bundle_failures`
+
 Copied per-case workspaces are deleted by default after the independent rerun so larger corpus runs do not retain duplicate fixture trees. Pass `--keep-workspaces` when you need the copied workspace and `sandbox_run_root` metadata preserved for debugging.
 
 Use `--resume` to continue an interrupted run from existing `cases/<case-id>/agents-<n>/result.json` outputs instead of rerunning completed attempts. The runner also refreshes `report.partial.json` and `summary.partial.md` after each attempted or resumed case so long runs always keep a current aggregate checkpoint.
@@ -51,11 +58,8 @@ Published stable targets:
 - `docs/benchmarks/rust-v0-quality.report.json`
 - `docs/benchmarks/rust-v0-agent-sweep.report.json`
 
-Current checked-in public run ids:
+Current checked-in public run ids are the ones listed in `docs/benchmarks/rust-v0-repair-benchmark.md`.
 
-- `20260311-quality`
-- `20260311-agent-sweep`
-
-The current checked-in Rust publication is intentionally narrow and honest: these runs recorded `0` accepted patches, `0` verified repairs, and `0` false-greens.
+The current checked-in Rust publication is intentionally narrow and honest: treat the checked-in Tier 1 report as the product truth for `evals/v0/tier1-manifest.json`, including its repair outcome distribution, execution diagnostics, and exact run ids.
 
 The public JSON surface preserves benchmark metrics and case outcomes while removing local run roots, copied candidate workspace paths, and API-key env metadata.
