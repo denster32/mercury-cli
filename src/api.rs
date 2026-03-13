@@ -488,6 +488,12 @@ struct TransportConfig {
     min_request_interval_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TransportRuntime<'a> {
+    config: TransportConfig,
+    state: &'a TransportState,
+}
+
 fn api_key_env_hint() -> String {
     format!("{INCEPTION_API_KEY_ENV} (preferred) or {MERCURY_API_KEY_ENV}")
 }
@@ -645,11 +651,11 @@ async fn post_json_with_retry_raw(
     api_key: &str,
     url: &str,
     payload: &(impl Serialize + Sync),
-    config: TransportConfig,
-    state: &TransportState,
+    runtime: TransportRuntime<'_>,
     log_label: &str,
 ) -> Result<Vec<u8>, ApiError> {
     let mut attempts: u32 = 0;
+    let TransportRuntime { config, state } = runtime;
 
     loop {
         attempts += 1;
@@ -732,8 +738,7 @@ async fn post_json_with_retry_parsed<T, P>(
     api_key: &str,
     url: &str,
     payload: &(impl Serialize + Sync),
-    config: TransportConfig,
-    state: &TransportState,
+    runtime: TransportRuntime<'_>,
     log_label: &str,
     mut parse: P,
 ) -> Result<T, ApiError>
@@ -741,11 +746,11 @@ where
     P: FnMut(&[u8]) -> Result<T, ApiError>,
 {
     let mut attempts: u32 = 0;
+    let config = runtime.config;
 
     loop {
         attempts += 1;
-        let raw =
-            post_json_with_retry_raw(http, api_key, url, payload, config, state, log_label).await?;
+        let raw = post_json_with_retry_raw(http, api_key, url, payload, runtime, log_label).await?;
 
         match parse(&raw) {
             Ok(parsed) => return Ok(parsed),
@@ -1109,8 +1114,10 @@ impl Mercury2Client {
             &self.api_key,
             &self.base_url,
             &body,
-            self.transport_config(),
-            &self.transport_state,
+            TransportRuntime {
+                config: self.transport_config(),
+                state: &self.transport_state,
+            },
             "chat/completions",
             parse_chat_response,
         )
@@ -1145,8 +1152,10 @@ impl Mercury2Client {
             &self.api_key,
             &self.base_url,
             &body,
-            self.transport_config(),
-            &self.transport_state,
+            TransportRuntime {
+                config: self.transport_config(),
+                state: &self.transport_state,
+            },
             "chat/completions",
             parse_chat_response_with_tools,
         )
@@ -1337,8 +1346,10 @@ impl MercuryEditClient {
             &self.api_key,
             &url,
             payload,
-            self.transport_config(),
-            &self.transport_state,
+            TransportRuntime {
+                config: self.transport_config(),
+                state: &self.transport_state,
+            },
             path,
             parse,
         )

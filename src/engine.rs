@@ -1693,15 +1693,15 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                     .next_edit_with_context(
                         indexed_step.step.file_path.as_str(),
                         &candidate,
-                        &retry_focused_context
+                        retry_focused_context
                             .as_ref()
                             .map(|context| context.code_to_edit.as_str())
                             .unwrap_or(""),
-                        &retry_focused_context
+                        retry_focused_context
                             .as_ref()
                             .map(|context| context.cursor.as_str())
                             .unwrap_or(""),
-                        &retry_focused_context
+                        retry_focused_context
                             .as_ref()
                             .map(|context| context.recent_snippets.as_str())
                             .unwrap_or(""),
