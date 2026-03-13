@@ -80,12 +80,14 @@ TypeScript lane status:
 Current corpus contracts:
 
 - `evals/v0`: Rust v0.3 baseline harness (50 logical cases)
+- `evals/v0/tier0-manifest.json`: Tier 0 Rust diagnostic slice (20 logical cases focused on trivial single-file assertion, logic, and clippy failures)
 - `evals/v0/tier1-manifest.json`: Tier 1 Rust repair beta lane (35 logical cases focused on solvable compile, test, and lint failures)
+- `evals/v0/tier2-manifest.json`: Tier 2 Rust diagnostic slice (15 logical cases covering parser, trait-bound, and panic-unwrap failures that remain harder or unsupported in the current beta)
 - `evals/v1_typescript`: TypeScript scoped-support baseline harness (50 logical cases)
 
-The baseline harnesses validate expected-red behavior and emit reproducible run bundles. The Tier 1 manifest narrows the public Rust repair claim to a solvable beta lane that can be rerun and diagnosed honestly. The TypeScript harness should still be read as frozen experimental baseline evidence rather than parser-backed repair proof.
+The baseline harnesses validate expected-red behavior and emit reproducible run bundles. Tier 0 and Tier 2 exist as diagnostic slices so failures can be explained by tier without widening the support claim. The Tier 1 manifest narrows the public Rust repair claim to a solvable beta lane that can be rerun and diagnosed honestly. The TypeScript harness should still be read as frozen experimental baseline evidence rather than parser-backed repair proof.
 
-The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to `evals/v0/tier1-manifest.json` and the exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence, and the public report now includes the false-green policy, repair outcome distribution, tier breakdowns, verifier-class tables for `cargo test`, `cargo check`, and `cargo clippy`, candidate lineage breakdowns, failure attribution, and execution diagnostics used to interpret misses.
+The repo includes a reproducible Rust benchmark publisher at `evals/repair_benchmark/publish.py` plus checked-in public targets at `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json`. Those published metrics remain limited to `evals/v0/tier1-manifest.json` and the exact run ids in the report rather than a universal repair-quality claim or TypeScript parity evidence. `evals/v0/tier0-manifest.json` and `evals/v0/tier2-manifest.json` are diagnostic slices that support tiered reporting and release bundles, not a broader product promise. The public report now includes the false-green policy, repair outcome distribution, tier breakdowns, verifier-class tables for `cargo test`, `cargo check`, and `cargo clippy`, candidate lineage breakdowns, failure attribution, and execution diagnostics used to interpret misses.
 
 ## Release Artifact Reality
 

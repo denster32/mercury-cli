@@ -21,7 +21,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   BINARY_SOURCE: target/release/mercury-cli
-  PACKAGE_BINARY: mercury
+  PACKAGE_BINARY: mercury-cli
+  PACKAGE_BINARY_ALIAS: mercury
 
 jobs:
   build-and-release:
@@ -95,13 +96,47 @@ PY
 
           mkdir -p "$PACKAGE_ROOT"
           cp "$BINARY_SOURCE" "$PACKAGE_ROOT/$PACKAGE_BINARY"
+          cp "$BINARY_SOURCE" "$PACKAGE_ROOT/$PACKAGE_BINARY_ALIAS"
           cp README.md CHANGELOG.md SECURITY.md "$PACKAGE_ROOT/"
           tar -czf "$ARCHIVE" "$PACKAGE_ROOT"
 
-          python3 - <<'PY'
+          ARCHIVE_PATH="$ARCHIVE" python3 - <<'PY'
           import hashlib
+          import os
           from pathlib import Path
-          archive = Path("${ARCHIVE}")
+          archive = Path(os.environ["ARCHIVE_PATH"])
+          checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+          Path(f"{archive}.sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
+          PY
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Package benchmark publication bundle
+        if: matrix.archive_target == 'x86_64-unknown-linux-gnu'
+        id: benchmark_bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          PACKAGE_ROOT="mercury-benchmarks-${VERSION}"
+          ARCHIVE="${PACKAGE_ROOT}.tar.gz"
+
+          mkdir -p "$PACKAGE_ROOT/docs/benchmarks" "$PACKAGE_ROOT/evals/v0"
+          cp docs/benchmarks/README.md "$PACKAGE_ROOT/docs/benchmarks/"
+          cp docs/benchmarks/rust-v0-repair-benchmark.md "$PACKAGE_ROOT/docs/benchmarks/"
+          cp docs/benchmarks/rust-v0-quality.report.json "$PACKAGE_ROOT/docs/benchmarks/"
+          cp docs/benchmarks/rust-v0-agent-sweep.report.json "$PACKAGE_ROOT/docs/benchmarks/"
+          cp evals/v0/tier0-manifest.json "$PACKAGE_ROOT/evals/v0/"
+          cp evals/v0/tier1-manifest.json "$PACKAGE_ROOT/evals/v0/"
+          cp evals/v0/tier2-manifest.json "$PACKAGE_ROOT/evals/v0/"
+          cp CHANGELOG.md "$PACKAGE_ROOT/"
+          tar -czf "$ARCHIVE" "$PACKAGE_ROOT"
+
+          ARCHIVE_PATH="$ARCHIVE" python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          archive = Path(os.environ["ARCHIVE_PATH"])
           checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
           Path(f"{archive}.sha256").write_text(f"{checksum}  {archive.name}\n", encoding="utf-8")
           PY
@@ -116,6 +151,15 @@ PY
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
 
+      - name: Upload benchmark publication artifact
+        if: steps.benchmark_bundle.outputs.archive != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mercury-benchmarks
+          path: |
+            ${{ steps.benchmark_bundle.outputs.archive }}
+            ${{ steps.benchmark_bundle.outputs.archive }}.sha256
+
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
@@ -125,3 +169,13 @@ PY
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
           generate_release_notes: true
+
+      - name: Publish benchmark release asset
+        if: steps.benchmark_bundle.outputs.archive != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          files: |
+            ${{ steps.benchmark_bundle.outputs.archive }}
+            ${{ steps.benchmark_bundle.outputs.archive }}.sha256

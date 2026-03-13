@@ -8,9 +8,9 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 ## Publication Inputs
 
 - Quality report: `rust-v0-quality.report.json`
-  Run id: `20260312-tier1-quality` | Generated at: `2026-03-12T04:50:01.075670Z` | Agent counts: `4`
+  Run id: `20260313-quality` | Generated at: `2026-03-13T20:41:11.371410Z` | Agent counts: `4`
 - Agent-sweep report: `rust-v0-agent-sweep.report.json`
-  Run id: `20260312-tier1-agent-sweep` | Generated at: `2026-03-12T05:24:34.468087Z` | Agent counts: `1, 2, 4, 8`
+  Run id: `20260313-agent-sweep` | Generated at: `2026-03-13T20:52:57.228449Z` | Agent counts: `1, 2, 4, 8`
 - Aggregate schema: `mercury-repair-benchmark-v1`
 
 ## Quality Metrics
@@ -24,7 +24,7 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 - Median time to first candidate (ms): `n/a`
 - Median time to verified repair (ms): `n/a`
 - Median cost per attempted case (USD): `0.000`
-- Mean cost per attempted case (USD): `0.000`
+- Mean cost per attempted case (USD): `0.001`
 - Median cost per verified repair (USD): `n/a`
 - Mean cost per verified repair (USD): `n/a`
 
@@ -32,8 +32,9 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 
 | outcome | quality count | agent-sweep count |
 | --- | ---: | ---: |
-| fix_failed | 27 | 22 |
-| no_patch | 8 | 18 |
+| fix_failed | 24 | 33 |
+| no_patch | 11 | 6 |
+| runner_error | 0 | 1 |
 
 ## Difficulty-Class Breakdown
 
@@ -41,15 +42,15 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 
 | difficulty | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| easy | 30 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=24, no_patch=6 |
+| easy | 30 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=21, no_patch=9 |
 | medium | 5 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=3, no_patch=2 |
 
 ### Agent-sweep report
 
 | difficulty | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| easy | 36 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=20, no_patch=16 |
-| medium | 4 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=2, no_patch=2 |
+| easy | 36 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=30, no_patch=5, runner_error=1 |
+| medium | 4 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=3, no_patch=1 |
 
 ## Tier Breakdown
 
@@ -57,13 +58,15 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 
 | tier | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+| tier0 | 20 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=13, no_patch=7 |
+| tier1 | 15 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=11, no_patch=4 |
 
 ### Agent-sweep report
 
 | tier | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+| tier0 | 16 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=11, no_patch=4, runner_error=1 |
+| tier1 | 24 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=2 |
 
 ## Verifier-Class Breakdown
 
@@ -71,13 +74,17 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 
 | verifier class | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+| cargo_test | 10 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=5, no_patch=5 |
+| cargo_check | 15 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=11, no_patch=4 |
+| cargo_clippy | 10 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=8, no_patch=2 |
 
 ### Agent-sweep report
 
 | verifier class | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+| cargo_test | 8 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=6, no_patch=2 |
+| cargo_check | 24 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=2 |
+| cargo_clippy | 8 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=5, no_patch=2, runner_error=1 |
 
 ## Candidate Lineage Breakdown
 
@@ -85,13 +92,15 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 
 | candidate lineage | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+| mixed | 11 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | no_patch=11 |
+| unknown | 24 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=24 |
 
 ### Agent-sweep report
 
 | candidate lineage | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+| critique_retry | 6 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | no_patch=6 |
+| unknown | 34 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=33, runner_error=1 |
 
 ## Candidate Lineage Attempts
 
@@ -99,15 +108,16 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 | --- | ---: | ---: | ---: | ---: |
 | apply_edit | 0 | 0 | 0 | 0 |
 | grounded_next_edit | 0 | 0 | 0 | 0 |
-| critique_retry | 0 | 0 | 0 | 0 |
-| exploratory_next_edit | 0 | 0 | 0 | 0 |
+| critique_retry | 15 | 0 | 10 | 0 |
+| exploratory_next_edit | 16 | 0 | 0 | 0 |
 
 ## Failure Attribution
 
 | failure attribution | quality count | agent-sweep count |
 | --- | ---: | ---: |
-| fix_failed | 27 | 22 |
-| candidate_failed_verifier | 8 | 18 |
+| fix_failed | 24 | 33 |
+| candidate_failed_verifier | 11 | 6 |
+| runner_error | 0 | 1 |
 
 ## Execution Diagnostics
 
@@ -115,25 +125,25 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 | --- | ---: | ---: |
 | generation_failures | 0 | 0 |
 | safety_failures | 0 | 0 |
-| candidate_verification_failures | 19 | 59 |
+| candidate_verification_failures | 31 | 10 |
 | final_bundle_failures | 0 | 0 |
 
 ## `--max-agents` Speedup Curve
 
 | agents | attempted | verified | median duration ms | median verified ms | speedup vs baseline |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | 10 | 0 | 4058.000 | n/a | 1.000 |
-| 2 | 10 | 0 | 68643.000 | n/a | 0.059 |
-| 4 | 10 | 0 | 111923.000 | n/a | 0.036 |
-| 8 | 10 | 0 | 4102.500 | n/a | 0.989 |
+| 1 | 10 | 0 | 4126.500 | n/a | 1.000 |
+| 2 | 10 | 0 | 21024.500 | n/a | 0.196 |
+| 4 | 10 | 0 | 2114.500 | n/a | 1.952 |
+| 8 | 10 | 0 | 162.000 | n/a | 25.472 |
 
 ## `--max-agents` Cost Curve
 
 | agents | attempted | median cost usd | mean cost usd |
 | --- | ---: | ---: | ---: |
 | 1 | 10 | 0.000 | 0.000 |
-| 2 | 10 | 0.001 | 0.001 |
-| 4 | 10 | 0.003 | 0.002 |
+| 2 | 10 | 0.000 | 0.001 |
+| 4 | 10 | 0.000 | 0.000 |
 | 8 | 10 | 0.000 | 0.000 |
 
 ## Corpus Selection

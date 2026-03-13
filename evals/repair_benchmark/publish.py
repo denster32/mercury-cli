@@ -17,6 +17,18 @@ AGENT_SWEEP_REPORT_NAME = "rust-v0-agent-sweep.report.json"
 PENDING_STATUS = "pending first checked-in secret-backed Tier 1 Rust beta run."
 DIFFICULTY_ORDER = ["easy", "medium", "hard", "unknown"]
 TIER_ORDER = ["tier0", "tier1", "tier2", "unknown"]
+FAILURE_CLASS_TO_TIER = {
+    "test_assertion": "tier0",
+    "logic_off_by_one": "tier0",
+    "clippy_needless_return": "tier0",
+    "clippy_identity_op": "tier0",
+    "type_mismatch": "tier1",
+    "missing_symbol": "tier1",
+    "unknown_field": "tier1",
+    "parser": "tier2",
+    "trait_bound": "tier2",
+    "panic_unwrap": "tier2",
+}
 VERIFIER_CLASS_ORDER = ["cargo_test", "cargo_check", "cargo_clippy", "unknown"]
 CANDIDATE_LINEAGE_ORDER = [
     "apply_edit",
@@ -122,6 +134,208 @@ def normalize_tier_label(value: Any) -> str:
         if match:
             return f"tier{match.group(1)}"
     return "unknown"
+
+
+def derive_tier(
+    case: dict[str, Any],
+    suite_id: Optional[str] = None,
+    manifest_path: Optional[Path] = None,
+) -> str:
+    explicit = normalize_tier_label(case.get("tier"))
+    if explicit != "unknown":
+        return explicit
+
+    for tag in case.get("tags", []):
+        normalized = normalize_tier_label(tag)
+        if normalized != "unknown":
+            return normalized
+
+    failure_class = case.get("failure_class")
+    if isinstance(failure_class, str):
+        mapped = FAILURE_CLASS_TO_TIER.get(failure_class)
+        if mapped is not None:
+            return mapped
+
+    for candidate in (
+        suite_id,
+        str(manifest_path) if manifest_path is not None else None,
+        case.get("id"),
+        case.get("path"),
+        case.get("title"),
+    ):
+        normalized = normalize_tier_label(candidate)
+        if normalized != "unknown":
+            return normalized
+
+    return "unknown"
+
+
+def classify_verifier_command(argv: Any) -> str:
+    parts: list[str] = []
+    if isinstance(argv, list):
+        parts = [part.lower() for part in argv if isinstance(part, str)]
+    elif isinstance(argv, str):
+        parts = argv.lower().split()
+
+    for index, part in enumerate(parts):
+        if part != "cargo" or index + 1 >= len(parts):
+            continue
+        subcommand = parts[index + 1]
+        if subcommand == "test":
+            return "cargo_test"
+        if subcommand == "check":
+            return "cargo_check"
+        if subcommand == "clippy":
+            return "cargo_clippy"
+    return "unknown"
+
+
+def resolve_input_path(value: Any, *, base_dir: Optional[Path] = None) -> Optional[Path]:
+    if not isinstance(value, str) or not value:
+        return None
+
+    raw = Path(value)
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        if base_dir is not None:
+            candidates.append(base_dir / raw)
+        candidates.append(REPO_ROOT / raw)
+
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.exists():
+            return resolved
+
+    if not candidates:
+        return None
+    return candidates[0].resolve()
+
+
+def load_manifest_cases(
+    report: dict[str, Any], source_path: Optional[Path]
+) -> tuple[dict[str, dict[str, Any]], Optional[str], Optional[Path]]:
+    suite_id = report.get("suite_id") if isinstance(report.get("suite_id"), str) else None
+    selection = report.get("selection", {})
+    if not isinstance(selection, dict):
+        return {}, suite_id, None
+
+    manifest_path = resolve_input_path(
+        selection.get("manifest_path"),
+        base_dir=source_path.parent if source_path is not None else None,
+    )
+    if manifest_path is None or not manifest_path.exists():
+        return {}, suite_id, manifest_path
+
+    try:
+        payload = read_json(manifest_path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}, suite_id, manifest_path
+
+    if isinstance(payload.get("suite_id"), str):
+        suite_id = payload["suite_id"]
+
+    cases: dict[str, dict[str, Any]] = {}
+    for case in payload.get("cases", []):
+        if not isinstance(case, dict):
+            continue
+        case_id = case.get("id")
+        if isinstance(case_id, str) and case_id:
+            cases[case_id] = case
+    return cases, suite_id, manifest_path
+
+
+def infer_benchmark_run_path(result: dict[str, Any], source_path: Optional[Path]) -> Optional[Path]:
+    if source_path is None:
+        return None
+
+    case_id = result.get("case_id")
+    agent_count = result.get("agent_count")
+    if not isinstance(case_id, str) or not isinstance(agent_count, (int, float)):
+        return None
+
+    return (
+        source_path.parent
+        / "cases"
+        / case_id
+        / f"agents-{int(agent_count)}"
+        / "benchmark-run.json"
+    ).resolve()
+
+
+def load_benchmark_run(
+    result: dict[str, Any], source_path: Optional[Path]
+) -> Optional[dict[str, Any]]:
+    candidates: list[Path] = []
+    explicit = resolve_input_path(
+        result.get("benchmark_run_path"),
+        base_dir=source_path.parent if source_path is not None else None,
+    )
+    if explicit is not None:
+        candidates.append(explicit)
+
+    inferred = infer_benchmark_run_path(result, source_path)
+    if inferred is not None and inferred not in candidates:
+        candidates.append(inferred)
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            return read_json(candidate)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+def enrich_case_result(
+    result: dict[str, Any],
+    *,
+    case_index: dict[str, dict[str, Any]],
+    suite_id: Optional[str],
+    manifest_path: Optional[Path],
+    source_path: Optional[Path],
+) -> dict[str, Any]:
+    enriched = dict(result)
+    case_id = enriched.get("case_id")
+    case = dict(case_index.get(case_id, {})) if isinstance(case_id, str) else {}
+    if "id" not in case and isinstance(case_id, str):
+        case["id"] = case_id
+    if "path" not in case and isinstance(enriched.get("case_path"), str):
+        case["path"] = enriched["case_path"]
+    if "title" not in case and isinstance(enriched.get("case_title"), str):
+        case["title"] = enriched["case_title"]
+
+    if normalize_tier_label(enriched.get("tier")) == "unknown":
+        enriched["tier"] = derive_tier(case, suite_id, manifest_path)
+
+    verifier_class = enriched.get("verifier_class")
+    if not isinstance(verifier_class, str) or verifier_class not in VERIFIER_CLASS_ORDER:
+        enriched["verifier_class"] = classify_verifier_command(case.get("verifier_command"))
+
+    benchmark_run = load_benchmark_run(enriched, source_path)
+    if benchmark_run is not None:
+        for field in [
+            "accepted_patch_bytes",
+            "time_to_first_candidate_ms",
+            "time_to_verified_repair_ms",
+            "total_cost_usd",
+            "budget_remaining_usd",
+            *EXECUTION_DIAGNOSTIC_FIELDS,
+            *CANDIDATE_ATTEMPT_FIELDS,
+            *CANDIDATE_ACCEPTED_FIELDS,
+        ]:
+            if not isinstance(enriched.get(field), (int, float)) and field in benchmark_run:
+                enriched[field] = benchmark_run[field]
+
+        for field in ["outcome", "failure_attribution"]:
+            if not isinstance(enriched.get(field), str) and isinstance(
+                benchmark_run.get(field), str
+            ):
+                enriched[field] = benchmark_run[field]
+
+    return enriched
 
 
 def normalized_execution_diagnostics(source: dict[str, Any]) -> dict[str, int]:
@@ -286,23 +500,31 @@ def compute_candidate_attempt_breakdown(results: list[dict[str, Any]]) -> dict[s
     return breakdown
 
 
-def sanitize_public_report(report: dict[str, Any]) -> dict[str, Any]:
+def sanitize_public_report(report: dict[str, Any], source_path: Optional[Path] = None) -> dict[str, Any]:
     sanitized = dict(report)
     for field in ["run_root", "binary_path", "api_key_env"]:
         sanitized.pop(field, None)
 
+    manifest_cases, suite_id, resolved_manifest_path = load_manifest_cases(report, source_path)
     selection = dict(sanitized.get("selection", {}))
     if "manifest_path" in selection:
-        manifest_path = repo_relative_path(selection["manifest_path"])
-        if manifest_path is None:
+        public_manifest_path = repo_relative_path(selection["manifest_path"])
+        if public_manifest_path is None:
             selection.pop("manifest_path", None)
         else:
-            selection["manifest_path"] = manifest_path
+            selection["manifest_path"] = public_manifest_path
     sanitized["selection"] = selection
 
     sanitized_results: list[dict[str, Any]] = []
     for result in sanitized.get("results", []):
-        public_result = normalized_case_result(dict(result))
+        enriched = enrich_case_result(
+            dict(result),
+            case_index=manifest_cases,
+            suite_id=suite_id,
+            manifest_path=resolved_manifest_path,
+            source_path=source_path,
+        )
+        public_result = normalized_case_result(enriched)
         public_result.pop("benchmark_run_path", None)
         public_result.pop("candidate_workspace", None)
         sanitized_results.append(public_result)
@@ -794,8 +1016,8 @@ def main() -> int:
     quality = validate_report(args.quality_report.resolve(), "quality")
     agent_sweep = validate_report(args.agent_sweep_report.resolve(), "agent-sweep")
     assert_same_track(quality, agent_sweep)
-    public_quality = sanitize_public_report(quality)
-    public_agent_sweep = sanitize_public_report(agent_sweep)
+    public_quality = sanitize_public_report(quality, args.quality_report.resolve())
+    public_agent_sweep = sanitize_public_report(agent_sweep, args.agent_sweep_report.resolve())
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_json(args.output_dir / QUALITY_REPORT_NAME, public_quality)

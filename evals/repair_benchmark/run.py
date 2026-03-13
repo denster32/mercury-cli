@@ -70,6 +70,18 @@ CANDIDATE_LINEAGE_FIELDS = {
 CANDIDATE_ATTEMPT_FIELDS = [fields[0] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
 CANDIDATE_ACCEPTED_FIELDS = [fields[1] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
 TIER_PATTERN = re.compile(r"tier[\s:_-]*([012])", re.IGNORECASE)
+FAILURE_CLASS_TO_TIER = {
+    "test_assertion": "tier0",
+    "logic_off_by_one": "tier0",
+    "clippy_needless_return": "tier0",
+    "clippy_identity_op": "tier0",
+    "type_mismatch": "tier1",
+    "missing_symbol": "tier1",
+    "unknown_field": "tier1",
+    "parser": "tier2",
+    "trait_bound": "tier2",
+    "panic_unwrap": "tier2",
+}
 
 
 def now_utc() -> datetime:
@@ -461,6 +473,12 @@ def derive_tier(
         normalized = normalize_tier_label(tag)
         if normalized != "unknown":
             return normalized
+
+    failure_class = case.get("failure_class")
+    if isinstance(failure_class, str):
+        mapped = FAILURE_CLASS_TO_TIER.get(failure_class)
+        if mapped is not None:
+            return mapped
 
     for candidate in (
         suite_id,
@@ -923,7 +941,67 @@ def case_workspace_root(run_root: Path, case: dict[str, Any], agent_count: int) 
     return run_root / "workspaces" / f"{case['id']}-agents-{agent_count}"
 
 
-def load_existing_result(result_path: Path) -> Optional[dict[str, Any]]:
+def load_cached_benchmark_run(result_path: Path) -> Optional[dict[str, Any]]:
+    benchmark_run_path = result_path.parent / "benchmark-run.json"
+    if not benchmark_run_path.exists():
+        return None
+    try:
+        payload = read_json(benchmark_run_path)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def cached_result_has_lineage_metadata(source: dict[str, Any]) -> bool:
+    lineage_fields = CANDIDATE_ATTEMPT_FIELDS + CANDIDATE_ACCEPTED_FIELDS
+    return all(field in source for field in lineage_fields)
+
+
+def enrich_existing_result(
+    payload: dict[str, Any],
+    benchmark_run: Optional[dict[str, Any]],
+    case: dict[str, Any],
+    suite_id: Optional[str],
+    manifest_path: Optional[Path],
+) -> dict[str, Any]:
+    enriched = dict(payload)
+    if normalize_tier_label(enriched.get("tier")) == "unknown":
+        enriched["tier"] = derive_tier(case, suite_id, manifest_path)
+    verifier_class = enriched.get("verifier_class")
+    if not isinstance(verifier_class, str) or verifier_class not in VERIFIER_CLASS_ORDER:
+        enriched["verifier_class"] = classify_verifier_command(case.get("verifier_command"))
+    if benchmark_run is not None:
+        for field in (
+            EXECUTION_DIAGNOSTIC_FIELDS
+            + CANDIDATE_ATTEMPT_FIELDS
+            + CANDIDATE_ACCEPTED_FIELDS
+        ):
+            if field not in enriched and field in benchmark_run:
+                enriched[field] = benchmark_run[field]
+    return enriched
+
+
+def cached_result_requires_rerun(
+    payload: dict[str, Any], benchmark_run: Optional[dict[str, Any]]
+) -> bool:
+    if cached_result_has_lineage_metadata(payload):
+        return False
+    if benchmark_run is not None and cached_result_has_lineage_metadata(benchmark_run):
+        return False
+    outcome = payload.get("outcome")
+    if benchmark_run is not None:
+        return True
+    if payload.get("accepted_patch"):
+        return True
+    return outcome in {"verified_repair", "accepted_patch_unverified", "false_green"}
+
+
+def load_existing_result(
+    result_path: Path,
+    case: dict[str, Any],
+    suite_id: Optional[str],
+    manifest_path: Optional[Path],
+) -> Optional[dict[str, Any]]:
     if not result_path.exists():
         return None
     payload = read_json(result_path)
@@ -946,7 +1024,11 @@ def load_existing_result(result_path: Path) -> Optional[dict[str, Any]]:
         raise ValueError(
             f"benchmark result at {result_path} declared unsupported schema version {payload['schema_version']}"
         )
-    return normalized_case_result(payload)
+    benchmark_run = load_cached_benchmark_run(result_path)
+    enriched = enrich_existing_result(payload, benchmark_run, case, suite_id, manifest_path)
+    if cached_result_requires_rerun(enriched, benchmark_run):
+        return None
+    return normalized_case_result(enriched)
 
 
 def build_runner_error_result(
@@ -1514,7 +1596,12 @@ def main() -> int:
             result_root = case_result_root(run_root, case, agent_count)
             result_path = result_root / "result.json"
             if args.resume:
-                existing = load_existing_result(result_path)
+                existing = load_existing_result(
+                    result_path,
+                    case,
+                    manifest["suite_id"],
+                    args.suite.resolve(),
+                )
                 if existing is not None:
                     results.append(existing)
                     write_report_bundle(

@@ -36,8 +36,16 @@ fn manifest() -> Value {
     manifest_at("evals/v0/manifest.json")
 }
 
+fn tier0_manifest() -> Value {
+    manifest_at("evals/v0/tier0-manifest.json")
+}
+
 fn tier1_manifest() -> Value {
     manifest_at("evals/v0/tier1-manifest.json")
+}
+
+fn tier2_manifest() -> Value {
+    manifest_at("evals/v0/tier2-manifest.json")
 }
 
 fn typescript_manifest() -> Value {
@@ -422,6 +430,100 @@ fn eval_manifest_matches_v0_shape() {
 }
 
 #[test]
+fn eval_tier0_manifest_matches_diagnostic_shape() {
+    let full_manifest = manifest();
+    let full_case_ids: BTreeSet<_> = full_manifest["cases"]
+        .as_array()
+        .expect("v0 cases must be an array")
+        .iter()
+        .map(|case| case["id"].as_str().expect("case id must be a string"))
+        .collect();
+
+    let manifest = tier0_manifest();
+    assert_eq!(manifest["schema_version"], "mercury-evals-v0");
+    assert_eq!(manifest["suite_id"], "rust-v0.3-tier0");
+    assert_eq!(manifest["language"], "rust");
+    assert_eq!(manifest["version"], 3);
+    assert_eq!(
+        manifest["description"],
+        "Tier 0 Rust diagnostic lane focused on trivial single-file assertion, logic, and clippy repairs."
+    );
+
+    let supported_modes = manifest["supported_modes"]
+        .as_array()
+        .expect("supported_modes must be an array");
+    assert_eq!(supported_modes.len(), 1);
+    assert_eq!(supported_modes[0], "baseline");
+
+    let cases = manifest["cases"]
+        .as_array()
+        .expect("cases must be an array");
+    assert_eq!(
+        cases.len(),
+        20,
+        "tier0 corpus should contain 20 logical case ids"
+    );
+
+    let mut ids = BTreeSet::new();
+    let mut stage_counts = BTreeMap::new();
+    let mut failure_class_counts = BTreeMap::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("case id must be a string");
+        assert!(ids.insert(id.to_string()), "tier0 case ids must be unique");
+        assert!(
+            full_case_ids.contains(id),
+            "tier0 case `{id}` should exist in the seeded v0 corpus"
+        );
+
+        let stage = case["failure_stage"]
+            .as_str()
+            .expect("failure_stage must be a string");
+        *stage_counts.entry(stage.to_string()).or_insert(0usize) += 1;
+
+        let failure_class = case["failure_class"]
+            .as_str()
+            .expect("failure_class must be a string");
+        assert!(
+            matches!(
+                failure_class,
+                "test_assertion"
+                    | "logic_off_by_one"
+                    | "clippy_needless_return"
+                    | "clippy_identity_op"
+            ),
+            "tier0 should keep only trivial failure class `{failure_class}`"
+        );
+        *failure_class_counts
+            .entry(failure_class.to_string())
+            .or_insert(0usize) += 1;
+    }
+
+    assert_eq!(stage_counts.get("test"), Some(&10usize));
+    assert_eq!(stage_counts.get("lint"), Some(&10usize));
+    assert!(
+        !stage_counts.contains_key("parse"),
+        "tier0 should exclude parse-stage cases"
+    );
+    assert!(
+        !stage_counts.contains_key("compile"),
+        "tier0 should exclude compile-stage cases"
+    );
+
+    for failure_class in [
+        "test_assertion",
+        "logic_off_by_one",
+        "clippy_needless_return",
+        "clippy_identity_op",
+    ] {
+        assert_eq!(
+            failure_class_counts.get(failure_class),
+            Some(&5usize),
+            "tier0 should keep five cases for `{failure_class}`"
+        );
+    }
+}
+
+#[test]
 fn eval_tier1_manifest_matches_beta_shape() {
     let full_manifest = manifest();
     let full_case_ids: BTreeSet<_> = full_manifest["cases"]
@@ -505,6 +607,82 @@ fn eval_tier1_manifest_matches_beta_shape() {
             failure_class_counts.get(failure_class),
             Some(&5usize),
             "tier1 should keep five cases for `{failure_class}`"
+        );
+    }
+}
+
+#[test]
+fn eval_tier2_manifest_matches_diagnostic_shape() {
+    let full_manifest = manifest();
+    let full_case_ids: BTreeSet<_> = full_manifest["cases"]
+        .as_array()
+        .expect("v0 cases must be an array")
+        .iter()
+        .map(|case| case["id"].as_str().expect("case id must be a string"))
+        .collect();
+
+    let manifest = tier2_manifest();
+    assert_eq!(manifest["schema_version"], "mercury-evals-v0");
+    assert_eq!(manifest["suite_id"], "rust-v0.3-tier2");
+    assert_eq!(manifest["language"], "rust");
+    assert_eq!(manifest["version"], 3);
+    assert_eq!(
+        manifest["description"],
+        "Tier 2 Rust diagnostic lane covering parser, trait-bound, and panic-unwrap repairs that remain harder or unsupported in the current beta."
+    );
+
+    let supported_modes = manifest["supported_modes"]
+        .as_array()
+        .expect("supported_modes must be an array");
+    assert_eq!(supported_modes.len(), 1);
+    assert_eq!(supported_modes[0], "baseline");
+
+    let cases = manifest["cases"]
+        .as_array()
+        .expect("cases must be an array");
+    assert_eq!(
+        cases.len(),
+        15,
+        "tier2 corpus should contain 15 logical case ids"
+    );
+
+    let mut ids = BTreeSet::new();
+    let mut stage_counts = BTreeMap::new();
+    let mut failure_class_counts = BTreeMap::new();
+    for case in cases {
+        let id = case["id"].as_str().expect("case id must be a string");
+        assert!(ids.insert(id.to_string()), "tier2 case ids must be unique");
+        assert!(
+            full_case_ids.contains(id),
+            "tier2 case `{id}` should exist in the seeded v0 corpus"
+        );
+
+        let stage = case["failure_stage"]
+            .as_str()
+            .expect("failure_stage must be a string");
+        *stage_counts.entry(stage.to_string()).or_insert(0usize) += 1;
+
+        let failure_class = case["failure_class"]
+            .as_str()
+            .expect("failure_class must be a string");
+        assert!(
+            matches!(failure_class, "parser" | "trait_bound" | "panic_unwrap"),
+            "tier2 should keep only harder failure class `{failure_class}`"
+        );
+        *failure_class_counts
+            .entry(failure_class.to_string())
+            .or_insert(0usize) += 1;
+    }
+
+    assert_eq!(stage_counts.get("parse"), Some(&5usize));
+    assert_eq!(stage_counts.get("compile"), Some(&5usize));
+    assert_eq!(stage_counts.get("test"), Some(&5usize));
+
+    for failure_class in ["parser", "trait_bound", "panic_unwrap"] {
+        assert_eq!(
+            failure_class_counts.get(failure_class),
+            Some(&5usize),
+            "tier2 should keep five cases for `{failure_class}`"
         );
     }
 }
@@ -865,6 +1043,8 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
         fs::read_to_string(repo_root.join("docs/QUALITY.md")).expect("quality doc should exist");
     let benchmark_readme = fs::read_to_string(repo_root.join("docs/benchmarks/README.md"))
         .expect("benchmark README should exist");
+    let v0_readme =
+        fs::read_to_string(repo_root.join("evals/v0/README.md")).expect("v0 README should exist");
     let operator_quickstart = fs::read_to_string(repo_root.join("docs/operator-quickstart.md"))
         .expect("operator quickstart should exist");
     let starter_index = fs::read_to_string(repo_root.join("starter-repos/README.md"))
@@ -1047,6 +1227,7 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             ("docs/benchmarks/README.md", benchmark_readme.as_str()),
             ("README", readme.as_str()),
             ("QUALITY", quality.as_str()),
+            ("evals/v0/README.md", v0_readme.as_str()),
         ] {
             assert!(
                 !text.contains("secret-backed Tier 1 Rust beta"),
@@ -1063,6 +1244,14 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             assert!(
                 text.contains("evals/v0/tier1-manifest.json"),
                 "{label} should describe the Tier 1 Rust beta manifest"
+            );
+            assert!(
+                text.contains("evals/v0/tier0-manifest.json"),
+                "{label} should describe the Tier 0 Rust diagnostic manifest"
+            );
+            assert!(
+                text.contains("evals/v0/tier2-manifest.json"),
+                "{label} should describe the Tier 2 Rust diagnostic manifest"
             );
         }
         assert!(
@@ -1171,6 +1360,9 @@ fn release_workflow_requires_manual_version_to_match_manifest_version() {
         "echo \"version=$VERSION\" >> \"$GITHUB_OUTPUT\"",
         "echo \"prerelease=$PRERELEASE\" >> \"$GITHUB_OUTPUT\"",
         "prerelease: ${{ steps.version.outputs.prerelease == 'true' }}",
+        "evals/v0/tier0-manifest.json",
+        "evals/v0/tier1-manifest.json",
+        "evals/v0/tier2-manifest.json",
     ] {
         assert!(
             workflow.contains(expected),
@@ -1685,6 +1877,618 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         copied_agent_sweep["failure_attribution"]["candidate_failed_verifier"],
         1
     );
+    assert_public_benchmark_report_is_scrubbed(&copied_quality);
+    assert_public_benchmark_report_is_scrubbed(&copied_agent_sweep);
+}
+
+#[test]
+fn repair_benchmark_publish_script_backfills_legacy_metadata_from_manifest_and_benchmark_runs() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = temp.path().join("published");
+    let quality_run_dir = temp.path().join("quality-run");
+    let agent_run_dir = temp.path().join("agent-run");
+    let quality_path = quality_run_dir.join("report.json");
+    let agent_sweep_path = agent_run_dir.join("report.json");
+    let quality_case_dir = quality_run_dir
+        .join("cases")
+        .join("rust_type_mismatch")
+        .join("agents-4");
+    let agent_case_dir = agent_run_dir
+        .join("cases")
+        .join("rust_type_mismatch")
+        .join("agents-8");
+
+    fs::create_dir_all(&quality_case_dir).expect("quality case dir should be creatable");
+    fs::create_dir_all(&agent_case_dir).expect("agent case dir should be creatable");
+
+    let quality_benchmark_run = json!({
+        "schema_version": "mercury-repair-benchmark-run-v1",
+        "accepted_patch_bytes": 72,
+        "generation_failures": 0,
+        "safety_failures": 1,
+        "candidate_verification_failures": 2,
+        "final_bundle_failures": 0,
+        "critique_retry_attempts": 3,
+        "critique_retry_accepted_steps": 1,
+        "time_to_first_candidate_ms": 2100,
+        "time_to_verified_repair_ms": 6100,
+        "total_cost_usd": 0.14,
+        "failure_attribution": "candidate_failed_verifier",
+        "outcome": "accepted_patch_unverified"
+    });
+    let agent_benchmark_run = json!({
+        "schema_version": "mercury-repair-benchmark-run-v1",
+        "accepted_patch_bytes": 0,
+        "generation_failures": 1,
+        "safety_failures": 0,
+        "candidate_verification_failures": 0,
+        "final_bundle_failures": 0,
+        "failure_attribution": "patch_generation_failed",
+        "outcome": "no_patch"
+    });
+
+    fs::write(
+        quality_case_dir.join("benchmark-run.json"),
+        serde_json::to_vec_pretty(&quality_benchmark_run)
+            .expect("quality benchmark run should serialize"),
+    )
+    .expect("quality benchmark run should be writable");
+    fs::write(
+        agent_case_dir.join("benchmark-run.json"),
+        serde_json::to_vec_pretty(&agent_benchmark_run)
+            .expect("agent benchmark run should serialize"),
+    )
+    .expect("agent benchmark run should be writable");
+
+    let quality_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Legacy aggregate report missing tier and verifier metadata",
+        "suite_id": "rust-v0.3-tier1",
+        "language": "rust",
+        "mode": "quality",
+        "generated_at": "2026-03-13T00:00:00Z",
+        "run_id": "quality-legacy",
+        "run_root": quality_run_dir,
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [4],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "MERCURY_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/tier1-manifest.json"),
+            "selected_count": 1,
+            "selected_case_ids": ["rust_type_mismatch"],
+            "selected_unique_fixture_paths": 1,
+            "requested_limit": serde_json::Value::Null,
+            "requested_stages": ["compile"],
+            "requested_difficulties": []
+        },
+        "started_at": "2026-03-13T00:00:00Z",
+        "finished_at": "2026-03-13T00:05:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "accepted_patches": 1,
+            "false_greens": 0,
+            "verified_repair_rate": 0.0,
+            "accepted_patch_rate": 1.0,
+            "false_green_rate": 0.0,
+            "median_time_to_first_candidate_ms": 2100,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "median_cost_per_attempted_case_usd": 0.14,
+            "mean_cost_per_attempted_case_usd": 0.14,
+            "median_cost_per_verified_repair_usd": serde_json::Value::Null,
+            "mean_cost_per_verified_repair_usd": serde_json::Value::Null
+        },
+        "failure_attribution": {},
+        "execution_diagnostics": {
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 0,
+            "final_bundle_failures": 0
+        },
+        "speedup_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "median_duration_ms": 6100,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "speedup_vs_baseline": 1.0
+        }],
+        "cost_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 1,
+            "median_total_cost_usd": 0.14,
+            "mean_total_cost_usd": 0.14
+        }],
+        "results": [{
+            "case_id": "rust_type_mismatch",
+            "agent_count": 4,
+            "outcome": "accepted_patch_unverified",
+            "verified_repair": false,
+            "difficulty": "medium",
+            "tier": serde_json::Value::Null,
+            "verifier_class": serde_json::Value::Null
+        }]
+    });
+    let agent_sweep_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Legacy agent-sweep report missing lineage counters",
+        "suite_id": "rust-v0.3-tier1",
+        "language": "rust",
+        "mode": "agent-sweep",
+        "generated_at": "2026-03-13T01:00:00Z",
+        "run_id": "agent-legacy",
+        "run_root": agent_run_dir,
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [8],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "MERCURY_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/tier1-manifest.json"),
+            "selected_count": 1,
+            "selected_case_ids": ["rust_type_mismatch"],
+            "selected_unique_fixture_paths": 1,
+            "requested_limit": 1,
+            "requested_stages": ["compile"],
+            "requested_difficulties": []
+        },
+        "started_at": "2026-03-13T01:00:00Z",
+        "finished_at": "2026-03-13T01:05:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "accepted_patches": 0,
+            "false_greens": 0,
+            "verified_repair_rate": 0.0,
+            "accepted_patch_rate": 0.0,
+            "false_green_rate": 0.0,
+            "median_time_to_first_candidate_ms": serde_json::Value::Null,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "median_cost_per_attempted_case_usd": 0.03,
+            "mean_cost_per_attempted_case_usd": 0.03,
+            "median_cost_per_verified_repair_usd": serde_json::Value::Null,
+            "mean_cost_per_verified_repair_usd": serde_json::Value::Null
+        },
+        "failure_attribution": {},
+        "execution_diagnostics": {
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 0,
+            "final_bundle_failures": 0
+        },
+        "speedup_curve": [{
+            "agent_count": 8,
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "median_duration_ms": 1900,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "speedup_vs_baseline": 1.0
+        }],
+        "cost_curve": [{
+            "agent_count": 8,
+            "attempted_cases": 1,
+            "median_total_cost_usd": 0.03,
+            "mean_total_cost_usd": 0.03
+        }],
+        "results": [{
+            "case_id": "rust_type_mismatch",
+            "agent_count": 8,
+            "outcome": "no_patch",
+            "verified_repair": false,
+            "difficulty": "medium",
+            "tier": serde_json::Value::Null,
+            "verifier_class": serde_json::Value::Null
+        }]
+    });
+
+    fs::write(
+        &quality_path,
+        serde_json::to_vec_pretty(&quality_report).expect("quality report should serialize"),
+    )
+    .expect("quality report should be writable");
+    fs::write(
+        &agent_sweep_path,
+        serde_json::to_vec_pretty(&agent_sweep_report)
+            .expect("agent sweep report should serialize"),
+    )
+    .expect("agent sweep report should be writable");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/publish.py")
+        .arg("--quality-report")
+        .arg(quality_path.as_os_str())
+        .arg("--agent-sweep-report")
+        .arg(agent_sweep_path.as_os_str())
+        .arg("--output-dir")
+        .arg(output_dir.as_os_str())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute benchmark publisher");
+    assert!(
+        output.status.success(),
+        "legacy benchmark publisher should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let copied_quality: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("rust-v0-quality.report.json"))
+            .expect("copied quality report should exist"),
+    )
+    .expect("copied quality report should parse");
+    let copied_agent_sweep: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("rust-v0-agent-sweep.report.json"))
+            .expect("copied agent sweep report should exist"),
+    )
+    .expect("copied agent sweep report should parse");
+
+    assert_eq!(
+        copied_quality["selection"]["manifest_path"],
+        "evals/v0/tier1-manifest.json"
+    );
+    assert_eq!(copied_quality["results"][0]["tier"], "tier1");
+    assert_eq!(copied_quality["results"][0]["verifier_class"], "cargo_check");
+    assert_eq!(copied_quality["results"][0]["candidate_lineage"], "critique_retry");
+    assert_eq!(copied_quality["results"][0]["accepted_patch_bytes"], 72);
+    assert_eq!(copied_quality["results"][0]["safety_failures"], 1);
+    assert_eq!(copied_quality["results"][0]["candidate_verification_failures"], 2);
+    assert_eq!(
+        copied_quality["candidate_lineage_breakdown"]["critique_retry"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["critique_retry"]["attempts"],
+        3
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["critique_retry"]["accepted_steps"],
+        1
+    );
+
+    assert_eq!(copied_agent_sweep["results"][0]["tier"], "tier1");
+    assert_eq!(copied_agent_sweep["results"][0]["verifier_class"], "cargo_check");
+    assert_eq!(copied_agent_sweep["results"][0]["candidate_lineage"], "unknown");
+    assert_eq!(
+        copied_agent_sweep["candidate_lineage_breakdown"]["unknown"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["candidate_attempt_breakdown"]["apply_edit"]["attempts"],
+        0
+    );
+    assert_eq!(
+        copied_agent_sweep["failure_attribution"]["patch_generation_failed"],
+        1
+    );
+
+    assert_public_benchmark_report_is_scrubbed(&copied_quality);
+    assert_public_benchmark_report_is_scrubbed(&copied_agent_sweep);
+}
+
+#[test]
+fn repair_benchmark_publish_script_backfills_canonical_manifest_tier_and_lineage_metadata() {
+    let temp = tempfile::tempdir().expect("tempdir should be created");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = temp.path().join("published");
+    let quality_run_dir = temp.path().join("quality-run");
+    let agent_run_dir = temp.path().join("agent-run");
+    let quality_path = quality_run_dir.join("report.json");
+    let agent_sweep_path = agent_run_dir.join("report.json");
+    let quality_case_dir = quality_run_dir
+        .join("cases")
+        .join("rust_runtime_assertion_failure")
+        .join("agents-2");
+    let agent_case_dir = agent_run_dir
+        .join("cases")
+        .join("rust_runtime_assertion_failure")
+        .join("agents-4");
+
+    fs::create_dir_all(&quality_case_dir).expect("quality case dir should be creatable");
+    fs::create_dir_all(&agent_case_dir).expect("agent case dir should be creatable");
+
+    let quality_benchmark_run = json!({
+        "schema_version": "mercury-repair-benchmark-run-v1",
+        "accepted_patch_bytes": 48,
+        "generation_failures": 0,
+        "safety_failures": 0,
+        "candidate_verification_failures": 1,
+        "final_bundle_failures": 0,
+        "apply_edit_attempts": 2,
+        "apply_edit_accepted_steps": 1,
+        "time_to_first_candidate_ms": 1200,
+        "time_to_verified_repair_ms": 3400,
+        "total_cost_usd": 0.09,
+        "failure_attribution": "candidate_failed_verifier",
+        "outcome": "accepted_patch_unverified"
+    });
+    let agent_benchmark_run = json!({
+        "schema_version": "mercury-repair-benchmark-run-v1",
+        "accepted_patch_bytes": 0,
+        "generation_failures": 1,
+        "safety_failures": 0,
+        "candidate_verification_failures": 0,
+        "final_bundle_failures": 0,
+        "failure_attribution": "patch_generation_failed",
+        "outcome": "no_patch"
+    });
+
+    fs::write(
+        quality_case_dir.join("benchmark-run.json"),
+        serde_json::to_vec_pretty(&quality_benchmark_run)
+            .expect("quality benchmark run should serialize"),
+    )
+    .expect("quality benchmark run should be writable");
+    fs::write(
+        agent_case_dir.join("benchmark-run.json"),
+        serde_json::to_vec_pretty(&agent_benchmark_run)
+            .expect("agent benchmark run should serialize"),
+    )
+    .expect("agent benchmark run should be writable");
+
+    let quality_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Legacy canonical report missing tier and lineage metadata",
+        "suite_id": "rust-v0.3-seeded",
+        "language": "rust",
+        "mode": "quality",
+        "generated_at": "2026-03-13T02:00:00Z",
+        "run_id": "quality-canonical-legacy",
+        "run_root": quality_run_dir,
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [2],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "MERCURY_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "selected_count": 1,
+            "selected_case_ids": ["rust_runtime_assertion_failure"],
+            "selected_unique_fixture_paths": 1,
+            "requested_limit": serde_json::Value::Null,
+            "requested_stages": ["test"],
+            "requested_difficulties": []
+        },
+        "started_at": "2026-03-13T02:00:00Z",
+        "finished_at": "2026-03-13T02:05:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "accepted_patches": 1,
+            "false_greens": 0,
+            "verified_repair_rate": 0.0,
+            "accepted_patch_rate": 1.0,
+            "false_green_rate": 0.0,
+            "median_time_to_first_candidate_ms": 1200,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "median_cost_per_attempted_case_usd": 0.09,
+            "mean_cost_per_attempted_case_usd": 0.09,
+            "median_cost_per_verified_repair_usd": serde_json::Value::Null,
+            "mean_cost_per_verified_repair_usd": serde_json::Value::Null
+        },
+        "failure_attribution": {},
+        "execution_diagnostics": {
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 0,
+            "final_bundle_failures": 0
+        },
+        "speedup_curve": [{
+            "agent_count": 2,
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "median_duration_ms": 3400,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "speedup_vs_baseline": 1.0
+        }],
+        "cost_curve": [{
+            "agent_count": 2,
+            "attempted_cases": 1,
+            "median_total_cost_usd": 0.09,
+            "mean_total_cost_usd": 0.09
+        }],
+        "results": [{
+            "case_id": "rust_runtime_assertion_failure",
+            "agent_count": 2,
+            "outcome": "accepted_patch_unverified",
+            "verified_repair": false,
+            "difficulty": "easy",
+            "tier": serde_json::Value::Null,
+            "verifier_class": serde_json::Value::Null
+        }]
+    });
+    let agent_sweep_report = json!({
+        "schema_version": "mercury-repair-benchmark-v1",
+        "description": "Legacy canonical agent-sweep report missing tier metadata",
+        "suite_id": "rust-v0.3-seeded",
+        "language": "rust",
+        "mode": "agent-sweep",
+        "generated_at": "2026-03-13T02:10:00Z",
+        "run_id": "agent-canonical-legacy",
+        "run_root": agent_run_dir,
+        "binary_path": "/tmp/mercury-cli",
+        "agent_counts": [4],
+        "max_cost_usd": 0.5,
+        "timeout_seconds": 300,
+        "api_key_env": "MERCURY_API_KEY",
+        "manifest": {
+            "schema_version": "mercury-evals-v0",
+            "version": 3,
+            "artifact_schema_version": "mercury-eval-report-v0",
+            "supported_modes": ["baseline"]
+        },
+        "selection": {
+            "manifest_path": repo_root.join("evals/v0/manifest.json"),
+            "selected_count": 1,
+            "selected_case_ids": ["rust_runtime_assertion_failure"],
+            "selected_unique_fixture_paths": 1,
+            "requested_limit": 1,
+            "requested_stages": ["test"],
+            "requested_difficulties": []
+        },
+        "started_at": "2026-03-13T02:10:00Z",
+        "finished_at": "2026-03-13T02:15:00Z",
+        "duration_ms": 300000,
+        "metrics": {
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "accepted_patches": 0,
+            "false_greens": 0,
+            "verified_repair_rate": 0.0,
+            "accepted_patch_rate": 0.0,
+            "false_green_rate": 0.0,
+            "median_time_to_first_candidate_ms": serde_json::Value::Null,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "median_cost_per_attempted_case_usd": 0.02,
+            "mean_cost_per_attempted_case_usd": 0.02,
+            "median_cost_per_verified_repair_usd": serde_json::Value::Null,
+            "mean_cost_per_verified_repair_usd": serde_json::Value::Null
+        },
+        "failure_attribution": {},
+        "execution_diagnostics": {
+            "generation_failures": 0,
+            "safety_failures": 0,
+            "candidate_verification_failures": 0,
+            "final_bundle_failures": 0
+        },
+        "speedup_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 1,
+            "verified_repairs": 0,
+            "median_duration_ms": 1800,
+            "median_time_to_verified_repair_ms": serde_json::Value::Null,
+            "speedup_vs_baseline": 1.0
+        }],
+        "cost_curve": [{
+            "agent_count": 4,
+            "attempted_cases": 1,
+            "median_total_cost_usd": 0.02,
+            "mean_total_cost_usd": 0.02
+        }],
+        "results": [{
+            "case_id": "rust_runtime_assertion_failure",
+            "agent_count": 4,
+            "outcome": "no_patch",
+            "verified_repair": false,
+            "difficulty": "easy",
+            "tier": serde_json::Value::Null,
+            "verifier_class": serde_json::Value::Null
+        }]
+    });
+
+    fs::write(
+        &quality_path,
+        serde_json::to_vec_pretty(&quality_report).expect("quality report should serialize"),
+    )
+    .expect("quality report should be writable");
+    fs::write(
+        &agent_sweep_path,
+        serde_json::to_vec_pretty(&agent_sweep_report)
+            .expect("agent sweep report should serialize"),
+    )
+    .expect("agent sweep report should be writable");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/publish.py")
+        .arg("--quality-report")
+        .arg(quality_path.as_os_str())
+        .arg("--agent-sweep-report")
+        .arg(agent_sweep_path.as_os_str())
+        .arg("--output-dir")
+        .arg(output_dir.as_os_str())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("python3 should execute benchmark publisher");
+    assert!(
+        output.status.success(),
+        "canonical legacy benchmark publisher should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let copied_quality: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("rust-v0-quality.report.json"))
+            .expect("copied quality report should exist"),
+    )
+    .expect("copied quality report should parse");
+    let copied_agent_sweep: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("rust-v0-agent-sweep.report.json"))
+            .expect("copied agent sweep report should exist"),
+    )
+    .expect("copied agent sweep report should parse");
+
+    assert_eq!(
+        copied_quality["selection"]["manifest_path"],
+        "evals/v0/manifest.json"
+    );
+    assert_eq!(copied_quality["results"][0]["tier"], "tier0");
+    assert_eq!(copied_quality["results"][0]["verifier_class"], "cargo_test");
+    assert_eq!(copied_quality["results"][0]["candidate_lineage"], "apply_edit");
+    assert_eq!(copied_quality["results"][0]["accepted_patch_bytes"], 48);
+    assert_eq!(
+        copied_quality["candidate_lineage_breakdown"]["apply_edit"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["apply_edit"]["attempts"],
+        2
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["apply_edit"]["accepted_steps"],
+        1
+    );
+    assert_eq!(
+        copied_quality["tier_breakdown"]["tier0"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["verifier_class_breakdown"]["cargo_test"]["attempted_cases"],
+        1
+    );
+
+    assert_eq!(
+        copied_agent_sweep["selection"]["manifest_path"],
+        "evals/v0/manifest.json"
+    );
+    assert_eq!(copied_agent_sweep["results"][0]["tier"], "tier0");
+    assert_eq!(copied_agent_sweep["results"][0]["verifier_class"], "cargo_test");
+    assert_eq!(copied_agent_sweep["results"][0]["candidate_lineage"], "unknown");
+    assert_eq!(
+        copied_agent_sweep["candidate_lineage_breakdown"]["unknown"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["tier_breakdown"]["tier0"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["verifier_class_breakdown"]["cargo_test"]["attempted_cases"],
+        1
+    );
+
     assert_public_benchmark_report_is_scrubbed(&copied_quality);
     assert_public_benchmark_report_is_scrubbed(&copied_agent_sweep);
 }
@@ -2691,6 +3495,119 @@ fn repair_benchmark_runner_resumes_existing_results_and_keeps_partial_checkpoint
     .expect("report.json should be valid json");
     assert_eq!(report["metrics"]["attempted_cases"], 1);
     assert_eq!(report["results"][0]["outcome"], "false_green");
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_benchmark_runner_resume_reruns_legacy_results_without_lineage_metadata() {
+    let (temp, run_dir) =
+        run_synthetic_false_green_benchmark_with_run_id(false, "false-green-legacy-resume");
+    let result_root = run_dir
+        .join("cases")
+        .join("synthetic_false_green")
+        .join("agents-4");
+    let result_path = result_root.join("result.json");
+    let benchmark_run_path = result_root.join("benchmark-run.json");
+    let stale_marker = result_root.join("legacy-stale.txt");
+    fs::write(&stale_marker, "stale\n").expect("legacy marker should be writable");
+
+    let mut legacy_result: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("result.json should exist before resume"),
+    )
+    .expect("result.json should be valid json before resume");
+    let legacy_result_object = legacy_result
+        .as_object_mut()
+        .expect("legacy result should be a json object");
+    legacy_result_object.remove("tier");
+    legacy_result_object.remove("verifier_class");
+    legacy_result_object.remove("candidate_lineage");
+    for field in CANDIDATE_ATTEMPT_FIELDS {
+        legacy_result_object.remove(field);
+    }
+    for field in CANDIDATE_ACCEPTED_FIELDS {
+        legacy_result_object.remove(field);
+    }
+    fs::write(
+        &result_path,
+        serde_json::to_string_pretty(&legacy_result).expect("legacy result should serialize"),
+    )
+    .expect("legacy result should be rewritten");
+
+    let mut legacy_benchmark_run: Value = serde_json::from_str(
+        &fs::read_to_string(&benchmark_run_path).expect("benchmark-run.json should exist"),
+    )
+    .expect("benchmark-run.json should be valid json");
+    let legacy_benchmark_run_object = legacy_benchmark_run
+        .as_object_mut()
+        .expect("legacy benchmark run should be a json object");
+    for field in CANDIDATE_ATTEMPT_FIELDS {
+        legacy_benchmark_run_object.remove(field);
+    }
+    for field in CANDIDATE_ACCEPTED_FIELDS {
+        legacy_benchmark_run_object.remove(field);
+    }
+    fs::write(
+        &benchmark_run_path,
+        serde_json::to_string_pretty(&legacy_benchmark_run)
+            .expect("legacy benchmark run should serialize"),
+    )
+    .expect("legacy benchmark run should be rewritten");
+
+    let output = Command::new("python3")
+        .arg("evals/repair_benchmark/run.py")
+        .arg("--suite")
+        .arg(temp.path().join("suite/manifest.json"))
+        .arg("--binary")
+        .arg(temp.path().join("fake-mercury"))
+        .arg("--case")
+        .arg("synthetic_false_green")
+        .arg("--run-id")
+        .arg("false-green-legacy-resume")
+        .arg("--output-dir")
+        .arg(temp.path().join("reports"))
+        .arg("--resume")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("INCEPTION_API_KEY", "test-key")
+        .output()
+        .expect("python3 should execute repair benchmark resume");
+
+    assert!(
+        output.status.success(),
+        "synthetic benchmark legacy resume should succeed: stdout=`{}` stderr=`{}`",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !stale_marker.exists(),
+        "resume should rerun stale legacy case results instead of reusing the existing directory"
+    );
+
+    let result: Value = serde_json::from_str(
+        &fs::read_to_string(&result_path).expect("result.json should exist after resume"),
+    )
+    .expect("result.json should be valid json after resume");
+    assert_eq!(result["candidate_lineage"], "apply_edit");
+    for field in CANDIDATE_ATTEMPT_FIELDS {
+        assert!(
+            result[field].as_u64().is_some(),
+            "legacy resume rerun should restore numeric {field}"
+        );
+    }
+    for field in CANDIDATE_ACCEPTED_FIELDS {
+        assert!(
+            result[field].as_u64().is_some(),
+            "legacy resume rerun should restore numeric {field}"
+        );
+    }
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(run_dir.join("report.json")).expect("report.json should exist"),
+    )
+    .expect("report.json should be valid json");
+    assert_eq!(
+        report["candidate_lineage_breakdown"]["apply_edit"]["attempted_cases"],
+        1
+    );
 }
 
 #[cfg(unix)]
