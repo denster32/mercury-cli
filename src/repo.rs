@@ -420,7 +420,7 @@ pub fn prepare_repair_workspace(
         create_detached_worktree(project_root, workspace_root)?;
     } else {
         fs::create_dir_all(workspace_root)?;
-        copy_workspace_tree(project_root, workspace_root, project_root)?;
+        copy_filtered_repo_tree(project_root, workspace_root)?;
     }
 
     for (relative_path, content) in accepted_states {
@@ -496,37 +496,111 @@ fn create_detached_worktree(project_root: &Path, workspace_root: &Path) -> Resul
     Err(RepoError::GitCommandFailed { command, stderr })
 }
 
-fn copy_workspace_tree(source: &Path, destination: &Path, root: &Path) -> Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let relative = source_path
-            .strip_prefix(root)
-            .unwrap_or(source_path.as_path());
+/// Walk repository entries using repo-relative validation for every traversed path.
+pub fn walk_repo_tree<F, S>(project_root: &Path, should_skip: S, visitor: &mut F) -> Result<()>
+where
+    F: FnMut(&RepoRelativePath, &Path, &fs::Metadata) -> Result<()>,
+    S: Fn(&RepoRelativePath) -> bool,
+{
+    let canonical_root = fs::canonicalize(project_root)?;
+    let mut active_dirs = vec![canonical_root.clone()];
+    walk_repo_tree_from(
+        project_root,
+        &canonical_root,
+        None,
+        &should_skip,
+        &mut active_dirs,
+        visitor,
+    )
+}
 
-        if should_skip_workspace_copy(relative) {
+/// Copy a filtered repository snapshot while validating every traversed path.
+pub fn copy_filtered_repo_tree(project_root: &Path, destination_root: &Path) -> Result<()> {
+    fs::create_dir_all(destination_root)?;
+    walk_repo_tree(
+        project_root,
+        should_skip_workspace_copy,
+        &mut |relative, source_path, metadata| {
+            let destination_path = relative.resolve_under(destination_root)?;
+            if metadata.is_dir() {
+                fs::create_dir_all(&destination_path)?;
+            } else if metadata.is_file() {
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(source_path, &destination_path)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+fn walk_repo_tree_from<F, S>(
+    display_root: &Path,
+    canonical_root: &Path,
+    parent_relative: Option<&RepoRelativePath>,
+    should_skip: &S,
+    active_dirs: &mut Vec<PathBuf>,
+    visitor: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&RepoRelativePath, &Path, &fs::Metadata) -> Result<()>,
+    S: Fn(&RepoRelativePath) -> bool,
+{
+    let current_dir = match parent_relative {
+        Some(relative) => relative.resolve_under(canonical_root)?,
+        None => canonical_root.to_path_buf(),
+    };
+
+    for entry in fs::read_dir(&current_dir)? {
+        let entry = entry?;
+        let relative = child_repo_relative_path(parent_relative, &entry.file_name())?;
+        if should_skip(&relative) {
             continue;
         }
 
-        let destination_path = destination.join(relative);
-        let metadata = entry.metadata()?;
+        let resolved = relative.resolve_under(canonical_root)?;
+        let display_path = display_root.join(relative.as_path());
+        let metadata = fs::metadata(&resolved)?;
+        visitor(&relative, &display_path, &metadata)?;
 
         if metadata.is_dir() {
-            fs::create_dir_all(&destination_path)?;
-            copy_workspace_tree(&source_path, destination, root)?;
-        } else if metadata.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)?;
+            let canonical_dir = fs::canonicalize(&resolved)?;
+            if active_dirs.contains(&canonical_dir) {
+                return Err(invalid_repo_relative_path(
+                    relative.as_str(),
+                    "symlink cycle detected",
+                ));
             }
-            fs::copy(&source_path, &destination_path)?;
+            active_dirs.push(canonical_dir);
+            walk_repo_tree_from(
+                display_root,
+                canonical_root,
+                Some(&relative),
+                should_skip,
+                active_dirs,
+                visitor,
+            )?;
+            active_dirs.pop();
         }
     }
 
     Ok(())
 }
 
-fn should_skip_workspace_copy(relative: &Path) -> bool {
-    let relative = relative.to_string_lossy();
+fn child_repo_relative_path(
+    parent_relative: Option<&RepoRelativePath>,
+    child_name: &std::ffi::OsStr,
+) -> Result<RepoRelativePath> {
+    let child = match parent_relative {
+        Some(parent) => parent.as_path().join(child_name),
+        None => PathBuf::from(child_name),
+    };
+    RepoRelativePath::new(child.to_string_lossy())
+}
+
+fn should_skip_workspace_copy(relative: &RepoRelativePath) -> bool {
+    let relative = relative.as_str();
     relative == ".git"
         || relative.starts_with(".git/")
         || relative == "target"
@@ -1379,11 +1453,14 @@ fn symbol_kind_order(kind: &SymbolKind) -> u8 {
     }
 }
 
-fn should_skip_directory(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some(".git") | Some("target") | Some(".mercury")
-    )
+fn should_skip_directory(relative: &RepoRelativePath) -> bool {
+    let relative = relative.as_str();
+    relative == ".git"
+        || relative.starts_with(".git/")
+        || relative == "target"
+        || relative.starts_with("target/")
+        || relative == ".mercury"
+        || relative.starts_with(".mercury/")
 }
 
 /// Internal helper that recursively visits source files under `dir` keyed by
@@ -1396,23 +1473,18 @@ fn walk_source_files(
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            if should_skip_directory(&path) {
-                continue;
-            }
-            walk_source_files(&path, languages, visitor)?;
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if let Some(language) = Language::from_extension(ext) {
-                if languages.is_enabled(language) {
-                    visitor(&path, language)?;
+    walk_repo_tree(dir, should_skip_directory, &mut |_, path, metadata| {
+        if metadata.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if let Some(language) = Language::from_extension(ext) {
+                    if languages.is_enabled(language) {
+                        visitor(path, language)?;
+                    }
                 }
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,6 +2220,25 @@ const ViewModel = class InternalViewModel {};
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_walk_source_files_rejects_symlink_escape_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        symlink(outside.path(), dir.path().join("escape")).expect("create symlink");
+
+        let languages = RepoLanguages::default();
+        let err = walk_source_files(dir.path(), &languages, &mut |_path, _language| Ok(()))
+            .expect_err("symlink escape should fail");
+
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err
+            .to_string()
+            .contains("symlink escapes the repository root"));
+    }
+
+    #[test]
     fn test_prepare_repair_workspace_uses_git_worktree_not_repo_copy() {
         let dir = tempfile::tempdir().expect("tempdir");
         init_git_repo(dir.path());
@@ -2209,6 +2300,30 @@ const ViewModel = class InternalViewModel {};
             !workspace_root.join(".git").exists(),
             "fallback copy mode should not synthesize git metadata"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_prepare_repair_workspace_fallback_rejects_symlink_escape_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        symlink(outside.path(), dir.path().join("escape")).expect("create escape symlink");
+
+        let workspace_root = dir
+            .path()
+            .join(".mercury")
+            .join("worktrees")
+            .join("fallback-escape");
+        let err = prepare_repair_workspace(dir.path(), &workspace_root, &HashMap::new())
+            .expect_err("symlink escape should be rejected");
+
+        assert!(matches!(err, RepoError::InvalidRepoRelativePath { .. }));
+        assert!(err
+            .to_string()
+            .contains("symlink escapes the repository root"));
+        assert!(!workspace_root.join("escape").exists());
     }
 
     #[test]

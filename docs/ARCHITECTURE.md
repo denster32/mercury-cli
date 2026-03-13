@@ -2,7 +2,7 @@
 
 This document describes the current runtime and trust boundaries for Mercury CLI in the `1.0.0-beta.1` pre-release branch scope, with repair quality centered on Rust, scoped experimental selected TypeScript verifier-path support, and current observability and hardening surfaces.
 
-Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is narrower:
+Mercury CLI is not a generic autonomous coding shell. The implemented product wedge is a Rust direct cargo verifier repair beta:
 
 - start from a failing direct allowlisted verifier command, with Rust as the primary repair-quality target and selected experimental TypeScript commands supported in scoped `fix` and CI flows
 - attempt bounded repair with Mercury models
@@ -116,7 +116,7 @@ If a nested Mercury run directory is available, it is copied into `mercury-run/`
 - TypeScript support is intentionally scoped and experimental: selected direct verifier commands are supported in `fix`/CI flows, while watch-based auto-repair and broader command classes are still limited; the repo does not ship a real TypeScript parser, so this is not parity with the Rust repair surface.
 - Live observability now exposes candidate/phase/runtime events, but it is still not a full conflict-telemetry or merge-decision explanation surface.
 - CI automation is draft-PR oriented, not autonomous merge.
-- Public benchmark reporting now exists under `docs/benchmarks/` for the selected Rust corpus, emitted by the dedicated repair benchmark workflow and publisher. Those checked-in numbers are bounded to the exact run ids and corpus selection documented there.
+- Public benchmark reporting now exists under `docs/benchmarks/` for the selected Rust corpus, emitted by the dedicated repair benchmark workflow and publisher. Those checked-in numbers are bounded to the exact run ids and corpus selection documented there, with published repair outcome, tier, verifier-class, candidate-lineage, failure-attribution, and execution-diagnostics slices for that lane.
 - TypeScript harness fixtures currently validate deterministic expected-red script outputs; this is useful for corpus/reporter contract checks but not a replacement for full benchmark-backed repair reporting.
 
 ## Relationship to Case Studies

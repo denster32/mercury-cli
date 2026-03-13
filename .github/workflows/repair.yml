@@ -185,6 +185,115 @@ jobs:
               except json.JSONDecodeError:
                   return {}
 
+          def build_mercury_run_payload(summary: dict, metadata: dict, execution_summary: dict) -> dict | None:
+              if not summary and not metadata and not execution_summary:
+                  return None
+              counts = summary.get("counts")
+              if not isinstance(counts, dict):
+                  counts = {}
+              candidate_lineage = summary.get("candidate_lineage")
+              if not isinstance(candidate_lineage, dict):
+                  candidate_lineage = {}
+              winning_candidates = summary.get("winning_candidates")
+              if not isinstance(winning_candidates, list):
+                  winning_candidates = []
+              final_bundle_verified = bool(
+                  summary.get(
+                      "final_bundle_verified",
+                      metadata.get(
+                          "final_bundle_verified",
+                          execution_summary.get("final_bundle_verified", False),
+                      ),
+                  )
+              )
+              applied = bool(
+                  summary.get(
+                      "applied",
+                      metadata.get("applied", execution_summary.get("applied", False)),
+                  )
+              )
+              headline = summary.get("headline")
+              if not headline:
+                  if final_bundle_verified:
+                      headline = "verified repair"
+                  elif applied:
+                      headline = "accepted patch captured"
+                  else:
+                      headline = "repair attempt captured"
+              return {
+                  "artifact_root": summary.get("artifact_root"),
+                  "headline": headline,
+                  "outcome": summary.get("outcome") or execution_summary.get("outcome"),
+                  "failure_reason_rollup": summary.get("failure_reason_rollup")
+                  or execution_summary.get("failure_attribution"),
+                  "counts": counts,
+                  "candidate_lineage": candidate_lineage,
+                  "winning_candidates": winning_candidates,
+                  "final_bundle_verified": final_bundle_verified,
+                  "applied": applied,
+              }
+
+          def format_count_rollup(counts: object) -> str:
+              if not isinstance(counts, dict) or not counts:
+                  return "n/a"
+              ordered_keys = [
+                  "accepted_steps",
+                  "rejected_steps",
+                  "verification_failures",
+                  "generation_failures",
+                  "safety_failures",
+                  "candidate_verification_failures",
+                  "final_bundle_failures",
+                  "retry_attempts",
+              ]
+              parts = [f"{key}={counts[key]}" for key in ordered_keys if key in counts]
+              return ", ".join(parts) or "n/a"
+
+          def format_candidate_lineage(candidate_lineage: object) -> str:
+              if not isinstance(candidate_lineage, dict) or not candidate_lineage:
+                  return "n/a"
+              ordered_keys = [
+                  "apply_edit",
+                  "grounded_next_edit",
+                  "critique_retry",
+                  "exploratory_next_edit",
+              ]
+              parts = []
+              for key in ordered_keys:
+                  entry = candidate_lineage.get(key)
+                  if not isinstance(entry, dict):
+                      continue
+                  attempts = entry.get("attempts", 0)
+                  accepted_steps = entry.get("accepted_steps", 0)
+                  parts.append(f"{key} {accepted_steps}/{attempts} accepted")
+              return "; ".join(parts) or "n/a"
+
+          def format_winning_candidates(winning_candidates: object) -> list[str]:
+              if not isinstance(winning_candidates, list) or not winning_candidates:
+                  return ["none"]
+              lines: list[str] = []
+              for winner in winning_candidates[:5]:
+                  if not isinstance(winner, dict):
+                      continue
+                  parts = [str(winner.get("agent_id", "unknown-agent"))]
+                  file_path = winner.get("file_path")
+                  if file_path:
+                      parts.append(str(file_path))
+                  if winner.get("phase"):
+                      parts.append(f"phase={winner['phase']}")
+                  if winner.get("source_lineage"):
+                      parts.append(f"lineage={winner['source_lineage']}")
+                  if winner.get("retry_count") is not None:
+                      parts.append(f"retry={winner['retry_count']}")
+                  if winner.get("touched_lines") is not None:
+                      parts.append(f"lines={winner['touched_lines']}")
+                  if winner.get("byte_delta") is not None:
+                      parts.append(f"bytes={winner['byte_delta']}")
+                  if winner.get("reason"):
+                      parts.append(f"reason={winner['reason']}")
+                  lines.append(", ".join(parts))
+              return lines or ["none"]
+
           def upsert_section_value(text: str, section: str, key: str, rendered_value: str) -> str:
               section_pattern = re.compile(rf"(?ms)(^\[{re.escape(section)}\]\s*$)(.*?)(?=^\[|\Z)")
               match = section_pattern.search(text)
@@ -377,6 +486,8 @@ jobs:
 
                   metadata = load_json((run_dir / "metadata.json") if run_dir else Path("/dev/null"))
                   execution_summary = load_json((run_dir / "execution-summary.json") if run_dir else Path("/dev/null"))
+                  mercury_summary = load_json((run_dir / "summary-index.json") if run_dir else Path("/dev/null"))
+                  mercury_run = build_mercury_run_payload(mercury_summary, metadata, execution_summary)
                   final_bundle_verified = bool(
                       metadata.get("final_bundle_verified", execution_summary.get("final_bundle_verified", False))
                   )
@@ -448,6 +559,8 @@ jobs:
                   "pr_title": pr_title,
                   "commit_message": commit_message,
               }
+              if mercury_run is not None:
+                  decision_payload["mercury_run"] = mercury_run
               write_json(artifact_dir / "environment.json", environment_payload)
               write_json(artifact_dir / "decision.json", decision_payload)
 
@@ -470,6 +583,21 @@ jobs:
                   "- Draft PR mutation is only attempted after a verified repair when `dry_run=false` and the workflow can push to the same repository.",
                   f"- Mercury run directory: `{run_dir.name if run_dir else 'none'}`",
               ]
+              if mercury_run is not None:
+                  summary_lines.extend(
+                      [
+                          "",
+                          "## Mercury run summary",
+                          "",
+                          f"- Headline: `{mercury_run.get('headline') or 'n/a'}`",
+                          f"- Outcome: `{mercury_run.get('outcome') or 'n/a'}`",
+                          f"- Failure reason rollup: `{mercury_run.get('failure_reason_rollup') or 'none'}`",
+                          f"- Counts: `{format_count_rollup(mercury_run.get('counts'))}`",
+                          f"- Candidate lineage: `{format_candidate_lineage(mercury_run.get('candidate_lineage'))}`",
+                      ]
+                  )
+                  for winner in format_winning_candidates(mercury_run.get("winning_candidates")):
+                      summary_lines.append(f"- Winning candidate: `{winner}`")
               write_text(artifact_dir / "summary.md", "\n".join(summary_lines) + "\n")
 
               pr_body_lines = [

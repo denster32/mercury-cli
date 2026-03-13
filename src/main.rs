@@ -4,7 +4,7 @@
 //! coordination primitive for multi-agent code editing.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::IsTerminal;
@@ -26,7 +26,7 @@ use mercury_cli::engine::{
     self, Scheduler, SchedulerConfig, StepExecutionSummary, Verifier, VerifyConfig,
 };
 use mercury_cli::failure_parser::{self, CargoCommandKind};
-use mercury_cli::repo;
+use mercury_cli::repo::{self, RepoRelativePath};
 use mercury_cli::swarm;
 use mercury_cli::thermal::{self, render_heatmap_to_string};
 use mercury_cli::verification;
@@ -321,7 +321,7 @@ enum EditAction {
     /// Apply a concrete replacement snippet or patch to a file.
     Apply {
         /// The file to edit.
-        file: PathBuf,
+        file: String,
         /// Concrete replacement code or patch content for Mercury Edit apply.
         #[arg(long = "update-snippet")]
         update_snippet: String,
@@ -840,19 +840,70 @@ fn candidate_verification_result(state: &CandidateLiveState) -> &'static str {
     if state.status == "success" {
         return "passed";
     }
+    if matches!(candidate_decision(state), "lost" | "suppressed")
+        && state.metadata.failure_stage.as_deref() != Some("verification")
+    {
+        return "passed_not_selected";
+    }
     if state.metadata.failure_stage.as_deref() == Some("verification") {
         return "failed";
-    }
-    if matches!(
-        state.metadata.reason.as_deref(),
-        Some("duplicate verified candidate output" | "lower-ranked competing candidate")
-    ) {
-        return "passed_not_selected";
     }
     match state.status.as_str() {
         "retrying" => "retrying",
         "spawned" | "running" => "pending",
         _ => "not_reached",
+    }
+}
+
+fn candidate_decision(state: &CandidateLiveState) -> &'static str {
+    if state.status == "success" {
+        return "won";
+    }
+    if state
+        .metadata
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("oscillation suppressed:"))
+    {
+        return "suppressed";
+    }
+    if state
+        .metadata
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("duplicate verified candidate output"))
+    {
+        return "suppressed";
+    }
+    if state.metadata.failure_stage.as_deref() == Some("verification")
+        || state.metadata.reason.as_deref().is_some_and(|reason| {
+            reason.starts_with("lost selection to higher-ranked verified candidate")
+        })
+    {
+        return "lost";
+    }
+    match state.status.as_str() {
+        "retrying" | "spawned" | "running" => "in_flight",
+        _ => "rejected",
+    }
+}
+
+fn candidate_explanation(state: &CandidateLiveState) -> Option<String> {
+    if let Some(reason) = state.metadata.reason.clone() {
+        return Some(reason);
+    }
+    match state.status.as_str() {
+        "success" => Some("verified candidate selected for application".to_string()),
+        "retrying" => Some("candidate queued for critique retry".to_string()),
+        "spawned" => Some("candidate launched".to_string()),
+        "running" => Some("candidate generation or verification in progress".to_string()),
+        "failed" => match state.metadata.failure_stage.as_deref() {
+            Some("generation") => Some("candidate generation failed".to_string()),
+            Some("safety") => Some("candidate blocked by safety checks".to_string()),
+            Some("verification") => Some("candidate failed verification".to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -872,6 +923,8 @@ fn candidate_event_details(
         "source_lineage": state.metadata.source_lineage,
         "retry_count": state.metadata.retry_count,
         "outcome": state.metadata.outcome,
+        "decision": candidate_decision(state),
+        "explanation": candidate_explanation(state),
         "verification_result": candidate_verification_result(state),
         "reason": state.metadata.reason,
         "failure_stage": state.metadata.failure_stage,
@@ -1103,11 +1156,14 @@ fn format_live_event_line(event: &LiveStatusEvent) -> String {
             if let Some(outcome) = value_string(details, "outcome") {
                 parts.push(format!("outcome={outcome}"));
             }
+            if let Some(decision) = value_string(details, "decision") {
+                parts.push(format!("decision={decision}"));
+            }
             if let Some(result) = value_string(details, "verification_result") {
                 parts.push(format!("verify={result}"));
             }
-            if let Some(reason) = value_string(details, "reason") {
-                parts.push(format!("reason={reason}"));
+            if let Some(explanation) = value_string(details, "explanation") {
+                parts.push(format!("why={explanation}"));
             }
             if let Some(touched_lines) = value_u64(details, "touched_lines") {
                 parts.push(format!("lines={touched_lines}"));
@@ -1933,12 +1989,11 @@ async fn cmd_fix_with_verify_config(
                 final_verification,
             )?;
         }
-        write_json_artifact(
-            &artifact_root.join("agent-logs.json"),
-            &db.get_agent_logs()?,
-        )?;
+        let agent_logs = db.get_agent_logs()?;
+        write_json_artifact(&artifact_root.join("agent-logs.json"), &agent_logs)?;
         write_json_artifact(&artifact_root.join("thermal-aggregates.json"), &aggregates)?;
-        if let Some(state) = db.get_swarm_state()? {
+        let swarm_state = db.get_swarm_state()?;
+        if let Some(state) = swarm_state.as_ref() {
             write_json_artifact(&artifact_root.join("swarm-state.json"), &state)?;
         }
         let grounding_tool_calls = grounded_context
@@ -1953,79 +2008,125 @@ async fn cmd_fix_with_verify_config(
             .run_root
             .as_ref()
             .map(|path| path.display().to_string());
-        write_json_artifact(
-            &artifact_root.join("metadata.json"),
-            &FixRunMetadata {
-                description: description_redacted.clone(),
-                max_agents,
-                max_cost,
-                started_at: started_at.to_rfc3339(),
-                finished_at: finished_at.to_rfc3339(),
-                duration_ms,
-                planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
-                grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME
-                    .to_string(),
-                grounding_rounds: grounded_context.rounds.len(),
-                grounding_tool_calls,
-                grounding_collected: !grounded_context.summary.trim().is_empty()
-                    || !grounded_context.rounds.is_empty(),
-                grounding_cost_usd: grounded_context.total_usage.cost_usd,
-                planner_estimated_cost_usd: plan.estimated_cost,
-                final_bundle_verified: execution_summary.final_bundle_verified,
-                applied: execution_summary.applied,
-                sandbox_run_root: sandbox_run_root.clone(),
-                total_cost_usd,
-                budget_remaining_usd,
-                security: final_security.clone(),
-            },
-        )?;
+        let metadata = FixRunMetadata {
+            description: description_redacted.clone(),
+            max_agents,
+            max_cost,
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms,
+            planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+            grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
+            grounding_rounds: grounded_context.rounds.len(),
+            grounding_tool_calls,
+            grounding_collected: !grounded_context.summary.trim().is_empty()
+                || !grounded_context.rounds.is_empty(),
+            grounding_cost_usd: grounded_context.total_usage.cost_usd,
+            planner_estimated_cost_usd: plan.estimated_cost,
+            final_bundle_verified: execution_summary.final_bundle_verified,
+            applied: execution_summary.applied,
+            sandbox_run_root: sandbox_run_root.clone(),
+            total_cost_usd,
+            budget_remaining_usd,
+            security: final_security.clone(),
+        };
+        write_json_artifact(&artifact_root.join("metadata.json"), &metadata)?;
         let diff_patch_path = artifact_root.join("diff.patch");
         if let Some(run_root) = execution_summary.run_root.as_ref() {
             copy_if_exists(&run_root.join("accepted.patch"), &diff_patch_path)?;
         }
         let accepted_patch_bytes = patch_size_bytes(&diff_patch_path)?;
         let accepted_patch = accepted_patch_bytes.is_some_and(|len| len > 0);
-        write_json_artifact(
-            &artifact_root.join("benchmark-run.json"),
-            &FixBenchmarkRun {
-                schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
-                description: description_redacted.clone(),
-                started_at: started_at.to_rfc3339(),
-                finished_at: finished_at.to_rfc3339(),
-                duration_ms,
-                accepted_steps: execution_summary.accepted,
-                rejected_steps: execution_summary.rejected,
-                verification_failures: execution_summary.verification_failures,
-                generation_failures: execution_summary.generation_failures,
-                safety_failures: execution_summary.safety_failures,
-                candidate_verification_failures: execution_summary.candidate_verification_failures,
-                final_bundle_failures: execution_summary.final_bundle_failures,
-                retry_attempts: execution_summary.retry_attempts,
-                time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
-                time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
-                final_bundle_verified: execution_summary.final_bundle_verified,
-                applied: execution_summary.applied,
+        let benchmark_run = FixBenchmarkRun {
+            schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
+            description: description_redacted.clone(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms,
+            accepted_steps: execution_summary.accepted,
+            rejected_steps: execution_summary.rejected,
+            verification_failures: execution_summary.verification_failures,
+            generation_failures: execution_summary.generation_failures,
+            safety_failures: execution_summary.safety_failures,
+            candidate_verification_failures: execution_summary.candidate_verification_failures,
+            final_bundle_failures: execution_summary.final_bundle_failures,
+            apply_edit_attempts: execution_summary.apply_edit_attempts,
+            grounded_next_edit_attempts: execution_summary.grounded_next_edit_attempts,
+            critique_retry_attempts: execution_summary.critique_retry_attempts,
+            exploratory_next_edit_attempts: execution_summary.exploratory_next_edit_attempts,
+            apply_edit_accepted_steps: execution_summary.apply_edit_accepted_steps,
+            grounded_next_edit_accepted_steps: execution_summary.grounded_next_edit_accepted_steps,
+            critique_retry_accepted_steps: execution_summary.critique_retry_accepted_steps,
+            exploratory_next_edit_accepted_steps: execution_summary
+                .exploratory_next_edit_accepted_steps,
+            retry_attempts: execution_summary.retry_attempts,
+            time_to_first_candidate_ms: execution_summary.time_to_first_candidate_ms,
+            time_to_verified_repair_ms: execution_summary.time_to_verified_repair_ms,
+            final_bundle_verified: execution_summary.final_bundle_verified,
+            applied: execution_summary.applied,
+            accepted_patch,
+            accepted_patch_bytes,
+            outcome: classify_fix_benchmark_outcome(
+                execution_summary.final_bundle_verified,
                 accepted_patch,
-                accepted_patch_bytes,
-                outcome: classify_fix_benchmark_outcome(
-                    execution_summary.final_bundle_verified,
-                    accepted_patch,
-                )
-                .to_string(),
-                failure_attribution: classify_fix_failure_attribution(
-                    &execution_summary,
-                    accepted_patch,
-                )
-                .map(str::to_string),
-                // False-green requires an independent rerun outside `fix`; the
-                // benchmark harness derives it later instead of guessing here.
-                false_green: None,
-                sandbox_run_root: sandbox_run_root.clone(),
-                total_cost_usd,
-                budget_remaining_usd,
-                verifier: benchmark_verifier.clone(),
-                security: final_security.clone(),
-            },
+            )
+            .to_string(),
+            failure_attribution: classify_fix_failure_attribution(
+                &execution_summary,
+                accepted_patch,
+            )
+            .map(str::to_string),
+            // False-green requires an independent rerun outside `fix`; the
+            // benchmark harness derives it later instead of guessing here.
+            false_green: None,
+            sandbox_run_root: sandbox_run_root.clone(),
+            total_cost_usd,
+            budget_remaining_usd,
+            verifier: benchmark_verifier.clone(),
+            security: final_security.clone(),
+        };
+        write_json_artifact(&artifact_root.join("benchmark-run.json"), &benchmark_run)?;
+
+        let mut summary_artifacts = BTreeMap::new();
+        summary_artifacts.insert(
+            "grounded_context".to_string(),
+            "grounded-context.json".to_string(),
+        );
+        summary_artifacts.insert("plan".to_string(), "plan.json".to_string());
+        summary_artifacts.insert("assessments".to_string(), "assessments.json".to_string());
+        summary_artifacts.insert(
+            "execution_summary".to_string(),
+            "execution-summary.json".to_string(),
+        );
+        summary_artifacts.insert("agent_logs".to_string(), "agent-logs.json".to_string());
+        summary_artifacts.insert(
+            "thermal_aggregates".to_string(),
+            "thermal-aggregates.json".to_string(),
+        );
+        summary_artifacts.insert("metadata".to_string(), "metadata.json".to_string());
+        summary_artifacts.insert(
+            "benchmark_run".to_string(),
+            "benchmark-run.json".to_string(),
+        );
+        summary_artifacts.insert("audit_log".to_string(), "audit.log".to_string());
+        if execution_summary.final_verification.is_some() {
+            summary_artifacts.insert(
+                "final_verification".to_string(),
+                "final-verification.json".to_string(),
+            );
+        }
+        if swarm_state.is_some() {
+            summary_artifacts.insert("swarm_state".to_string(), "swarm-state.json".to_string());
+        }
+        if accepted_patch_bytes.is_some() {
+            summary_artifacts.insert("diff_patch".to_string(), "diff.patch".to_string());
+        }
+        write_fix_summary_index(
+            &artifact_root,
+            &metadata,
+            &benchmark_run,
+            &agent_logs,
+            summary_artifacts,
         )?;
         write_audit_event(
             &artifact_root,
@@ -2348,6 +2449,10 @@ async fn execute_watch_cycle(
                         &artifact_root.join("repair").join("benchmark-run.json"),
                     )?;
                     copy_if_exists(
+                        &outcome.artifact_root.join("summary-index.json"),
+                        &artifact_root.join("repair").join("summary-index.json"),
+                    )?;
+                    copy_if_exists(
                         &outcome.artifact_root.join("plan.json"),
                         &artifact_root.join("repair").join("plan.json"),
                     )?;
@@ -2487,6 +2592,7 @@ async fn execute_watch_cycle(
 
     write_watch_output_artifacts(&artifact_root, &record)?;
     write_json_artifact(&artifact_root.join("watch.json"), &record)?;
+    write_watch_summary_index(&artifact_root, &record)?;
     write_audit_event(
         &artifact_root,
         "watch_cycle_completed",
@@ -2674,6 +2780,14 @@ struct FixBenchmarkRun {
     safety_failures: usize,
     candidate_verification_failures: usize,
     final_bundle_failures: usize,
+    apply_edit_attempts: usize,
+    grounded_next_edit_attempts: usize,
+    critique_retry_attempts: usize,
+    exploratory_next_edit_attempts: usize,
+    apply_edit_accepted_steps: usize,
+    grounded_next_edit_accepted_steps: usize,
+    critique_retry_accepted_steps: usize,
+    exploratory_next_edit_accepted_steps: usize,
     retry_attempts: usize,
     time_to_first_candidate_ms: Option<u64>,
     time_to_verified_repair_ms: Option<u64>,
@@ -2693,6 +2807,355 @@ struct FixBenchmarkRun {
     security: SecurityRuntimeContext,
 }
 
+#[derive(Debug, Serialize)]
+struct ArtifactCountSummary {
+    accepted_steps: usize,
+    rejected_steps: usize,
+    verification_failures: usize,
+    generation_failures: usize,
+    safety_failures: usize,
+    candidate_verification_failures: usize,
+    final_bundle_failures: usize,
+    retry_attempts: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactCandidateLineageEntry {
+    attempts: usize,
+    accepted_steps: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactCandidateLineageSummary {
+    apply_edit: ArtifactCandidateLineageEntry,
+    grounded_next_edit: ArtifactCandidateLineageEntry,
+    critique_retry: ArtifactCandidateLineageEntry,
+    exploratory_next_edit: ArtifactCandidateLineageEntry,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactWinningCandidateSummary {
+    agent_id: String,
+    file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_lineage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    touched_lines: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byte_delta: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FixArtifactSummaryIndex {
+    run_kind: &'static str,
+    artifact_root: String,
+    headline: String,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason_rollup: Option<String>,
+    description: String,
+    duration_ms: u64,
+    applied: bool,
+    final_bundle_verified: bool,
+    accepted_patch: bool,
+    accepted_patch_bytes: Option<u64>,
+    sandbox_run_root: Option<String>,
+    counts: ArtifactCountSummary,
+    candidate_lineage: ArtifactCandidateLineageSummary,
+    time_to_first_candidate_ms: Option<u64>,
+    time_to_verified_repair_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    winning_candidates: Vec<ArtifactWinningCandidateSummary>,
+    artifacts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WatchCommandPhaseSummary {
+    success: bool,
+    exit_code: Option<i32>,
+    parsed_failure: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WatchRepairSummaryIndex {
+    headline: String,
+    supported: bool,
+    verifier_command: Option<String>,
+    fix_artifact_root: Option<String>,
+    sandbox_run_root: Option<String>,
+    accepted_steps: usize,
+    rejected_steps: usize,
+    verification_failures: usize,
+    final_bundle_verified: bool,
+    applied: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WatchArtifactSummaryIndex {
+    run_kind: &'static str,
+    artifact_root: String,
+    headline: String,
+    decision: String,
+    command: String,
+    repair_requested: bool,
+    duration_ms: u64,
+    initial_run: WatchCommandPhaseSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmation_run: Option<WatchCommandPhaseSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<WatchRepairSummaryIndex>,
+    artifacts: BTreeMap<String, String>,
+}
+
+fn artifact_count_summary(benchmark: &FixBenchmarkRun) -> ArtifactCountSummary {
+    ArtifactCountSummary {
+        accepted_steps: benchmark.accepted_steps,
+        rejected_steps: benchmark.rejected_steps,
+        verification_failures: benchmark.verification_failures,
+        generation_failures: benchmark.generation_failures,
+        safety_failures: benchmark.safety_failures,
+        candidate_verification_failures: benchmark.candidate_verification_failures,
+        final_bundle_failures: benchmark.final_bundle_failures,
+        retry_attempts: benchmark.retry_attempts,
+    }
+}
+
+fn artifact_candidate_lineage_summary(
+    benchmark: &FixBenchmarkRun,
+) -> ArtifactCandidateLineageSummary {
+    ArtifactCandidateLineageSummary {
+        apply_edit: ArtifactCandidateLineageEntry {
+            attempts: benchmark.apply_edit_attempts,
+            accepted_steps: benchmark.apply_edit_accepted_steps,
+        },
+        grounded_next_edit: ArtifactCandidateLineageEntry {
+            attempts: benchmark.grounded_next_edit_attempts,
+            accepted_steps: benchmark.grounded_next_edit_accepted_steps,
+        },
+        critique_retry: ArtifactCandidateLineageEntry {
+            attempts: benchmark.critique_retry_attempts,
+            accepted_steps: benchmark.critique_retry_accepted_steps,
+        },
+        exploratory_next_edit: ArtifactCandidateLineageEntry {
+            attempts: benchmark.exploratory_next_edit_attempts,
+            accepted_steps: benchmark.exploratory_next_edit_accepted_steps,
+        },
+    }
+}
+
+fn artifact_winning_candidates(
+    agent_logs: &[db::AgentLogEntry],
+) -> Vec<ArtifactWinningCandidateSummary> {
+    agent_logs
+        .iter()
+        .filter_map(|entry| {
+            let metadata = parse_candidate_runtime_metadata(entry);
+            (entry.status == "success" && metadata.outcome.as_deref() == Some("accepted"))
+                .then_some(ArtifactWinningCandidateSummary {
+                    agent_id: entry.agent_id.clone(),
+                    file_path: entry.file_path.clone(),
+                    phase: metadata.phase,
+                    source_lineage: metadata.source_lineage,
+                    reason: metadata.reason,
+                    retry_count: metadata.retry_count,
+                    touched_lines: metadata.touched_lines,
+                    byte_delta: metadata.byte_delta,
+                })
+        })
+        .collect()
+}
+
+fn fix_summary_headline(
+    outcome: &str,
+    final_bundle_verified: bool,
+    accepted_patch: bool,
+) -> &'static str {
+    match outcome {
+        "verified_repair" => "verified repair",
+        "accepted_patch_unverified" => "accepted patch but final bundle failed",
+        "no_patch" => "no accepted patch",
+        "fix_failed" => "fix run failed before a repair was accepted",
+        "rejected_allowlist" => "verifier command rejected by allowlist",
+        _ if final_bundle_verified => "verified repair",
+        _ if accepted_patch => "accepted patch but final bundle failed",
+        _ => "no accepted patch",
+    }
+}
+
+fn fix_failure_reason_rollup(failure: &str) -> String {
+    match failure {
+        "final_bundle_verification_failed" => "final bundle verification failed".to_string(),
+        "candidate_failed_verifier" => "candidate verification failed".to_string(),
+        "candidate_failed_safety" => "candidate rejected by safety policy".to_string(),
+        "patch_generation_failed" => "patch generation failed".to_string(),
+        "no_patch_emitted" => "no patch was emitted".to_string(),
+        "fix_failed" => "fix run failed before a verified repair was produced".to_string(),
+        "rejected_allowlist" => "verifier command rejected by allowlist".to_string(),
+        _ => failure.to_string(),
+    }
+}
+
+fn write_fix_summary_index(
+    artifact_root: &Path,
+    metadata: &FixRunMetadata,
+    benchmark: &FixBenchmarkRun,
+    agent_logs: &[db::AgentLogEntry],
+    artifacts: BTreeMap<String, String>,
+) -> Result<()> {
+    let summary = FixArtifactSummaryIndex {
+        run_kind: "fix",
+        artifact_root: artifact_root.display().to_string(),
+        headline: fix_summary_headline(
+            &benchmark.outcome,
+            benchmark.final_bundle_verified,
+            benchmark.accepted_patch,
+        )
+        .to_string(),
+        outcome: benchmark.outcome.clone(),
+        failure_reason_rollup: benchmark
+            .failure_attribution
+            .as_deref()
+            .map(fix_failure_reason_rollup),
+        description: metadata.description.clone(),
+        duration_ms: benchmark.duration_ms,
+        applied: benchmark.applied,
+        final_bundle_verified: benchmark.final_bundle_verified,
+        accepted_patch: benchmark.accepted_patch,
+        accepted_patch_bytes: benchmark.accepted_patch_bytes,
+        sandbox_run_root: benchmark.sandbox_run_root.clone(),
+        counts: artifact_count_summary(benchmark),
+        candidate_lineage: artifact_candidate_lineage_summary(benchmark),
+        time_to_first_candidate_ms: benchmark.time_to_first_candidate_ms,
+        time_to_verified_repair_ms: benchmark.time_to_verified_repair_ms,
+        winning_candidates: artifact_winning_candidates(agent_logs),
+        artifacts,
+    };
+    write_json_artifact(&artifact_root.join("summary-index.json"), &summary)
+}
+
+fn watch_summary_headline(decision: &str) -> &'static str {
+    match decision {
+        "passed_without_repair" => "watch command passed without repair",
+        "failed_without_repair" => "watch command failed without repair",
+        "repaired_and_verified" => "verified repair",
+        "repair_applied_but_command_still_failing" => {
+            "repair applied but watched command still failing"
+        }
+        "repair_not_applied" => "repair produced no applied patch",
+        "repair_flow_failed" => "repair flow failed",
+        "repair_not_supported" => "repair not supported for watched command",
+        _ => "watch cycle completed",
+    }
+}
+
+fn watch_phase_summary(result: &WatchCommandResult) -> WatchCommandPhaseSummary {
+    WatchCommandPhaseSummary {
+        success: result.success,
+        exit_code: result.exit_code,
+        parsed_failure: result.parsed_failure.is_some(),
+    }
+}
+
+fn write_watch_summary_index(artifact_root: &Path, record: &WatchRunRecord) -> Result<()> {
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert("watch_record".to_string(), "watch.json".to_string());
+    artifacts.insert(
+        "initial_stdout".to_string(),
+        "initial.stdout.txt".to_string(),
+    );
+    artifacts.insert(
+        "initial_stderr".to_string(),
+        "initial.stderr.txt".to_string(),
+    );
+    artifacts.insert("audit_log".to_string(), "audit.log".to_string());
+    if record.initial_run.parsed_failure.is_some() {
+        artifacts.insert(
+            "initial_failure".to_string(),
+            "initial.failure.json".to_string(),
+        );
+    }
+    if record.confirmation_run.is_some() {
+        artifacts.insert(
+            "confirmation_stdout".to_string(),
+            "confirmation.stdout.txt".to_string(),
+        );
+        artifacts.insert(
+            "confirmation_stderr".to_string(),
+            "confirmation.stderr.txt".to_string(),
+        );
+    }
+    if record
+        .confirmation_run
+        .as_ref()
+        .and_then(|result| result.parsed_failure.as_ref())
+        .is_some()
+    {
+        artifacts.insert(
+            "confirmation_failure".to_string(),
+            "confirmation.failure.json".to_string(),
+        );
+    }
+    if let Some(repair) = record.repair.as_ref() {
+        if repair.fix_artifact_root.is_some() {
+            artifacts.insert("repair_bundle".to_string(), "repair".to_string());
+            artifacts.insert(
+                "repair_summary".to_string(),
+                "repair/summary-index.json".to_string(),
+            );
+            artifacts.insert(
+                "repair_execution_summary".to_string(),
+                "repair/execution-summary.json".to_string(),
+            );
+            artifacts.insert(
+                "repair_metadata".to_string(),
+                "repair/metadata.json".to_string(),
+            );
+            artifacts.insert(
+                "repair_benchmark_run".to_string(),
+                "repair/benchmark-run.json".to_string(),
+            );
+            artifacts.insert("repair_plan".to_string(), "repair/plan.json".to_string());
+        }
+    }
+
+    let summary = WatchArtifactSummaryIndex {
+        run_kind: "watch",
+        artifact_root: artifact_root.display().to_string(),
+        headline: watch_summary_headline(&record.decision).to_string(),
+        decision: record.decision.clone(),
+        command: record.command.clone(),
+        repair_requested: record.repair_requested,
+        duration_ms: record.duration_ms,
+        initial_run: watch_phase_summary(&record.initial_run),
+        confirmation_run: record.confirmation_run.as_ref().map(watch_phase_summary),
+        repair: record
+            .repair
+            .as_ref()
+            .map(|repair| WatchRepairSummaryIndex {
+                headline: watch_summary_headline(&record.decision).to_string(),
+                supported: repair.supported,
+                verifier_command: repair.verifier_command.clone(),
+                fix_artifact_root: repair.fix_artifact_root.clone(),
+                sandbox_run_root: repair.sandbox_run_root.clone(),
+                accepted_steps: repair.accepted_steps,
+                rejected_steps: repair.rejected_steps,
+                verification_failures: repair.verification_failures,
+                final_bundle_verified: repair.final_bundle_verified,
+                applied: repair.applied,
+                error: repair.error.clone(),
+            }),
+        artifacts,
+    };
+    write_json_artifact(&artifact_root.join("summary-index.json"), &summary)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_fix_failure_artifacts(
     artifact_root: &Path,
@@ -2706,68 +3169,82 @@ fn write_fix_failure_artifacts(
     verifier: &FixBenchmarkVerifier,
     security: &SecurityRuntimeContext,
 ) -> Result<()> {
-    write_json_artifact(
-        &artifact_root.join("metadata.json"),
-        &FixRunMetadata {
-            description: description.to_string(),
-            max_agents,
-            max_cost,
-            started_at: started_at.to_rfc3339(),
-            finished_at: finished_at.to_rfc3339(),
-            duration_ms,
-            planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
-            grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
-            grounding_rounds: 0,
-            grounding_tool_calls: 0,
-            grounding_collected: false,
-            grounding_cost_usd: 0.0,
-            planner_estimated_cost_usd: 0.0,
-            final_bundle_verified: false,
-            applied: false,
-            sandbox_run_root: None,
-            total_cost_usd: 0.0,
-            budget_remaining_usd: max_cost,
-            security: security.clone(),
+    let metadata = FixRunMetadata {
+        description: description.to_string(),
+        max_agents,
+        max_cost,
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        duration_ms,
+        planner_schema_version: mercury_cli::api::PLANNER_RESPONSE_SCHEMA_NAME.to_string(),
+        grounding_schema_version: verification::GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME.to_string(),
+        grounding_rounds: 0,
+        grounding_tool_calls: 0,
+        grounding_collected: false,
+        grounding_cost_usd: 0.0,
+        planner_estimated_cost_usd: 0.0,
+        final_bundle_verified: false,
+        applied: false,
+        sandbox_run_root: None,
+        total_cost_usd: 0.0,
+        budget_remaining_usd: max_cost,
+        security: security.clone(),
+    };
+    write_json_artifact(&artifact_root.join("metadata.json"), &metadata)?;
+
+    let benchmark = FixBenchmarkRun {
+        schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
+        description: description.to_string(),
+        started_at: started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        duration_ms,
+        accepted_steps: 0,
+        rejected_steps: 0,
+        verification_failures: 0,
+        generation_failures: 0,
+        safety_failures: 0,
+        candidate_verification_failures: 0,
+        final_bundle_failures: 0,
+        apply_edit_attempts: 0,
+        grounded_next_edit_attempts: 0,
+        critique_retry_attempts: 0,
+        exploratory_next_edit_attempts: 0,
+        apply_edit_accepted_steps: 0,
+        grounded_next_edit_accepted_steps: 0,
+        critique_retry_accepted_steps: 0,
+        exploratory_next_edit_accepted_steps: 0,
+        retry_attempts: 0,
+        time_to_first_candidate_ms: None,
+        time_to_verified_repair_ms: None,
+        final_bundle_verified: false,
+        applied: false,
+        accepted_patch: false,
+        accepted_patch_bytes: None,
+        outcome: outcome.to_string(),
+        failure_attribution: Some(outcome.to_string()),
+        false_green: None,
+        sandbox_run_root: None,
+        total_cost_usd: 0.0,
+        budget_remaining_usd: max_cost,
+        verifier: FixBenchmarkVerifier {
+            parse_before_write: verifier.parse_before_write,
+            test_after_write: verifier.test_after_write,
+            lint_after_write: verifier.lint_after_write,
+            test_command: verifier.test_command.clone(),
+            lint_command: verifier.lint_command.clone(),
         },
-    )?;
-    write_json_artifact(
-        &artifact_root.join("benchmark-run.json"),
-        &FixBenchmarkRun {
-            schema_version: FIX_BENCHMARK_RUN_SCHEMA_NAME.to_string(),
-            description: description.to_string(),
-            started_at: started_at.to_rfc3339(),
-            finished_at: finished_at.to_rfc3339(),
-            duration_ms,
-            accepted_steps: 0,
-            rejected_steps: 0,
-            verification_failures: 0,
-            generation_failures: 0,
-            safety_failures: 0,
-            candidate_verification_failures: 0,
-            final_bundle_failures: 0,
-            retry_attempts: 0,
-            time_to_first_candidate_ms: None,
-            time_to_verified_repair_ms: None,
-            final_bundle_verified: false,
-            applied: false,
-            accepted_patch: false,
-            accepted_patch_bytes: None,
-            outcome: outcome.to_string(),
-            failure_attribution: Some(outcome.to_string()),
-            false_green: None,
-            sandbox_run_root: None,
-            total_cost_usd: 0.0,
-            budget_remaining_usd: max_cost,
-            verifier: FixBenchmarkVerifier {
-                parse_before_write: verifier.parse_before_write,
-                test_after_write: verifier.test_after_write,
-                lint_after_write: verifier.lint_after_write,
-                test_command: verifier.test_command.clone(),
-                lint_command: verifier.lint_command.clone(),
-            },
-            security: security.clone(),
-        },
-    )?;
+        security: security.clone(),
+    };
+    write_json_artifact(&artifact_root.join("benchmark-run.json"), &benchmark)?;
+
+    let mut artifacts = BTreeMap::new();
+    artifacts.insert("metadata".to_string(), "metadata.json".to_string());
+    artifacts.insert(
+        "benchmark_run".to_string(),
+        "benchmark-run.json".to_string(),
+    );
+    artifacts.insert("audit_log".to_string(), "audit.log".to_string());
+    write_fix_summary_index(artifact_root, &metadata, &benchmark, &[], artifacts)?;
     Ok(())
 }
 
@@ -2780,68 +3257,18 @@ fn create_run_artifact_root(project_root: &Path) -> Result<PathBuf> {
 
 fn create_cli_worktree_root(project_root: &Path) -> Result<PathBuf> {
     let run_id = format!("edit-{}", Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
-    let root = project_root.join(".mercury").join("worktrees").join(run_id);
-    std::fs::create_dir_all(&root)?;
-    Ok(root)
+    Ok(project_root.join(".mercury").join("worktrees").join(run_id))
 }
 
-fn copy_repo_tree(source: &Path, destination: &Path, root: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let relative = source_path
-            .strip_prefix(root)
-            .unwrap_or(source_path.as_path());
-
-        if should_skip_repo_copy(relative) {
-            continue;
-        }
-
-        let destination_path = destination.join(relative);
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            std::fs::create_dir_all(&destination_path)?;
-            copy_repo_tree(&source_path, destination, root)?;
-        } else if metadata.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&source_path, &destination_path)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn should_skip_repo_copy(relative: &Path) -> bool {
-    let relative = relative.to_string_lossy();
-    relative == ".git"
-        || relative.starts_with(".git/")
-        || relative == "target"
-        || relative.starts_with("target/")
-        || relative == ".mercury/worktrees"
-        || relative.starts_with(".mercury/worktrees/")
-        || relative == ".mercury/runs"
-        || relative.starts_with(".mercury/runs/")
-}
-
-fn file_relative_to_project(file: &Path, project_root: &Path) -> Result<PathBuf> {
-    let full_path = if file.is_absolute() {
-        file.to_path_buf()
-    } else {
-        project_root.join(file)
-    };
-
-    full_path
-        .strip_prefix(project_root)
-        .map(PathBuf::from)
-        .with_context(|| {
-            format!(
-                "file {} must live under project root {}",
-                file.display(),
-                project_root.display()
-            )
-        })
+fn parse_cli_repo_relative_path(input: &str, project_root: &Path) -> Result<RepoRelativePath> {
+    let relative_path = RepoRelativePath::new(input)
+        .map_err(|err| anyhow!("invalid file path `{input}`: {err}"))?;
+    relative_path
+        .ensure_within_root(project_root)
+        .map_err(|err| {
+            anyhow!("file path `{input}` must stay within the repository root: {err}")
+        })?;
+    Ok(relative_path)
 }
 
 fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
@@ -2969,15 +3396,11 @@ fn join_line_window(lines: &[&str], start_line: usize, end_line: usize) -> Strin
 }
 
 fn build_next_edit_cli_context(
-    file: &Path,
-    project_root: &Path,
+    relative_path: &RepoRelativePath,
     content: &str,
     requested_line: u32,
 ) -> Result<NextEditCliContext> {
-    let relative = file_relative_to_project(file, project_root)
-        .unwrap_or_else(|_| file.to_path_buf())
-        .display()
-        .to_string();
+    let relative = relative_path.as_str().to_string();
     let lines = content.lines().collect::<Vec<_>>();
 
     if lines.is_empty() {
@@ -3179,15 +3602,17 @@ async fn main() -> Result<()> {
                     dry_run,
                     force,
                 } => {
-                    let content = std::fs::read_to_string(&file)?;
+                    let relative_path = parse_cli_repo_relative_path(&file, &project_root)?;
+                    let file_path = relative_path.resolve_under(&project_root)?;
+                    let content = std::fs::read_to_string(&file_path)?;
                     let (patched, usage) = patcher.patch(&content, &update_snippet).await?;
                     if dry_run {
                         println!("--- Dry run (not written) ---");
                         println!("{patched}");
                     } else if force {
                         println!("WARNING: verification bypassed due to --force");
-                        std::fs::write(&file, &patched)?;
-                        println!("Patched {}", file.display());
+                        atomic_write_string(&file_path, &patched)?;
+                        println!("Patched {relative_path}");
                     } else {
                         let verify_client = Mercury2Client::new(api_key.clone())
                             .with_base_url(config.api.mercury2_endpoint.clone())
@@ -3203,8 +3628,9 @@ async fn main() -> Result<()> {
                                 None
                             },
                         );
-                        verify_and_accept_patch(&verifier, &file, &patched, &project_root).await?;
-                        println!("Patched {}", file.display());
+                        verify_and_accept_patch(&verifier, &relative_path, &patched, &project_root)
+                            .await?;
+                        println!("Patched {relative_path}");
                     }
                     println!(
                         "Tokens: {} | Cost: ${:.4}",
@@ -3212,7 +3638,8 @@ async fn main() -> Result<()> {
                     );
                 }
                 EditAction::Complete { file } => {
-                    let (path, line) = parse_file_line(&file);
+                    let (relative_path, line) = parse_file_line(&file, &project_root)?;
+                    let path = relative_path.resolve_under(&project_root)?;
                     let content = std::fs::read_to_string(&path)?;
                     // Split at the cursor line for FIM prompt/suffix
                     let lines: Vec<&str> = content.lines().collect();
@@ -3231,10 +3658,10 @@ async fn main() -> Result<()> {
                     );
                 }
                 EditAction::Next { file } => {
-                    let (path, line) = parse_file_line(&file);
+                    let (relative_path, line) = parse_file_line(&file, &project_root)?;
+                    let path = relative_path.resolve_under(&project_root)?;
                     let content = std::fs::read_to_string(&path)?;
-                    let context =
-                        build_next_edit_cli_context(&path, &project_root, &content, line)?;
+                    let context = build_next_edit_cli_context(&relative_path, &content, line)?;
                     let (result, usage) = patcher
                         .next_edit_with_context(
                             &context.current_file_path,
@@ -3334,14 +3761,14 @@ fn parse_reasoning_effort(s: &str) -> Option<api::ReasoningEffort> {
     }
 }
 
-/// Parse "file.rs:42" into (PathBuf, line_number).
-fn parse_file_line(input: &str) -> (PathBuf, u32) {
+/// Parse "file.rs:42" into (RepoRelativePath, line_number).
+fn parse_file_line(input: &str, project_root: &Path) -> Result<(RepoRelativePath, u32)> {
     if let Some((file, line)) = input.rsplit_once(':') {
         if let Ok(n) = line.parse::<u32>() {
-            return (PathBuf::from(file), n);
+            return Ok((parse_cli_repo_relative_path(file, project_root)?, n));
         }
     }
-    (PathBuf::from(input), 1)
+    Ok((parse_cli_repo_relative_path(input, project_root)?, 1))
 }
 
 fn build_verify_config(config: &MercuryConfig) -> VerifyConfig {
@@ -3594,45 +4021,29 @@ fn write_watch_output_artifacts(artifact_root: &Path, record: &WatchRunRecord) -
 
 fn capture_repo_watch_snapshot(project_root: &Path) -> Result<RepoWatchSnapshot> {
     let mut files = BTreeMap::new();
-    collect_repo_watch_snapshot(project_root, project_root, &mut files)?;
+    repo::walk_repo_tree(
+        project_root,
+        |relative| should_skip_watch_path(relative.as_path()),
+        &mut |relative, _, metadata| {
+            if metadata.is_file() {
+                let modified_unix_nanos = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or_default();
+                files.insert(
+                    relative.as_path().to_path_buf(),
+                    RepoFileFingerprint {
+                        modified_unix_nanos,
+                        len: metadata.len(),
+                    },
+                );
+            }
+            Ok(())
+        },
+    )?;
     Ok(RepoWatchSnapshot(files))
-}
-
-fn collect_repo_watch_snapshot(
-    root: &Path,
-    current: &Path,
-    files: &mut BTreeMap<PathBuf, RepoFileFingerprint>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(path.as_path());
-
-        if should_skip_watch_path(relative) {
-            continue;
-        }
-
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_repo_watch_snapshot(root, &path, files)?;
-        } else if metadata.is_file() {
-            let modified_unix_nanos = metadata
-                .modified()
-                .ok()
-                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            files.insert(
-                relative.to_path_buf(),
-                RepoFileFingerprint {
-                    modified_unix_nanos,
-                    len: metadata.len(),
-                },
-            );
-        }
-    }
-
-    Ok(())
 }
 
 fn should_skip_watch_path(relative: &Path) -> bool {
@@ -3668,14 +4079,14 @@ async fn wait_for_repo_change(
 
 async fn verify_and_accept_patch(
     verifier: &Verifier<Mercury2Client>,
-    file: &Path,
+    relative_path: &RepoRelativePath,
     patched_content: &str,
     project_root: &Path,
 ) -> Result<()> {
     let sandbox_root = create_cli_worktree_root(project_root)?;
-    copy_repo_tree(project_root, &sandbox_root, project_root)?;
-    let relative_path = file_relative_to_project(file, project_root)?;
-    let sandbox_file = sandbox_root.join(&relative_path);
+    let accepted_states = HashMap::new();
+    repo::prepare_repair_workspace(project_root, &sandbox_root, &accepted_states)?;
+    let sandbox_file = relative_path.resolve_under(&sandbox_root)?;
 
     if let Some(parent) = sandbox_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -3686,11 +4097,12 @@ async fn verify_and_accept_patch(
         .verify(&sandbox_file, patched_content, &sandbox_root)
         .await?;
     if verification.is_ok() {
-        atomic_write_string(&project_root.join(&relative_path), patched_content)?;
-        let _ = std::fs::remove_dir_all(&sandbox_root);
+        let project_file = relative_path.resolve_under(project_root)?;
+        atomic_write_string(&project_file, patched_content)?;
+        let _ = repo::cleanup_repair_workspace(project_root, &sandbox_root);
         return Ok(());
     }
-    let _ = std::fs::remove_dir_all(&sandbox_root);
+    let _ = repo::cleanup_repair_workspace(project_root, &sandbox_root);
 
     let structured = serde_json::json!({
         "parse": verification.parse_ok,
@@ -3702,7 +4114,7 @@ async fn verify_and_accept_patch(
     });
     anyhow::bail!(
         "patch rejected by verification for {}\n{}",
-        file.display(),
+        relative_path,
         serde_json::to_string_pretty(&structured)?
     );
 }
@@ -3710,6 +4122,7 @@ async fn verify_and_accept_patch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn sample_config() -> MercuryConfig {
@@ -3768,6 +4181,17 @@ mod tests {
         }
     }
 
+    fn verification_config_that_passes() -> VerifyConfig {
+        VerifyConfig {
+            parse_before_write: false,
+            test_after_write: false,
+            lint_after_write: false,
+            mercury2_critique_on_failure: false,
+            test_command: "true".to_string(),
+            lint_command: "true".to_string(),
+        }
+    }
+
     fn sample_agent_log_entry(
         id: i64,
         status: &str,
@@ -3817,6 +4241,66 @@ mod tests {
         }
     }
 
+    fn init_git_repo(path: &Path) {
+        run_git(path, &["init", "-q"]);
+        run_git(path, &["config", "user.email", "mercury@example.com"]);
+        run_git(path, &["config", "user.name", "Mercury Tests"]);
+    }
+
+    fn run_git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Mercury Tests")
+            .env("GIT_AUTHOR_EMAIL", "mercury@example.com")
+            .env("GIT_COMMITTER_NAME", "Mercury Tests")
+            .env("GIT_COMMITTER_EMAIL", "mercury@example.com")
+            .output()
+            .expect("git command should run");
+
+        assert!(
+            output.status.success(),
+            "git command failed: git -C {} {} stderr={}",
+            path.display(),
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn parse_cli_repo_relative_path_rejects_invalid_inputs() {
+        let temp = tempdir().unwrap();
+
+        for (input, expected_reason) in [
+            (
+                "../../etc/passwd",
+                "parent-directory traversal is not allowed",
+            ),
+            ("/tmp/file", "absolute paths are not allowed"),
+            (r"C:\temp\file.rs", "absolute Windows paths are not allowed"),
+        ] {
+            let err = parse_cli_repo_relative_path(input, temp.path()).expect_err(input);
+            assert!(err.to_string().contains(expected_reason));
+        }
+    }
+
+    #[test]
+    fn parse_file_line_uses_repo_relative_paths() {
+        let temp = tempdir().unwrap();
+
+        let (relative, line) = parse_file_line("src/lib.rs:42", temp.path()).unwrap();
+        assert_eq!(relative, RepoRelativePath::new("src/lib.rs").unwrap());
+        assert_eq!(line, 42);
+
+        let (default_relative, default_line) = parse_file_line("src/main.rs", temp.path()).unwrap();
+        assert_eq!(
+            default_relative,
+            RepoRelativePath::new("src/main.rs").unwrap()
+        );
+        assert_eq!(default_line, 1);
+    }
+
     #[tokio::test]
     async fn verify_failure_does_not_mutate_user_worktree() {
         let temp = tempdir().unwrap();
@@ -3826,11 +4310,65 @@ mod tests {
         std::fs::write(&file, original).unwrap();
 
         let verifier = Verifier::<Mercury2Client>::new(verification_config_that_fails(), None);
-        let result = verify_and_accept_patch(&verifier, &file, patched, temp.path()).await;
+        let relative = RepoRelativePath::new("sample.rs").unwrap();
+        let result = verify_and_accept_patch(&verifier, &relative, patched, temp.path()).await;
 
         assert!(result.is_err());
         let after = std::fs::read_to_string(&file).unwrap();
         assert_eq!(after, original);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn verify_and_accept_patch_rejects_symlink_escape_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+        init_git_repo(&project_root);
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"cli-edit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(project_root.join("lib.rs"), "pub fn ok() {}\n").unwrap();
+        run_git(&project_root, &["add", "."]);
+        run_git(&project_root, &["commit", "-m", "init"]);
+        symlink(&outside, project_root.join("escape")).unwrap();
+
+        let verifier = Verifier::<Mercury2Client>::new(verification_config_that_passes(), None);
+        let relative = RepoRelativePath::new("escape/file.rs").unwrap();
+        let result =
+            verify_and_accept_patch(&verifier, &relative, "fn main() {}\n", &project_root).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("symlink escapes the repository root"));
+        assert!(!outside.join("file.rs").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn capture_repo_watch_snapshot_rejects_symlink_escape_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, project_root.join("escape")).unwrap();
+
+        let err =
+            capture_repo_watch_snapshot(&project_root).expect_err("symlink escape should fail");
+        assert!(err
+            .to_string()
+            .contains("symlink escapes the repository root"));
     }
 
     #[test]
@@ -3922,6 +4460,8 @@ mod tests {
         assert!(candidate_events.iter().any(|event| {
             event.details["agent_id"] == "agent-02"
                 && event.details["verification_result"] == "passed"
+                && event.details["decision"] == "won"
+                && event.details["explanation"] == "verified candidate selected for application"
         }));
 
         let runtime_event = events
@@ -3999,18 +4539,98 @@ mod tests {
                 && event.details["agent_id"] == "agent-01"
                 && event.details["transition"] == "status_changed"
                 && event.details["verification_result"] == "passed"
+                && event.details["decision"] == "won"
+                && event.details["explanation"] == "verified candidate selected for application"
         }));
         assert!(events.iter().any(|event| {
             event.event == "candidate_event"
                 && event.details["agent_id"] == "agent-02"
                 && event.details["transition"] == "launched"
                 && event.details["source_lineage"] == "exploratory_next_edit"
+                && event.details["decision"] == "in_flight"
         }));
         assert!(events.iter().any(|event| {
             event.event == "runtime_state"
                 && event.details["backlog"] == Value::Bool(false)
                 && event.details["total_tokens_used"] == 8192
         }));
+    }
+
+    #[test]
+    fn candidate_event_details_surface_suppression_and_verification_loss_explanations() {
+        let suppressed = sample_agent_log_entry(
+            1,
+            "failed",
+            "repair:verify",
+            Some(serde_json::json!({
+                "phase": "verify",
+                "candidate_source": "grounded_next_edit",
+                "outcome": "rejected",
+                "reason": "duplicate verified candidate output; identical verified state already kept from a higher-ranked candidate"
+            })),
+        );
+        let verification_failure = sample_agent_log_entry(
+            2,
+            "failed",
+            "repair:verify",
+            Some(serde_json::json!({
+                "phase": "verify",
+                "candidate_source": "critique_retry",
+                "outcome": "rejected",
+                "failure_stage": "verification",
+                "reason": "cargo test failed"
+            })),
+        );
+
+        let suppressed_details = candidate_event_details(
+            &build_candidate_live_state(&suppressed),
+            "status_changed",
+            false,
+        );
+        assert_eq!(suppressed_details["decision"], "suppressed");
+        assert_eq!(
+            suppressed_details["verification_result"],
+            "passed_not_selected"
+        );
+        assert_eq!(
+            suppressed_details["explanation"],
+            "duplicate verified candidate output; identical verified state already kept from a higher-ranked candidate"
+        );
+
+        let loss_details = candidate_event_details(
+            &build_candidate_live_state(&verification_failure),
+            "status_changed",
+            false,
+        );
+        assert_eq!(loss_details["decision"], "lost");
+        assert_eq!(loss_details["verification_result"], "failed");
+        assert_eq!(loss_details["explanation"], "cargo test failed");
+    }
+
+    #[test]
+    fn format_live_event_line_includes_decision_and_explanation() {
+        let event = LiveStatusEvent {
+            event: "candidate_event",
+            details: serde_json::json!({
+                "transition": "status_changed",
+                "phase": "verify",
+                "agent_id": "agent-07",
+                "status": "success",
+                "file_path": "src/lib.rs",
+                "source_lineage": "apply_edit",
+                "outcome": "accepted",
+                "decision": "won",
+                "verification_result": "passed",
+                "explanation": "highest-ranked verified candidate over 2 competing verified candidates; suppressed 1 duplicate verified output",
+                "tokens_used": 700,
+                "cost_usd": 0.21
+            }),
+        };
+
+        let line = format_live_event_line(&event);
+        assert!(line.contains("decision=won"));
+        assert!(line.contains("why=highest-ranked verified candidate over 2 competing verified candidates; suppressed 1 duplicate verified output"));
+        assert!(line.contains("verify=passed"));
     }
 
     #[test]

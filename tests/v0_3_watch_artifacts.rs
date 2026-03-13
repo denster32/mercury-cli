@@ -11,6 +11,19 @@ use std::time::{Duration, Instant};
 use assert_cmd::prelude::*;
 use serde_json::{json, Value};
 
+const CANDIDATE_LINEAGE_FIELDS: [(&str, &str); 4] = [
+    ("apply_edit_attempts", "apply_edit_accepted_steps"),
+    (
+        "grounded_next_edit_attempts",
+        "grounded_next_edit_accepted_steps",
+    ),
+    ("critique_retry_attempts", "critique_retry_accepted_steps"),
+    (
+        "exploratory_next_edit_attempts",
+        "exploratory_next_edit_accepted_steps",
+    ),
+];
+
 struct ChildGuard {
     child: Child,
 }
@@ -185,6 +198,7 @@ fn watch_without_repair_records_passed_decision_for_allowlisted_success_command(
     assert!(record["confirmation_run"].is_null());
 
     assert!(artifact_root.join("watch.json").exists());
+    assert!(artifact_root.join("summary-index.json").exists());
     assert!(artifact_root.join("initial.stdout.txt").exists());
     assert!(artifact_root.join("initial.stderr.txt").exists());
     assert!(
@@ -207,6 +221,13 @@ fn watch_without_repair_records_passed_decision_for_allowlisted_success_command(
         !artifact_root.join("confirmation.failure.json").exists(),
         "successful command should not create confirmation parsed failure artifact"
     );
+    let summary = read_json(artifact_root.join("summary-index.json"));
+    assert_eq!(summary["run_kind"], "watch");
+    assert_eq!(summary["decision"], "passed_without_repair");
+    assert_eq!(summary["headline"], "watch command passed without repair");
+    assert_eq!(summary["repair_requested"], Value::Bool(false));
+    assert_eq!(summary["repair"], Value::Null);
+    assert_eq!(summary["artifacts"]["watch_record"], "watch.json");
 
     drop(child);
 }
@@ -256,11 +277,18 @@ fn watch_without_repair_supported_env_wrapped_command_writes_initial_failure_jso
     assert!(record["repair"].is_null());
     assert!(record["confirmation_run"].is_null());
 
+    assert!(artifact_root.join("summary-index.json").exists());
     assert!(artifact_root.join("initial.failure.json").exists());
     assert!(
         !artifact_root.join("confirmation.failure.json").exists(),
         "no confirmation run exists without --repair"
     );
+    let summary = read_json(artifact_root.join("summary-index.json"));
+    assert_eq!(summary["run_kind"], "watch");
+    assert_eq!(summary["decision"], "failed_without_repair");
+    assert_eq!(summary["headline"], "watch command failed without repair");
+    assert_eq!(summary["repair"], Value::Null);
+    assert_eq!(summary["initial_run"]["parsed_failure"], Value::Bool(true));
     let initial_failure = read_json(artifact_root.join("initial.failure.json"));
     assert_eq!(initial_failure["command"], "Test");
     assert_eq!(initial_failure["stage"], "Test");
@@ -325,6 +353,7 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
     assert!(repair["error"].is_null());
 
     assert!(artifact_root.join("watch.json").exists());
+    assert!(artifact_root.join("summary-index.json").exists());
     assert!(artifact_root.join("initial.stdout.txt").exists());
     assert!(artifact_root.join("initial.stderr.txt").exists());
     assert!(artifact_root.join("initial.failure.json").exists());
@@ -344,12 +373,29 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
             "failing confirmation run should emit structured failure when available"
         );
     }
+    let watch_summary = read_json(artifact_root.join("summary-index.json"));
+    assert_eq!(watch_summary["run_kind"], "watch");
+    assert_eq!(watch_summary["decision"], record["decision"]);
+    assert_eq!(watch_summary["command"], record["command"]);
+    assert_eq!(
+        watch_summary["repair_requested"],
+        record["repair_requested"]
+    );
+    assert_eq!(
+        watch_summary["initial_run"]["parsed_failure"],
+        Value::Bool(true)
+    );
     if let Some(fix_artifact_root) = repair["fix_artifact_root"].as_str().map(PathBuf::from) {
         wait_for_mirrored_repair_artifacts(&artifact_root, &fix_artifact_root);
         assert!(fix_artifact_root.exists());
+        assert!(fix_artifact_root.join("summary-index.json").exists());
         assert!(artifact_root
             .join("repair")
             .join("execution-summary.json")
+            .exists());
+        assert!(artifact_root
+            .join("repair")
+            .join("summary-index.json")
             .exists());
         assert_eq!(
             artifact_root
@@ -402,11 +448,14 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
 
         let fix_benchmark = read_json(fix_artifact_root.join("benchmark-run.json"));
         let mirrored_benchmark = read_json(artifact_root.join("repair").join("benchmark-run.json"));
+        let fix_summary = read_json(fix_artifact_root.join("summary-index.json"));
+        let mirrored_summary = read_json(artifact_root.join("repair").join("summary-index.json"));
         assert_eq!(
             fix_benchmark["schema_version"],
             Value::String("mercury-repair-benchmark-case-v1".to_string())
         );
         assert_eq!(mirrored_benchmark, fix_benchmark);
+        assert_eq!(mirrored_summary, fix_summary);
         assert_eq!(
             fix_benchmark["accepted_steps"], repair["accepted_steps"],
             "benchmark accepted_steps should match the watch repair record"
@@ -434,6 +483,61 @@ fn watch_with_supported_rust_repair_records_nested_and_fix_artifact_bundles() {
                 .is_some_and(|command| command.contains("cargo test")),
             "benchmark verifier test command should record the cargo test invocation"
         );
+        assert_eq!(fix_summary["run_kind"], "fix");
+        assert_eq!(fix_summary["outcome"], fix_benchmark["outcome"]);
+        assert_eq!(
+            fix_summary["final_bundle_verified"],
+            fix_benchmark["final_bundle_verified"]
+        );
+        assert_eq!(fix_summary["applied"], fix_benchmark["applied"]);
+        assert_eq!(
+            fix_summary["counts"]["accepted_steps"],
+            fix_benchmark["accepted_steps"]
+        );
+        assert_eq!(
+            fix_summary["artifacts"]["benchmark_run"],
+            "benchmark-run.json"
+        );
+        assert_eq!(fix_summary["artifacts"]["metadata"], "metadata.json");
+        assert_eq!(
+            watch_summary["repair"]["fix_artifact_root"],
+            Value::String(fix_artifact_root.display().to_string())
+        );
+        assert_eq!(
+            watch_summary["artifacts"]["repair_summary"],
+            "repair/summary-index.json"
+        );
+        assert_eq!(
+            watch_summary["artifacts"]["repair_benchmark_run"],
+            "repair/benchmark-run.json"
+        );
+        if fix_benchmark["accepted_steps"]
+            .as_u64()
+            .is_some_and(|accepted_steps| accepted_steps > 0)
+        {
+            let winning_candidates = fix_summary["winning_candidates"]
+                .as_array()
+                .expect("accepted repair summary should include winning_candidates");
+            assert!(
+                !winning_candidates.is_empty(),
+                "accepted repair summary should include at least one winning candidate"
+            );
+            let first_winner = winning_candidates
+                .first()
+                .expect("winning_candidates should expose the accepted winner");
+            assert!(first_winner["agent_id"].as_str().is_some());
+            assert!(first_winner["file_path"].as_str().is_some());
+        }
+        for (attempt_field, accepted_field) in CANDIDATE_LINEAGE_FIELDS {
+            assert!(
+                fix_benchmark[attempt_field].as_u64().is_some(),
+                "successful watch benchmark artifact should expose numeric {attempt_field}"
+            );
+            assert!(
+                fix_benchmark[accepted_field].as_u64().is_some(),
+                "successful watch benchmark artifact should expose numeric {accepted_field}"
+            );
+        }
     }
 
     let requests = stub.recorded_requests();
@@ -785,9 +889,14 @@ fn fix_failure_writes_benchmark_and_metadata_artifacts() {
         artifact_root.join("benchmark-run.json").exists(),
         "failed fix runs should still write benchmark-run.json"
     );
+    assert!(
+        artifact_root.join("summary-index.json").exists(),
+        "failed fix runs should still write summary-index.json"
+    );
 
     let metadata = read_json(artifact_root.join("metadata.json"));
     let benchmark = read_json(artifact_root.join("benchmark-run.json"));
+    let summary = read_json(artifact_root.join("summary-index.json"));
 
     assert_eq!(
         benchmark["schema_version"],
@@ -804,11 +913,40 @@ fn fix_failure_writes_benchmark_and_metadata_artifacts() {
         benchmark.get("false_green").is_none(),
         "failed fix benchmark artifact should not claim false_green"
     );
+    for (attempt_field, accepted_field) in CANDIDATE_LINEAGE_FIELDS {
+        assert!(
+            benchmark[attempt_field].as_u64().is_some(),
+            "failed fix benchmark artifact should expose numeric {attempt_field}"
+        );
+        assert!(
+            benchmark[accepted_field].as_u64().is_some(),
+            "failed fix benchmark artifact should expose numeric {accepted_field}"
+        );
+    }
 
     assert_eq!(metadata["final_bundle_verified"], Value::Bool(false));
     assert_eq!(metadata["applied"], Value::Bool(false));
     assert_eq!(metadata["planner_estimated_cost_usd"], Value::from(0.0));
     assert_eq!(metadata["grounding_collected"], Value::Bool(false));
+    assert_eq!(summary["run_kind"], "fix");
+    assert_eq!(summary["outcome"], "fix_failed");
+    assert_eq!(
+        summary["headline"],
+        "fix run failed before a repair was accepted"
+    );
+    assert_eq!(
+        summary["failure_reason_rollup"],
+        "fix run failed before a verified repair was produced"
+    );
+    assert_eq!(summary["final_bundle_verified"], Value::Bool(false));
+    assert_eq!(summary["applied"], Value::Bool(false));
+    assert_eq!(summary["counts"]["accepted_steps"], Value::from(0));
+    assert_eq!(summary["artifacts"]["metadata"], "metadata.json");
+    assert_eq!(summary["artifacts"]["benchmark_run"], "benchmark-run.json");
+    assert!(
+        summary.get("winning_candidates").is_none(),
+        "failed fix summary should omit winning_candidates when no repair was accepted"
+    );
 
     let requests = stub.recorded_requests();
     assert!(
@@ -1001,6 +1139,7 @@ fn wait_for_mirrored_repair_artifacts(artifact_root: &Path, fix_artifact_root: &
         let fix_exists = fix_artifact_root.exists();
         let mirrored_exists = mirrored_repair_root.exists();
         let mandatory_mirrored = mirrored_repair_root.join("execution-summary.json").exists()
+            && mirrored_repair_root.join("summary-index.json").exists()
             && mirrored_repair_root.join("metadata.json").exists()
             && mirrored_repair_root.join("benchmark-run.json").exists()
             && mirrored_repair_root.join("plan.json").exists();

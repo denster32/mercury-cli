@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,18 @@ const EXECUTION_DIAGNOSTIC_FIELDS: [&str; 4] = [
     "safety_failures",
     "candidate_verification_failures",
     "final_bundle_failures",
+];
+const CANDIDATE_ATTEMPT_FIELDS: [&str; 4] = [
+    "apply_edit_attempts",
+    "grounded_next_edit_attempts",
+    "critique_retry_attempts",
+    "exploratory_next_edit_attempts",
+];
+const CANDIDATE_ACCEPTED_FIELDS: [&str; 4] = [
+    "apply_edit_accepted_steps",
+    "grounded_next_edit_accepted_steps",
+    "critique_retry_accepted_steps",
+    "exploratory_next_edit_accepted_steps",
 ];
 
 fn manifest() -> Value {
@@ -67,6 +81,39 @@ fn assert_public_benchmark_report_is_scrubbed(report: &Value) {
             "public benchmark report should expose numeric execution diagnostics for {field}"
         );
     }
+    for breakdown_key in [
+        "tier_breakdown",
+        "verifier_class_breakdown",
+        "candidate_lineage_breakdown",
+    ] {
+        assert!(
+            report
+                .get(breakdown_key)
+                .and_then(Value::as_object)
+                .is_some_and(|value| !value.is_empty()),
+            "public benchmark report should expose a non-empty {breakdown_key}"
+        );
+    }
+    let candidate_attempt_breakdown = report["candidate_attempt_breakdown"]
+        .as_object()
+        .expect("public benchmark report should expose candidate_attempt_breakdown");
+    assert!(
+        !candidate_attempt_breakdown.is_empty(),
+        "public benchmark report should expose at least one candidate_attempt_breakdown entry"
+    );
+    for (label, entry) in candidate_attempt_breakdown {
+        assert!(
+            entry.get("attempts").and_then(Value::as_u64).is_some(),
+            "public benchmark report should expose numeric attempts for {label}"
+        );
+        assert!(
+            entry
+                .get("accepted_steps")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "public benchmark report should expose numeric accepted_steps for {label}"
+        );
+    }
 
     if let Some(manifest_path) = report["selection"]["manifest_path"].as_str() {
         assert!(
@@ -91,10 +138,34 @@ fn assert_public_benchmark_report_is_scrubbed(report: &Value) {
             result["accepted_patch_bytes"].as_u64().is_some(),
             "public benchmark result should expose normalized accepted_patch_bytes"
         );
+        assert!(
+            result["tier"].as_str().is_some(),
+            "public benchmark result should expose normalized tier"
+        );
+        assert!(
+            result["verifier_class"].as_str().is_some(),
+            "public benchmark result should expose verifier_class"
+        );
+        assert!(
+            result["candidate_lineage"].as_str().is_some(),
+            "public benchmark result should expose candidate_lineage"
+        );
         for field in EXECUTION_DIAGNOSTIC_FIELDS {
             assert!(
                 result.get(field).and_then(Value::as_u64).is_some(),
                 "public benchmark result should expose numeric execution diagnostics for {field}"
+            );
+        }
+        for field in CANDIDATE_ATTEMPT_FIELDS {
+            assert!(
+                result.get(field).and_then(Value::as_u64).is_some(),
+                "public benchmark result should expose numeric candidate attempt counts for {field}"
+            );
+        }
+        for field in CANDIDATE_ACCEPTED_FIELDS {
+            assert!(
+                result.get(field).and_then(Value::as_u64).is_some(),
+                "public benchmark result should expose numeric candidate accepted counts for {field}"
             );
         }
     }
@@ -379,7 +450,11 @@ fn eval_tier1_manifest_matches_beta_shape() {
     let cases = manifest["cases"]
         .as_array()
         .expect("cases must be an array");
-    assert_eq!(cases.len(), 35, "tier1 corpus should contain 35 logical case ids");
+    assert_eq!(
+        cases.len(),
+        35,
+        "tier1 corpus should contain 35 logical case ids"
+    );
 
     let mut ids = BTreeSet::new();
     let mut stage_counts = BTreeMap::new();
@@ -602,6 +677,12 @@ fn repair_workflow_contract_exposes_expected_inputs_and_artifacts() {
         "decision.json",
         "environment.json",
         "pr-body.md",
+        "summary-index.json",
+        "failure_reason_rollup",
+        "candidate_lineage",
+        "winning_candidates",
+        "decision_payload[\"mercury_run\"] = mercury_run",
+        "## Mercury run summary",
         "repair.diff",
         "repair.diffstat.txt",
         "baseline.stdout.log",
@@ -784,6 +865,20 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
         fs::read_to_string(repo_root.join("docs/QUALITY.md")).expect("quality doc should exist");
     let benchmark_readme = fs::read_to_string(repo_root.join("docs/benchmarks/README.md"))
         .expect("benchmark README should exist");
+    let operator_quickstart = fs::read_to_string(repo_root.join("docs/operator-quickstart.md"))
+        .expect("operator quickstart should exist");
+    let starter_index = fs::read_to_string(repo_root.join("starter-repos/README.md"))
+        .expect("starter repo index should exist");
+    let local_starter =
+        fs::read_to_string(repo_root.join("starter-repos/local-rust-watch-repair/README.md"))
+            .expect("local starter repo README should exist");
+    let ci_starter =
+        fs::read_to_string(repo_root.join("starter-repos/ci-draft-pr-repair/README.md"))
+            .expect("ci starter repo README should exist");
+    let ci_starter_workflow = fs::read_to_string(
+        repo_root.join("starter-repos/ci-draft-pr-repair/.github/workflows/mercury-repair.yml"),
+    )
+    .expect("ci starter workflow should exist");
     let benchmark_report =
         fs::read_to_string(repo_root.join("docs/benchmarks/rust-v0-repair-benchmark.md"))
             .expect("benchmark report scaffold should exist");
@@ -826,6 +921,63 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             "{label} should point readers to checked-in benchmark reports"
         );
     }
+    assert!(
+        readme.contains("docs/operator-quickstart.md"),
+        "README should link to the operator quickstart"
+    );
+    assert!(
+        readme.contains("starter-repos/README.md"),
+        "README should link to the starter repo index"
+    );
+    for expected in [
+        "watch --repair",
+        "artifact bundle",
+        "summary-index.json",
+        "failure reason rollup",
+        "candidate lineage",
+        "winning candidates",
+        "verified_patch_ready",
+        "repair_not_verified",
+        "status --live",
+        "starter-repos/",
+    ] {
+        assert!(
+            operator_quickstart.contains(expected),
+            "operator quickstart should explain `{expected}`"
+        );
+    }
+    for expected in ["local-rust-watch-repair", "ci-draft-pr-repair", "Rust-only"] {
+        assert!(
+            starter_index.contains(expected),
+            "starter repo index should describe `{expected}`"
+        );
+    }
+    for expected in [
+        "cargo test",
+        "watch \"cargo test\" --repair",
+        "summary-index.json",
+    ] {
+        assert!(
+            local_starter.contains(expected),
+            "local starter README should explain `{expected}`"
+        );
+    }
+    for expected in [
+        "workflow_dispatch",
+        "repair is verified",
+        "dry_run",
+        "summary.md",
+    ] {
+        assert!(
+            ci_starter.contains(expected),
+            "ci starter README should explain `{expected}`"
+        );
+    }
+    assert!(
+        ci_starter_workflow
+            .contains("uses: denster32/mercury-cli/.github/workflows/repair.yml@v1.0.0-beta.1"),
+        "ci starter workflow should pin the reusable Mercury beta workflow"
+    );
 
     for (label, text) in [
         ("docs/benchmarks/README.md", benchmark_readme.as_str()),
@@ -914,12 +1066,50 @@ fn release_truth_and_benchmark_docs_remain_consistent() {
             );
         }
         assert!(
+            readme.contains("Rust direct cargo verifier repair beta"),
+            "README should describe the product as a Rust direct cargo verifier repair beta"
+        );
+        assert!(
             benchmark_readme.contains("repair outcome distribution"),
             "docs/benchmarks/README.md should describe the published repair outcome distribution"
         );
         assert!(
+            benchmark_readme.contains("tier breakdowns"),
+            "docs/benchmarks/README.md should describe the published tier breakdowns"
+        );
+        assert!(
+            benchmark_readme.contains("verifier-class breakdowns"),
+            "docs/benchmarks/README.md should describe the published verifier-class breakdowns"
+        );
+        assert!(
+            benchmark_readme.contains("candidate lineage breakdowns"),
+            "docs/benchmarks/README.md should describe the published candidate lineage breakdowns"
+        );
+        assert!(
+            benchmark_readme.contains("cargo test")
+                && benchmark_readme.contains("cargo check")
+                && benchmark_readme.contains("cargo clippy"),
+            "docs/benchmarks/README.md should call out the published Rust verifier classes"
+        );
+        assert!(
             benchmark_readme.contains("execution diagnostics"),
             "docs/benchmarks/README.md should describe the published execution diagnostics"
+        );
+        assert!(
+            readme.contains("tier breakdowns")
+                && readme.contains("candidate lineage")
+                && readme.contains("cargo test")
+                && readme.contains("cargo check")
+                && readme.contains("cargo clippy"),
+            "README should describe the published diagnostic benchmark slices"
+        );
+        assert!(
+            quality.contains("tier breakdowns")
+                && quality.contains("candidate lineage breakdowns")
+                && quality.contains("cargo test")
+                && quality.contains("cargo check")
+                && quality.contains("cargo clippy"),
+            "QUALITY should describe the published diagnostic benchmark slices"
         );
         assert!(
             benchmark_report.contains("## Repair Outcome Distribution"),
@@ -1178,11 +1368,22 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "agent_count": 4,
             "outcome": "verified_repair",
             "verified_repair": true,
+            "difficulty": "easy",
+            "tier": "Tier 1",
+            "verifier_class": "cargo_test",
             "accepted_patch_bytes": 128,
             "generation_failures": 0,
             "safety_failures": 0,
-            "candidate_verification_failures": 0,
+            "candidate_verification_failures": 1,
             "final_bundle_failures": 0,
+            "apply_edit_attempts": 2,
+            "grounded_next_edit_attempts": 0,
+            "critique_retry_attempts": 0,
+            "exploratory_next_edit_attempts": 0,
+            "apply_edit_accepted_steps": 1,
+            "grounded_next_edit_accepted_steps": 0,
+            "critique_retry_accepted_steps": 0,
+            "exploratory_next_edit_accepted_steps": 0,
             "benchmark_run_path": "/tmp/quality/cases/rust_type_mismatch/agents-4/benchmark-run.json",
             "candidate_workspace": "/tmp/quality/workspaces/rust_type_mismatch-agents-4"
         }]
@@ -1309,11 +1510,22 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
             "outcome": "accepted_patch_unverified",
             "verified_repair": false,
             "failure_attribution": "candidate_failed_verifier",
+            "difficulty": "medium",
+            "tier": 2,
+            "verifier_class": "cargo_check",
             "accepted_patch_bytes": 64,
             "generation_failures": 1,
             "safety_failures": 0,
             "candidate_verification_failures": 3,
             "final_bundle_failures": 1,
+            "apply_edit_attempts": 0,
+            "grounded_next_edit_attempts": 2,
+            "critique_retry_attempts": 1,
+            "exploratory_next_edit_attempts": 0,
+            "apply_edit_accepted_steps": 0,
+            "grounded_next_edit_accepted_steps": 1,
+            "critique_retry_accepted_steps": 0,
+            "exploratory_next_edit_accepted_steps": 0,
             "benchmark_run_path": "/tmp/sweep/cases/rust_type_mismatch/agents-8/benchmark-run.json",
             "candidate_workspace": "/tmp/sweep/workspaces/rust_type_mismatch-agents-8"
         }]
@@ -1370,6 +1582,35 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         "published benchmark markdown should render the execution diagnostics table"
     );
     assert!(
+        markdown.contains("## Tier Breakdown"),
+        "published benchmark markdown should include the tier breakdown section"
+    );
+    assert!(
+        markdown.contains("## Verifier-Class Breakdown"),
+        "published benchmark markdown should include the verifier-class breakdown section"
+    );
+    assert!(
+        markdown.contains("## Candidate Lineage Breakdown"),
+        "published benchmark markdown should include the candidate-lineage breakdown section"
+    );
+    assert!(
+        markdown.contains("## Candidate Lineage Attempts"),
+        "published benchmark markdown should include the candidate-lineage attempts section"
+    );
+    assert!(
+        markdown.contains("| tier1 | 1 | 1 | 0 | 0 | 1.000 | 0.000 | 0.000 | verified_repair=1 |"),
+        "published benchmark markdown should render normalized tier breakdown rows"
+    );
+    assert!(
+        markdown
+            .contains("| cargo_test | 1 | 1 | 0 | 0 | 1.000 | 0.000 | 0.000 | verified_repair=1 |"),
+        "published benchmark markdown should render verifier-class breakdown rows"
+    );
+    assert!(
+        markdown.contains("| apply_edit | 2 | 1 | 0 | 0 |"),
+        "published benchmark markdown should render candidate-lineage attempt totals"
+    );
+    assert!(
         markdown.contains("| 8 | 4 | 2 | 5000 | 4300 | 1.600 |"),
         "published benchmark markdown should render the speedup curve table"
     );
@@ -1396,7 +1637,50 @@ fn repair_benchmark_publish_script_renders_public_surface_from_reports() {
         copied_quality["execution_diagnostics"]["candidate_verification_failures"],
         1
     );
-    assert_eq!(copied_agent_sweep["execution_diagnostics"]["generation_failures"], 1);
+    assert_eq!(
+        copied_agent_sweep["execution_diagnostics"]["generation_failures"],
+        1
+    );
+    assert_eq!(
+        copied_quality["tier_breakdown"]["tier1"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["tier_breakdown"]["tier2"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["verifier_class_breakdown"]["cargo_test"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["verifier_class_breakdown"]["cargo_check"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["candidate_lineage_breakdown"]["apply_edit"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["candidate_lineage_breakdown"]["grounded_next_edit"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["apply_edit"]["attempts"],
+        2
+    );
+    assert_eq!(
+        copied_quality["candidate_attempt_breakdown"]["apply_edit"]["accepted_steps"],
+        1
+    );
+    assert_eq!(
+        copied_agent_sweep["candidate_attempt_breakdown"]["grounded_next_edit"]["attempts"],
+        2
+    );
+    assert_eq!(
+        copied_agent_sweep["candidate_attempt_breakdown"]["grounded_next_edit"]["accepted_steps"],
+        1
+    );
     assert_eq!(
         copied_agent_sweep["failure_attribution"]["candidate_failed_verifier"],
         1
@@ -1926,6 +2210,18 @@ if args and args[0] == "fix":
         "accepted_patch": True,
         "accepted_patch_bytes": 16,
         "outcome": "verified_repair",
+        "generation_failures": 0,
+        "safety_failures": 0,
+        "candidate_verification_failures": 0,
+        "final_bundle_failures": 0,
+        "apply_edit_attempts": 1,
+        "grounded_next_edit_attempts": 0,
+        "critique_retry_attempts": 0,
+        "exploratory_next_edit_attempts": 0,
+        "apply_edit_accepted_steps": 1,
+        "grounded_next_edit_accepted_steps": 0,
+        "critique_retry_accepted_steps": 0,
+        "exploratory_next_edit_accepted_steps": 0,
         "sandbox_run_root": str(sandbox_root),
         "total_cost_usd": 0.12,
         "budget_remaining_usd": 0.38,
@@ -2018,6 +2314,27 @@ fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
     assert_eq!(result["independent_rerun_success"], false);
     assert_eq!(result["workspace_preserved"], false);
     assert!(result["candidate_workspace"].is_null());
+    assert_eq!(result["tier"], "unknown");
+    assert_eq!(result["verifier_class"], "unknown");
+    assert_eq!(result["candidate_lineage"], "apply_edit");
+    for field in EXECUTION_DIAGNOSTIC_FIELDS {
+        assert_eq!(
+            result[field], 0,
+            "synthetic false-green result should keep {field}"
+        );
+    }
+    for field in CANDIDATE_ATTEMPT_FIELDS {
+        assert!(
+            result[field].as_u64().is_some(),
+            "synthetic false-green result should expose numeric {field}"
+        );
+    }
+    for field in CANDIDATE_ACCEPTED_FIELDS {
+        assert!(
+            result[field].as_u64().is_some(),
+            "synthetic false-green result should expose numeric {field}"
+        );
+    }
 
     let benchmark_run: Value = serde_json::from_str(
         &fs::read_to_string(
@@ -2054,6 +2371,23 @@ fn repair_benchmark_runner_downgrades_false_green_after_independent_rerun() {
         1
     );
     assert_eq!(report["keep_workspaces"], false);
+    assert_eq!(report["tier_breakdown"]["unknown"]["attempted_cases"], 1);
+    assert_eq!(
+        report["verifier_class_breakdown"]["unknown"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        report["candidate_lineage_breakdown"]["apply_edit"]["attempted_cases"],
+        1
+    );
+    assert_eq!(
+        report["candidate_attempt_breakdown"]["apply_edit"]["attempts"],
+        1
+    );
+    assert_eq!(
+        report["candidate_attempt_breakdown"]["apply_edit"]["accepted_steps"],
+        1
+    );
 }
 
 #[cfg(unix)]

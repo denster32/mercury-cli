@@ -2,6 +2,9 @@
 /evals/v0/target/
 /evals/v0/reports/*.json
 /evals/v0/reports/*.md
+/evals/repair_benchmark/reports/quality/run-*/
+/evals/repair_benchmark/reports/agent-sweep/run-*/
+.cursor/
 *.db
 .env
 .DS_Store

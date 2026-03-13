@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -24,6 +25,16 @@ DEFAULT_QUALITY_AGENT_COUNT = 4
 DEFAULT_AGENT_SWEEP = [1, 2, 4, 8]
 DEFAULT_REPRESENTATIVE_COUNT = 10
 DIFFICULTY_ORDER = ["easy", "medium", "hard", "unknown"]
+TIER_ORDER = ["tier0", "tier1", "tier2", "unknown"]
+VERIFIER_CLASS_ORDER = ["cargo_test", "cargo_check", "cargo_clippy", "unknown"]
+CANDIDATE_LINEAGE_ORDER = [
+    "apply_edit",
+    "grounded_next_edit",
+    "critique_retry",
+    "exploratory_next_edit",
+    "mixed",
+    "unknown",
+]
 FAILURE_ATTRIBUTION_ORDER = [
     "baseline_not_reproduced",
     "missing_benchmark_run",
@@ -44,6 +55,21 @@ EXECUTION_DIAGNOSTIC_FIELDS = [
     "candidate_verification_failures",
     "final_bundle_failures",
 ]
+CANDIDATE_LINEAGE_FIELDS = {
+    "apply_edit": ("apply_edit_attempts", "apply_edit_accepted_steps"),
+    "grounded_next_edit": (
+        "grounded_next_edit_attempts",
+        "grounded_next_edit_accepted_steps",
+    ),
+    "critique_retry": ("critique_retry_attempts", "critique_retry_accepted_steps"),
+    "exploratory_next_edit": (
+        "exploratory_next_edit_attempts",
+        "exploratory_next_edit_accepted_steps",
+    ),
+}
+CANDIDATE_ATTEMPT_FIELDS = [fields[0] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
+CANDIDATE_ACCEPTED_FIELDS = [fields[1] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
+TIER_PATTERN = re.compile(r"tier[\s:_-]*([012])", re.IGNORECASE)
 
 
 def now_utc() -> datetime:
@@ -394,23 +420,132 @@ def median_or_none(values: list[Union[float, int]]) -> Optional[float]:
     return float(statistics.median(values))
 
 
+def numeric_count(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
 def normalize_difficulty_label(value: Any) -> str:
     if isinstance(value, str) and value in {"easy", "medium", "hard"}:
         return value
     return "unknown"
 
 
+def normalize_tier_label(value: Any) -> str:
+    if isinstance(value, (int, float)) and int(value) in {0, 1, 2}:
+        return f"tier{int(value)}"
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        compact = lowered.replace(" ", "").replace("-", "").replace("_", "")
+        if compact in {"tier0", "0"}:
+            return "tier0"
+        if compact in {"tier1", "1"}:
+            return "tier1"
+        if compact in {"tier2", "2"}:
+            return "tier2"
+        match = TIER_PATTERN.search(lowered)
+        if match:
+            return f"tier{match.group(1)}"
+    return "unknown"
+
+
+def derive_tier(
+    case: dict[str, Any],
+    suite_id: Optional[str] = None,
+    manifest_path: Optional[Union[str, Path]] = None,
+) -> str:
+    explicit = normalize_tier_label(case.get("tier"))
+    if explicit != "unknown":
+        return explicit
+
+    for tag in case.get("tags", []):
+        normalized = normalize_tier_label(tag)
+        if normalized != "unknown":
+            return normalized
+
+    for candidate in (
+        suite_id,
+        str(manifest_path) if manifest_path is not None else None,
+        case.get("id"),
+        case.get("path"),
+        case.get("title"),
+    ):
+        normalized = normalize_tier_label(candidate)
+        if normalized != "unknown":
+            return normalized
+
+    return "unknown"
+
+
+def classify_verifier_command(argv: Any) -> str:
+    parts: list[str] = []
+    if isinstance(argv, list):
+        parts = [part.lower() for part in argv if isinstance(part, str)]
+    elif isinstance(argv, str):
+        parts = argv.lower().split()
+
+    for index, part in enumerate(parts):
+        if part != "cargo" or index + 1 >= len(parts):
+            continue
+        subcommand = parts[index + 1]
+        if subcommand == "test":
+            return "cargo_test"
+        if subcommand == "check":
+            return "cargo_check"
+        if subcommand == "clippy":
+            return "cargo_clippy"
+    return "unknown"
+
+
 def normalized_execution_diagnostics(source: dict[str, Any]) -> dict[str, int]:
-    return {
-        field: int(source.get(field) or 0)
-        for field in EXECUTION_DIAGNOSTIC_FIELDS
-    }
+    return {field: numeric_count(source.get(field)) for field in EXECUTION_DIAGNOSTIC_FIELDS}
+
+
+def normalized_candidate_lineage_counts(source: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for attempt_field in CANDIDATE_ATTEMPT_FIELDS:
+        counts[attempt_field] = numeric_count(source.get(attempt_field))
+    for accepted_field in CANDIDATE_ACCEPTED_FIELDS:
+        counts[accepted_field] = numeric_count(source.get(accepted_field))
+    return counts
+
+
+def candidate_lineage_label(source: dict[str, Any]) -> str:
+    lineage_counts = normalized_candidate_lineage_counts(source)
+    accepted_sources = [
+        label
+        for label, (_, accepted_field) in CANDIDATE_LINEAGE_FIELDS.items()
+        if lineage_counts[accepted_field] > 0
+    ]
+    if len(accepted_sources) == 1:
+        return accepted_sources[0]
+    if len(accepted_sources) > 1:
+        return "mixed"
+
+    attempted_sources = [
+        label
+        for label, (attempt_field, _) in CANDIDATE_LINEAGE_FIELDS.items()
+        if lineage_counts[attempt_field] > 0
+    ]
+    if len(attempted_sources) == 1:
+        return attempted_sources[0]
+    if len(attempted_sources) > 1:
+        return "mixed"
+    return "unknown"
 
 
 def normalized_case_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(result)
-    normalized["accepted_patch_bytes"] = int(normalized.get("accepted_patch_bytes") or 0)
+    normalized["accepted_patch_bytes"] = numeric_count(normalized.get("accepted_patch_bytes"))
+    normalized["tier"] = normalize_tier_label(normalized.get("tier"))
+    verifier_class = normalized.get("verifier_class")
+    normalized["verifier_class"] = (
+        verifier_class
+        if isinstance(verifier_class, str) and verifier_class in VERIFIER_CLASS_ORDER
+        else "unknown"
+    )
     normalized.update(normalized_execution_diagnostics(normalized))
+    normalized.update(normalized_candidate_lineage_counts(normalized))
+    normalized["candidate_lineage"] = candidate_lineage_label(normalized)
     return normalized
 
 
@@ -519,14 +654,38 @@ def bucket_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def compute_difficulty_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    by_difficulty: dict[str, list[dict[str, Any]]] = {}
-    for result in results:
-        label = normalize_difficulty_label(result.get("difficulty"))
-        by_difficulty.setdefault(label, []).append(result)
+    return compute_breakdown_by_label(
+        results,
+        lambda result: normalize_difficulty_label(result.get("difficulty")),
+        DIFFICULTY_ORDER,
+    )
 
-    ordered = [label for label in DIFFICULTY_ORDER if label in by_difficulty]
-    extras = sorted(label for label in by_difficulty if label not in DIFFICULTY_ORDER)
-    return {label: bucket_metrics(by_difficulty[label]) for label in ordered + extras}
+
+def compute_breakdown_by_label(
+    results: list[dict[str, Any]],
+    label_fn,
+    order: list[str],
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        label = label_fn(result)
+        buckets.setdefault(label, []).append(result)
+
+    ordered = [label for label in order if label in buckets]
+    extras = sorted(label for label in buckets if label not in order)
+    return {label: bucket_metrics(buckets[label]) for label in ordered + extras}
+
+
+def compute_candidate_attempt_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    breakdown: dict[str, dict[str, int]] = {}
+    for label, (attempt_field, accepted_field) in CANDIDATE_LINEAGE_FIELDS.items():
+        breakdown[label] = {
+            "attempts": sum(numeric_count(result.get(attempt_field)) for result in results),
+            "accepted_steps": sum(
+                numeric_count(result.get(accepted_field)) for result in results
+            ),
+        }
+    return breakdown
 
 
 def compute_agent_curves(results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -630,6 +789,58 @@ def summarize_report(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "## Tier Breakdown",
+            "",
+        ]
+    )
+
+    for tier, bucket in report["tier_breakdown"].items():
+        lines.append(
+            f"- {tier}: attempted={bucket['attempted_cases']}, verified={bucket['verified_repairs']}, accepted={bucket['accepted_patches']}, false_greens={bucket['false_greens']}, verified_rate={bucket['verified_repair_rate']:.3f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Verifier-Class Breakdown",
+            "",
+        ]
+    )
+
+    for verifier_class, bucket in report["verifier_class_breakdown"].items():
+        lines.append(
+            f"- {verifier_class}: attempted={bucket['attempted_cases']}, verified={bucket['verified_repairs']}, accepted={bucket['accepted_patches']}, false_greens={bucket['false_greens']}, verified_rate={bucket['verified_repair_rate']:.3f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Candidate Lineage Breakdown",
+            "",
+        ]
+    )
+
+    for lineage, bucket in report["candidate_lineage_breakdown"].items():
+        lines.append(
+            f"- {lineage}: attempted={bucket['attempted_cases']}, verified={bucket['verified_repairs']}, accepted={bucket['accepted_patches']}, false_greens={bucket['false_greens']}, verified_rate={bucket['verified_repair_rate']:.3f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Candidate Lineage Attempts",
+            "",
+        ]
+    )
+
+    for lineage, bucket in report["candidate_attempt_breakdown"].items():
+        lines.append(
+            f"- {lineage}: attempts={bucket['attempts']}, accepted_steps={bucket['accepted_steps']}"
+        )
+
+    lines.extend(
+        [
+            "",
             "## Failure Attribution",
             "",
         ]
@@ -671,7 +882,7 @@ def summarize_report(report: dict[str, Any]) -> str:
     lines.extend(["", "## Case Results", ""])
     for result in report["results"]:
         lines.append(
-            f"- {result['case_id']} [{normalize_difficulty_label(result.get('difficulty'))}] @ {result['agent_count']} agents: outcome={result['outcome']}, verified_repair={result['verified_repair']}, false_green={result['false_green']}, total_cost_usd={result['total_cost_usd']}"
+            f"- {result['case_id']} [{normalize_difficulty_label(result.get('difficulty'))}/{result.get('tier', 'unknown')}/{result.get('verifier_class', 'unknown')}/{result.get('candidate_lineage', 'unknown')}] @ {result['agent_count']} agents: outcome={result['outcome']}, verified_repair={result['verified_repair']}, false_green={result['false_green']}, total_cost_usd={result['total_cost_usd']}"
         )
 
     lines.append("")
@@ -742,6 +953,8 @@ def build_runner_error_result(
     case: dict[str, Any],
     agent_count: int,
     keep_workspaces: bool,
+    suite_id: Optional[str],
+    manifest_path: Optional[Path],
     message: str,
     traceback_text: str,
 ) -> dict[str, Any]:
@@ -751,6 +964,8 @@ def build_runner_error_result(
         "case_title": case["title"],
         "case_path": case["path"],
         "difficulty": normalize_difficulty_label(case.get("difficulty")),
+        "tier": derive_tier(case, suite_id, manifest_path),
+        "verifier_class": classify_verifier_command(case.get("verifier_command")),
         "failure_stage": case["failure_stage"],
         "failure_class": case["failure_class"],
         "agent_count": agent_count,
@@ -779,6 +994,8 @@ def build_runner_error_result(
         "runner_error_message": message,
         "runner_error_traceback": traceback_text,
         **normalized_execution_diagnostics({}),
+        **normalized_candidate_lineage_counts({}),
+        "candidate_lineage": "unknown",
     }
 
 
@@ -815,6 +1032,30 @@ def build_report(
     ]
     repair_outcome_distribution = compute_repair_outcome_distribution(normalized_results)
     difficulty_breakdown = compute_difficulty_breakdown(normalized_results)
+    tier_breakdown = compute_breakdown_by_label(
+        normalized_results,
+        lambda result: normalize_tier_label(result.get("tier")),
+        TIER_ORDER,
+    )
+    verifier_class_breakdown = compute_breakdown_by_label(
+        normalized_results,
+        lambda result: (
+            result.get("verifier_class")
+            if isinstance(result.get("verifier_class"), str)
+            else "unknown"
+        ),
+        VERIFIER_CLASS_ORDER,
+    )
+    candidate_lineage_breakdown = compute_breakdown_by_label(
+        normalized_results,
+        lambda result: (
+            result.get("candidate_lineage")
+            if isinstance(result.get("candidate_lineage"), str)
+            else "unknown"
+        ),
+        CANDIDATE_LINEAGE_ORDER,
+    )
+    candidate_attempt_breakdown = compute_candidate_attempt_breakdown(normalized_results)
     failure_attribution = compute_failure_attribution(normalized_results)
     execution_diagnostics = compute_execution_diagnostics(normalized_results)
     speedup_curve, cost_curve = compute_agent_curves(normalized_results)
@@ -861,6 +1102,10 @@ def build_report(
         },
         "repair_outcome_distribution": repair_outcome_distribution,
         "difficulty_breakdown": difficulty_breakdown,
+        "tier_breakdown": tier_breakdown,
+        "verifier_class_breakdown": verifier_class_breakdown,
+        "candidate_lineage_breakdown": candidate_lineage_breakdown,
+        "candidate_attempt_breakdown": candidate_attempt_breakdown,
         "failure_attribution": failure_attribution,
         "execution_diagnostics": execution_diagnostics,
         "speedup_curve": speedup_curve,
@@ -873,12 +1118,15 @@ def evaluate_case(
     run_root: Path,
     case: dict[str, Any],
     agent_count: int,
+    suite_id: str,
     args: argparse.Namespace,
     api_key_env: str,
     env: dict[str, str],
 ) -> dict[str, Any]:
     workspace_root = case_workspace_root(run_root, case, agent_count)
     result_root = case_result_root(run_root, case, agent_count)
+    tier = derive_tier(case, suite_id, args.suite)
+    verifier_class = classify_verifier_command(case.get("verifier_command"))
     try:
         if workspace_root.exists():
             shutil.rmtree(workspace_root)
@@ -902,6 +1150,8 @@ def evaluate_case(
                 "case_title": case["title"],
                 "case_path": case["path"],
                 "difficulty": normalize_difficulty_label(case.get("difficulty")),
+                "tier": tier,
+                "verifier_class": verifier_class,
                 "failure_stage": case["failure_stage"],
                 "failure_class": case["failure_class"],
                 "agent_count": agent_count,
@@ -919,6 +1169,8 @@ def evaluate_case(
                 "candidate_workspace": None,
                 "workspace_preserved": args.keep_workspaces,
                 **normalized_execution_diagnostics({}),
+                **normalized_candidate_lineage_counts({}),
+                "candidate_lineage": "unknown",
             }
             write_json(result_root / "result.json", result)
             return result
@@ -1009,6 +1261,8 @@ def evaluate_case(
             "case_title": case["title"],
             "case_path": case["path"],
             "difficulty": normalize_difficulty_label(case.get("difficulty")),
+            "tier": tier,
+            "verifier_class": verifier_class,
             "failure_stage": case["failure_stage"],
             "failure_class": case["failure_class"],
             "agent_count": agent_count,
@@ -1020,6 +1274,7 @@ def evaluate_case(
             "false_green": false_green,
             "failure_attribution": failure_attribution,
             **normalized_execution_diagnostics(benchmark_run),
+            **normalized_candidate_lineage_counts(benchmark_run),
             "fix_exit_code": fix_result.get("exit_code"),
             "fix_timed_out": fix_result.get("timed_out"),
             "fix_duration_ms": int(benchmark_run.get("duration_ms") or fix_result["duration_ms"]),
@@ -1040,6 +1295,7 @@ def evaluate_case(
             else None,
             "workspace_preserved": args.keep_workspaces,
         }
+        result["candidate_lineage"] = candidate_lineage_label(result)
         write_json(result_root / "result.json", result)
         return result
     finally:
@@ -1274,13 +1530,23 @@ def main() -> int:
                     )
                     continue
             try:
-                result = evaluate_case(run_root, case, agent_count, args, api_key_env, env)
+                result = evaluate_case(
+                    run_root,
+                    case,
+                    agent_count,
+                    manifest["suite_id"],
+                    args,
+                    api_key_env,
+                    env,
+                )
             except Exception as exc:
                 result_root.mkdir(parents=True, exist_ok=True)
                 result = build_runner_error_result(
                     case,
                     agent_count,
                     args.keep_workspaces,
+                    manifest["suite_id"],
+                    args.suite,
                     str(exc),
                     traceback.format_exc(),
                 )

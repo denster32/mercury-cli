@@ -27,5 +27,5 @@ Current truth:
 - the repo includes checked-in machine-readable quality and agent-sweep aggregates plus the rendered markdown report for the exact run ids documented in `rust-v0-repair-benchmark.md`
 - the published numbers are limited to the Tier 1 Rust beta lane in `evals/v0/tier1-manifest.json` and exact run ids documented in `rust-v0-repair-benchmark.md`
 - the public JSON aggregates intentionally omit local run roots, candidate workspace paths, and API-key env metadata
-- the public report documents the false-green policy, repair outcome distribution, and execution diagnostics alongside the quality and `--max-agents` tables
+- the public report documents the false-green policy, repair outcome distribution, tier breakdowns, verifier-class breakdowns for `cargo test`, `cargo check`, and `cargo clippy`, candidate lineage breakdowns, failure attribution, and execution diagnostics alongside the quality and `--max-agents` tables
 - the publication should be read as scoped evidence for the Tier 1 Rust beta lane rather than broad repair-quality proof or TypeScript parity

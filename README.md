@@ -1,8 +1,8 @@
 # Mercury CLI
 
-Mercury CLI is a Rust-first Mercury-native CI auto-repair tool for teams using Inception Labs models.
+Mercury CLI is a Rust direct cargo verifier repair beta for teams using Inception Labs models.
 
-The current branch is aligned to the Mercury CLI `1.0.0-beta.1` pre-release runtime surface. The real product wedge today is Rust-first repair: local `watch --repair` is for supported direct Rust verifier commands, while `fix` and the GitHub repair workflow are productized around direct allowlisted Rust verifier commands and the checked-in Tier 1 benchmark lane at `evals/v0/tier1-manifest.json`. TypeScript remains a frozen experimental lane for selected direct verifier commands; it currently relies on token-aware repository scanning and failure parsing rather than a real TypeScript parser, so it should not be read as parity with Rust repair quality. Artifact bundles, phased candidate fanout via `fix --max-agents N`, `status --live` runtime events, verifier allowlisting, audit logs, and output redaction are implemented. Candidate verification isolation is repo-copy/worktree based under `.mercury/worktrees/` (not a stronger process/container sandbox claim). `.github/workflows/repair.yml` only opens or updates draft PRs for verified repairs when `dry_run=false` and same-repo write permissions are available.
+The current branch is aligned to the Mercury CLI `1.0.0-beta.1` pre-release runtime surface. The real product wedge today is Rust-first repair: local `watch --repair` is for supported direct Rust verifier commands, while `fix` and the GitHub repair workflow are productized around direct allowlisted Rust verifier commands and the checked-in Tier 1 benchmark lane at `evals/v0/tier1-manifest.json`. In practice, that means `cargo test`, `cargo check`, and `cargo clippy` are the supported verifier classes for the current beta story. TypeScript remains a frozen experimental lane for selected direct verifier commands; it currently relies on token-aware repository scanning and failure parsing rather than a real TypeScript parser, so it should not be read as parity with Rust repair quality. Artifact bundles, phased candidate fanout via `fix --max-agents N`, `status --live` runtime events, verifier allowlisting, audit logs, and output redaction are implemented. Candidate verification isolation is repo-copy/worktree based under `.mercury/worktrees/` (not a stronger process/container sandbox claim). `.github/workflows/repair.yml` only opens or updates draft PRs for verified repairs when `dry_run=false` and same-repo write permissions are available.
 
 ## Install
 
@@ -53,6 +53,7 @@ What a good current run should leave behind:
 
 - a final watch decision printed to the terminal
 - an artifact bundle path under `.mercury/runs/`
+- `summary-index.json` as the top-level local run entrypoint
 - `watch.json` plus the watched command's stdout and stderr
 - copied repair artifacts when Mercury applies a fix attempt
 - no partial writes from rejected candidates
@@ -68,8 +69,12 @@ Important limits:
 
 Reproducible repo-backed walkthroughs:
 
+- [Operator quickstart](docs/operator-quickstart.md)
 - [Local red -> green watch-repair flow](docs/case-studies/local-red-to-green.md)
 - [CI-oriented repair to draft PR flow](docs/case-studies/ci-draft-pr-flow.md)
+- [Starter repos](starter-repos/README.md)
+- [Local Rust watch-repair starter repo](starter-repos/local-rust-watch-repair/README.md)
+- [CI draft-PR repair starter repo](starter-repos/ci-draft-pr-repair/README.md)
 
 ## Capability Matrix
 
@@ -81,7 +86,7 @@ Examples below assume you built from source in this repo, so command invocations
 | `./target/release/mercury-cli plan <goal>` | Available | Produces a structured repair plan and thermal assessments. |
 | `./target/release/mercury-cli ask <query>` | Available | Repo-aware Mercury 2 Q&A. |
 | `./target/release/mercury-cli status [--heatmap] [--agents] [--budget]` | Available | Reports thermal state and scheduler metadata. |
-| `./target/release/mercury-cli status --live [--interval-ms N]` | Available | Streams candidate, phase, and runtime events in a TTY dashboard and emits JSONL event records when piped. |
+| `./target/release/mercury-cli status --live [--interval-ms N]` | Available | Streams candidate, phase, and runtime events in a TTY dashboard and emits JSONL event records when piped, including winner/loss/suppression explanations from persisted candidate metadata. |
 | `./target/release/mercury-cli edit apply` | Available | Concrete Mercury Edit apply surface for replacement snippets or patch content. It is not an instruction-driven repair endpoint. |
 | `./target/release/mercury-cli edit complete` | Available | Completion-style Mercury Edit request for a file or cursor location. |
 | `./target/release/mercury-cli edit next` | Available | Next-edit prediction using current file state plus focused cursor and recent-snippet context. |
@@ -96,7 +101,7 @@ Examples below assume you built from source in this repo, so command invocations
 | Manual CI-to-draft-PR handoff | Documented workflow | The repo includes a case study for publishing artifacts and opening a draft PR after a verified local or CI reproduction. |
 | GitHub Action repair workflow | Available with limits | The `Mercury CI Auto-Repair Draft PR` workflow in `.github/workflows/repair.yml` reproduces a failure in isolation, runs Mercury repair for direct allowlisted Rust verifier commands and the frozen experimental TypeScript verifier lane when baseline is red and an API key is present, uploads artifacts for every terminal status, and opens or updates a draft PR only when repair is verified, `dry_run=false`, and the workflow can push to the same repository. Verified reruns targeting the same base ref and failure command reuse the same repair branch/PR head instead of minting a new branch name per run. Use `dry_run` when you want the evidence bundle without branch or PR mutation. |
 | Eval corpus | Available | `evals/v0/manifest.json` is the 50-case Rust baseline corpus, `evals/v0/tier1-manifest.json` is the 35-case Tier 1 Rust repair beta lane, and `evals/v1_typescript/manifest.json` is the 50-case frozen experimental TypeScript baseline harness. The TypeScript corpus is baseline coverage, not parser-backed repair-parity evidence. |
-| Published repair benchmark report | Available with scoped evidence | `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json` are generated by `evals/repair_benchmark/publish.py` from aggregate runner outputs. Those checked-in numbers are the product truth for the Tier 1 Rust beta lane at `evals/v0/tier1-manifest.json`, including repair outcome distribution and execution diagnostics for misses. |
+| Published repair benchmark report | Available with scoped evidence | `docs/benchmarks/rust-v0-repair-benchmark.md`, `docs/benchmarks/rust-v0-quality.report.json`, and `docs/benchmarks/rust-v0-agent-sweep.report.json` are generated by `evals/repair_benchmark/publish.py` from aggregate runner outputs. Those checked-in numbers are the product truth for the Tier 1 Rust beta lane at `evals/v0/tier1-manifest.json`, including repair outcome distribution, tier breakdowns, separate `cargo test`/`cargo check`/`cargo clippy` verifier-class tables, candidate lineage breakdowns, failure attribution, and execution diagnostics for misses. |
 | `./target/release/mercury-cli fix --max-agents N` | Available with scoped benchmark evidence | Materially changes phased runtime dispatch with real parallel candidate execution and isolated candidate fanout. `docs/benchmarks/` publishes representative runtime and cost curves for `--max-agents 1,2,4,8` on the Tier 1 Rust beta lane, but those exact runs should not be treated as a broad convergence or repair-quality claim beyond the checked-in corpus and run ids. |
 | Generic workflow DSL / `agent run` | Out of scope for tagged 1.0.0 GA | Intentionally deferred until the repair workflow is stronger. |
 
@@ -136,6 +141,7 @@ Repair runs are expected to leave behind an artifact bundle under `.mercury/runs
 
 A successful watch-repair cycle in the current `1.0.0-beta.1` pre-release runtime should leave enough evidence to replay the decision:
 
+- `summary-index.json` with the top-level decision, headline, failure reason rollup, candidate lineage counts, winning candidates when a repair was accepted, and pointers to the most important bundle files
 - `watch.json` with the watched command, decision, timestamps, and repair record
 - `initial.stdout.txt` and `initial.stderr.txt` from the failing command
 - `initial.failure.json` when a structured failure parse is available for the initial command result
@@ -147,6 +153,7 @@ A successful watch-repair cycle in the current `1.0.0-beta.1` pre-release runtim
 
 For direct `./target/release/mercury-cli fix` runs, the run bundle also includes:
 
+- `summary-index.json` as the operator-first summary for the fix bundle
 - `plan.json` and `assessments.json`
 - `execution-summary.json` and `final-verification.json` when final verification ran
 - `agent-logs.json` and `thermal-aggregates.json`
@@ -158,6 +165,8 @@ For direct `./target/release/mercury-cli fix` runs, the run bundle also includes
 For the `Mercury CI Auto-Repair Draft PR` workflow, the uploaded evidence bundle includes:
 
 - `summary.md`, `decision.json`, `environment.json`, and `pr-body.md`
+- `summary.md` now includes the nested Mercury run headline, failure reason rollup, candidate lineage, and winning candidate summary when a nested repair bundle was captured
+- `decision.json` mirrors those nested Mercury run highlights under `mercury_run`
 - `repair.diff`, `repair.diffstat.txt`, and `git-status.txt`
 - `logs/baseline.stdout.log` and `logs/baseline.stderr.log`
 - `logs/repair.stdout.log`, `logs/repair.stderr.log`, `logs/post-repair.stdout.log`, and `logs/post-repair.stderr.log` when a repair attempt ran
@@ -198,7 +207,7 @@ What that means today:
 
 What it does not mean yet:
 
-- the checked-in Rust benchmark reports under `docs/benchmarks/` are intentionally narrow: they cover the Tier 1 Rust beta manifest, the exact run ids listed there, and the execution diagnostics emitted for those misses, not a universal repair-quality claim
+- the checked-in Rust benchmark reports under `docs/benchmarks/` are intentionally narrow: they cover the Tier 1 Rust beta manifest, the exact run ids listed there, and the published repair outcome, tier, verifier-class, candidate-lineage, failure-attribution, and execution-diagnostics slices for that lane, not a universal repair-quality claim
 - TypeScript harness pass/fail proves baseline fixture contract only; it is supportive evidence for a frozen experimental lane built on token-aware scanning and failure parsing, not a standalone end-to-end TypeScript repair quality benchmark
 - you should treat these corpora as evaluation scaffolding, not finished market-grade benchmark reporting
 
@@ -223,7 +232,7 @@ What it does not mean yet:
 - frozen experimental TypeScript support for token-aware repo mapping/symbol extraction, failure parsing, and selected direct verifier commands in `fix` and CI repair paths
 - official release archives for macOS arm64 and Linux x86_64
 - manual or workflow-driven promotion of a verified run into a draft PR
-- checked-in Rust benchmark evidence under `docs/benchmarks/` with scrubbed machine-readable aggregates, repair outcome distribution, execution diagnostics, and published `--max-agents` curves for the current Tier 1 corpus
+- checked-in Rust benchmark evidence under `docs/benchmarks/` with scrubbed machine-readable aggregates, repair outcome distribution, tier and verifier-class breakdowns, candidate lineage slices, execution diagnostics, and published `--max-agents` curves for the current Tier 1 corpus
 - documented limits for incomplete surfaces
 
 ## Preview and Roadmap

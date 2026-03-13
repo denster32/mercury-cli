@@ -669,6 +669,14 @@ pub struct StepExecutionSummary {
     pub safety_failures: usize,
     pub candidate_verification_failures: usize,
     pub final_bundle_failures: usize,
+    pub apply_edit_attempts: usize,
+    pub grounded_next_edit_attempts: usize,
+    pub critique_retry_attempts: usize,
+    pub exploratory_next_edit_attempts: usize,
+    pub apply_edit_accepted_steps: usize,
+    pub grounded_next_edit_accepted_steps: usize,
+    pub critique_retry_accepted_steps: usize,
+    pub exploratory_next_edit_accepted_steps: usize,
     pub retry_attempts: usize,
     pub time_to_first_candidate_ms: Option<u64>,
     pub time_to_verified_repair_ms: Option<u64>,
@@ -683,6 +691,40 @@ impl StepExecutionSummary {
         self.accepted + self.rejected
     }
 
+    fn record_candidate_attempt(&mut self, source: CandidateSource) {
+        match source {
+            CandidateSource::ApplyEdit => {
+                self.apply_edit_attempts += 1;
+            }
+            CandidateSource::GroundedNextEdit => {
+                self.grounded_next_edit_attempts += 1;
+            }
+            CandidateSource::CritiqueRetry => {
+                self.critique_retry_attempts += 1;
+            }
+            CandidateSource::ExploratoryNextEdit => {
+                self.exploratory_next_edit_attempts += 1;
+            }
+        }
+    }
+
+    fn record_accepted_candidate(&mut self, source: CandidateSource) {
+        match source {
+            CandidateSource::ApplyEdit => {
+                self.apply_edit_accepted_steps += 1;
+            }
+            CandidateSource::GroundedNextEdit => {
+                self.grounded_next_edit_accepted_steps += 1;
+            }
+            CandidateSource::CritiqueRetry => {
+                self.critique_retry_accepted_steps += 1;
+            }
+            CandidateSource::ExploratoryNextEdit => {
+                self.exploratory_next_edit_accepted_steps += 1;
+            }
+        }
+    }
+
     fn merge(&mut self, other: StepExecutionSummary) {
         self.accepted += other.accepted;
         self.rejected += other.rejected;
@@ -691,6 +733,14 @@ impl StepExecutionSummary {
         self.safety_failures += other.safety_failures;
         self.candidate_verification_failures += other.candidate_verification_failures;
         self.final_bundle_failures += other.final_bundle_failures;
+        self.apply_edit_attempts += other.apply_edit_attempts;
+        self.grounded_next_edit_attempts += other.grounded_next_edit_attempts;
+        self.critique_retry_attempts += other.critique_retry_attempts;
+        self.exploratory_next_edit_attempts += other.exploratory_next_edit_attempts;
+        self.apply_edit_accepted_steps += other.apply_edit_accepted_steps;
+        self.grounded_next_edit_accepted_steps += other.grounded_next_edit_accepted_steps;
+        self.critique_retry_accepted_steps += other.critique_retry_accepted_steps;
+        self.exploratory_next_edit_accepted_steps += other.exploratory_next_edit_accepted_steps;
         self.retry_attempts += other.retry_attempts;
         self.time_to_first_candidate_ms = merge_min_duration(
             self.time_to_first_candidate_ms,
@@ -1236,6 +1286,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     for outcome in outcomes {
         let outcome = outcome?;
         summary.retry_attempts += outcome.retry_attempts;
+        summary.record_candidate_attempt(outcome.source);
         if outcome.candidate.is_some() {
             verified_candidates.push(outcome);
         } else {
@@ -1307,11 +1358,12 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     rank_candidate_outcomes(&mut ranked_candidates);
     let (ranked_candidates, duplicate_candidates) =
         split_duplicate_state_candidates(ranked_candidates);
+    let suppressed_duplicate_candidates = duplicate_candidates.len();
     for duplicate in duplicate_candidates {
         summary.rejected += 1;
         let metadata = serde_json::json!({
             "outcome":"rejected",
-            "reason":"duplicate verified candidate output",
+            "reason": duplicate_suppression_reason(),
             "sandbox_root": duplicate.sandbox_root.display().to_string(),
             "candidate_source": duplicate.source.as_str(),
             "retry_attempts": duplicate.retry_attempts,
@@ -1332,12 +1384,18 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
 
     let mut ranked_iter = ranked_candidates.into_iter();
     let winner = if let Some(winner) = ranked_iter.next() {
+        let competing_verified_candidates = ranked_iter.len();
+        let winner_reason = winner_selection_reason(
+            competing_verified_candidates,
+            suppressed_duplicate_candidates,
+        );
         let accepted = winner
             .candidate
             .as_ref()
             .cloned()
             .expect("verified candidate must carry content");
         summary.accepted += 1;
+        summary.record_accepted_candidate(winner.source);
         if summary.time_to_first_candidate_ms.is_none() {
             summary.time_to_first_candidate_ms =
                 Some(context.started_at.elapsed().as_millis() as u64);
@@ -1345,6 +1403,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
 
         let winner_metadata = serde_json::json!({
             "outcome":"accepted",
+            "reason": winner_reason,
             "sandbox_root": winner.sandbox_root.display().to_string(),
             "candidate_source": winner.source.as_str(),
             "retry_attempts": winner.retry_attempts,
@@ -1366,7 +1425,7 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             summary.rejected += 1;
             let metadata = serde_json::json!({
                 "outcome":"rejected",
-                "reason":"lower-ranked competing candidate",
+                "reason": losing_selection_reason(&winner),
                 "sandbox_root": loser.sandbox_root.display().to_string(),
                 "candidate_source": loser.source.as_str(),
                 "retry_attempts": loser.retry_attempts,
@@ -2213,6 +2272,43 @@ fn split_duplicate_state_candidates(
     }
 
     (unique_candidates, duplicate_candidates)
+}
+
+fn winner_selection_reason(
+    competing_verified_candidates: usize,
+    suppressed_duplicate_candidates: usize,
+) -> String {
+    let mut reason = if competing_verified_candidates == 0 {
+        "only surviving verified candidate".to_string()
+    } else {
+        format!(
+            "highest-ranked verified candidate over {competing_verified_candidates} competing verified candidate{}",
+            if competing_verified_candidates == 1 { "" } else { "s" }
+        )
+    };
+    if suppressed_duplicate_candidates > 0 {
+        reason.push_str(&format!(
+            "; suppressed {suppressed_duplicate_candidates} duplicate verified output{}",
+            if suppressed_duplicate_candidates == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    reason
+}
+
+fn duplicate_suppression_reason() -> &'static str {
+    "duplicate verified candidate output; identical verified state already kept from a higher-ranked candidate"
+}
+
+fn losing_selection_reason(winner: &CandidateOutcome) -> String {
+    format!(
+        "lost selection to higher-ranked verified candidate {} from {}",
+        winner.agent_id,
+        winner.source.as_str()
+    )
 }
 
 fn phase_temperature(phase: thermal::ExecutionPhase) -> f64 {

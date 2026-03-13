@@ -1,0 +1,37 @@
+name: Mercury Repair Draft PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      failure_command:
+        description: Direct Rust verifier command expected to be red before repair.
+        required: false
+        default: cargo test --all-features --verbose
+        type: string
+      repair_goal:
+        description: Advisory repair goal passed into the Mercury fix flow.
+        required: false
+        default: Repair the failing Rust verifier and keep the change reviewable
+        type: string
+      dry_run:
+        description: Upload evidence without attempting branch push or draft PR mutation.
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  repair:
+    uses: denster32/mercury-cli/.github/workflows/repair.yml@v1.0.0-beta.1
+    with:
+      failure_command: ${{ inputs.failure_command }}
+      repair_goal: ${{ inputs.repair_goal }}
+      base_ref: ${{ github.ref_name }}
+      dry_run: ${{ inputs.dry_run }}
+      max_agents: 8
+      max_cost: 0.25
+    secrets: inherit

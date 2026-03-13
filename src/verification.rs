@@ -18,6 +18,7 @@ use crate::failure_parser::{
     is_env_assignment, parse_command_parts, parse_verifier_failure, repo_native_tool_surface,
     ParsedFailureReport, RepoNativeTool, VerifierCommandKind,
 };
+use crate::repo::{self, RepoRelativePath};
 
 pub const GROUNDED_REPAIR_CONTEXT_SCHEMA_NAME: &str = "grounded-repair-context-v1";
 pub const READ_FILE_TOOL: &str = "read_file";
@@ -351,9 +352,13 @@ fn injected_verifier_env(invocation: &VerifierInvocation) -> Vec<(String, String
 }
 
 fn verifier_isolation_mode(project_root: &Path, workspace_root: &Path) -> &'static str {
-    match (normalize_path(project_root), normalize_path(workspace_root)) {
-        (Ok(project), Ok(workspace)) if project == workspace => "project_root",
-        _ => "repo_copy",
+    let project = fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let workspace =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    if project == workspace {
+        "project_root"
+    } else {
+        "repo_copy"
     }
 }
 
@@ -616,6 +621,9 @@ pub enum VerificationError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
+    #[error(transparent)]
+    Repo(#[from] repo::RepoError),
+
     #[error("grounding failed: {0}")]
     Grounding(String),
 }
@@ -647,7 +655,7 @@ pub async fn gather_grounded_repair_context<A: Mercury2Api>(
         .collect::<Vec<_>>();
     let workspace_root = create_grounding_workspace(project_root)?;
     let _cleanup = CleanupPath(workspace_root.clone());
-    copy_project_tree(project_root, &workspace_root, project_root)?;
+    repo::copy_filtered_repo_tree(project_root, &workspace_root)?;
 
     let executor = RepoToolExecutor::new(project_root, &workspace_root);
     let system_prompt = grounding_system_prompt();
@@ -811,10 +819,11 @@ impl RepoToolExecutor {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing path".to_string())?;
-        let resolved = self.resolve_workspace_path(path)?;
+        let relative = self.parse_repo_relative_path(path)?;
+        let resolved = self.resolve_workspace_path(&relative)?;
         let content = fs::read_to_string(&resolved).map_err(|err| err.to_string())?;
         Ok(json!({
-            "path": normalized_relative(&self.workspace_root, &resolved),
+            "path": relative.as_str(),
             "content": content,
         }))
     }
@@ -932,13 +941,14 @@ impl RepoToolExecutor {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing content".to_string())?;
-        let resolved = self.resolve_workspace_path(path)?;
+        let relative = self.parse_repo_relative_path(path)?;
+        let resolved = self.resolve_workspace_path(&relative)?;
         if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
         fs::write(&resolved, content).map_err(|err| err.to_string())?;
         Ok(json!({
-            "path": normalized_relative(&self.workspace_root, &resolved),
+            "path": relative.as_str(),
             "bytes_written": content.len(),
         }))
     }
@@ -946,10 +956,13 @@ impl RepoToolExecutor {
     fn git_diff(&self, args: &Value) -> Result<Value, String> {
         let path = args.get("path").and_then(Value::as_str);
         let (left, right) = match path {
-            Some(relative) if !relative.is_empty() => (
-                self.resolve_project_path(relative)?,
-                self.resolve_workspace_path(relative)?,
-            ),
+            Some(relative) if !relative.is_empty() => {
+                let relative = self.parse_repo_relative_path(relative)?;
+                (
+                    self.resolve_project_path(&relative)?,
+                    self.resolve_workspace_path(&relative)?,
+                )
+            }
             _ => (self.project_root.clone(), self.workspace_root.clone()),
         };
 
@@ -981,17 +994,25 @@ impl RepoToolExecutor {
             fs::remove_dir_all(&self.workspace_root).map_err(|err| err.to_string())?;
         }
         fs::create_dir_all(&self.workspace_root).map_err(|err| err.to_string())?;
-        copy_project_tree(&self.project_root, &self.workspace_root, &self.project_root)
+        repo::copy_filtered_repo_tree(&self.project_root, &self.workspace_root)
             .map_err(|err| err.to_string())?;
         Ok(json!({"workspace_root": self.workspace_root.display().to_string()}))
     }
 
-    fn resolve_workspace_path(&self, relative: &str) -> Result<PathBuf, String> {
-        resolve_relative_path(&self.workspace_root, relative)
+    fn parse_repo_relative_path(&self, relative: &str) -> Result<RepoRelativePath, String> {
+        RepoRelativePath::new(relative).map_err(|err| err.to_string())
     }
 
-    fn resolve_project_path(&self, relative: &str) -> Result<PathBuf, String> {
-        resolve_relative_path(&self.project_root, relative)
+    fn resolve_workspace_path(&self, relative: &RepoRelativePath) -> Result<PathBuf, String> {
+        relative
+            .resolve_under(&self.workspace_root)
+            .map_err(|err| err.to_string())
+    }
+
+    fn resolve_project_path(&self, relative: &RepoRelativePath) -> Result<PathBuf, String> {
+        relative
+            .resolve_under(&self.project_root)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -1258,38 +1279,6 @@ fn parse_env_assignment(part: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), value.to_string()))
 }
 
-fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
-    let candidate = root.join(relative);
-    let normalized = normalize_path(&candidate)?;
-    let normalized_root = normalize_path(root)?;
-    if !normalized.starts_with(&normalized_root) {
-        return Err(format!("path escapes workspace: {relative}"));
-    }
-    Ok(normalized)
-}
-
-fn normalize_path(path: &Path) -> Result<PathBuf, String> {
-    let mut normalized = if path.is_absolute() {
-        PathBuf::new()
-    } else {
-        std::env::current_dir().map_err(|err| err.to_string())?
-    };
-
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(format!("failed to normalize path: {}", path.display()));
-                }
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-
-    Ok(normalized)
-}
-
 fn normalized_relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -1317,45 +1306,6 @@ fn parse_ripgrep_match(line: &str, workspace_root: &Path) -> Option<Value> {
         "column": column,
         "text": text,
     }))
-}
-
-fn copy_project_tree(source: &Path, destination: &Path, root: &Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let relative = source_path
-            .strip_prefix(root)
-            .unwrap_or(source_path.as_path());
-
-        if should_skip_copy(relative) {
-            continue;
-        }
-
-        let destination_path = destination.join(relative);
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            fs::create_dir_all(&destination_path)?;
-            copy_project_tree(&source_path, destination, root)?;
-        } else if metadata.is_file() {
-            if let Some(parent) = destination_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(&source_path, &destination_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn should_skip_copy(relative: &Path) -> bool {
-    let relative = relative.to_string_lossy();
-    relative == ".git"
-        || relative.starts_with(".git/")
-        || relative == "target"
-        || relative.starts_with("target/")
-        || relative == ".mercury/worktrees"
-        || relative.starts_with(".mercury/worktrees/")
-        || relative == ".mercury/runs"
-        || relative.starts_with(".mercury/runs/")
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -1480,7 +1430,7 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
-        copy_project_tree(&project_root, &workspace_root, &project_root).unwrap();
+        repo::copy_filtered_repo_tree(&project_root, &workspace_root).unwrap();
 
         let executor = RepoToolExecutor::new(&project_root, &workspace_root);
         let write = executor.execute_named(
@@ -1512,6 +1462,123 @@ mod tests {
         assert!(rollback.success);
         let reset = fs::read_to_string(workspace_root.join("src/lib.rs")).unwrap();
         assert!(reset.contains("i32 { 1 }"));
+    }
+
+    fn invalid_file_tool_args(tool: &str, path: &str) -> Value {
+        match tool {
+            READ_FILE_TOOL => json!({ "path": path }),
+            APPLY_PATCH_TEMP_TOOL => json!({ "path": path, "content": "fn patched() {}\n" }),
+            GIT_DIFF_TOOL => json!({ "path": path }),
+            other => panic!("unsupported file tool in test: {other}"),
+        }
+    }
+
+    fn assert_invalid_repo_path_rejected(
+        executor: &RepoToolExecutor,
+        tool: &str,
+        path: &str,
+        expected_reason: &str,
+    ) {
+        let result = executor.execute_named(None, tool, invalid_file_tool_args(tool, path));
+        assert!(
+            !result.success,
+            "expected {tool} to reject path {path}, got {:?}",
+            result.output
+        );
+        assert!(
+            result.output["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected_reason),
+            "expected {tool} error for {path} to mention {expected_reason}, got {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn repo_tool_executor_rejects_invalid_repo_paths_for_file_tools() {
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(project_root.join("src")).unwrap();
+        fs::write(
+            project_root.join("src/lib.rs"),
+            "pub fn stable() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        repo::copy_filtered_repo_tree(&project_root, &workspace_root).unwrap();
+
+        let executor = RepoToolExecutor::new(&project_root, &workspace_root);
+        for tool in [READ_FILE_TOOL, APPLY_PATCH_TEMP_TOOL, GIT_DIFF_TOOL] {
+            assert_invalid_repo_path_rejected(
+                &executor,
+                tool,
+                "../../etc/passwd",
+                "parent-directory traversal is not allowed",
+            );
+            assert_invalid_repo_path_rejected(
+                &executor,
+                tool,
+                "/tmp/file",
+                "absolute paths are not allowed",
+            );
+            assert_invalid_repo_path_rejected(
+                &executor,
+                tool,
+                r"C:\temp\file.rs",
+                "absolute Windows paths are not allowed",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn repo_tool_executor_rejects_symlink_escape_targets_for_file_tools() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let workspace_root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, project_root.join("escape")).unwrap();
+        symlink(&outside, workspace_root.join("escape")).unwrap();
+
+        let executor = RepoToolExecutor::new(&project_root, &workspace_root);
+        for tool in [READ_FILE_TOOL, APPLY_PATCH_TEMP_TOOL, GIT_DIFF_TOOL] {
+            assert_invalid_repo_path_rejected(
+                &executor,
+                tool,
+                "escape/file.rs",
+                "symlink escapes the repository root",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rollback_candidate_rejects_symlink_escape_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let workspace_root = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, project_root.join("escape")).unwrap();
+
+        let executor = RepoToolExecutor::new(&project_root, &workspace_root);
+        let rollback = executor.execute_named(None, ROLLBACK_CANDIDATE_TOOL, json!({}));
+        assert!(!rollback.success);
+        assert!(rollback.output["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("symlink escapes the repository root"));
     }
 
     #[test]
@@ -1554,7 +1621,7 @@ members = []
         )
         .unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
-        copy_project_tree(&project_root, &workspace_root, &project_root).unwrap();
+        repo::copy_filtered_repo_tree(&project_root, &workspace_root).unwrap();
 
         let executor = RepoToolExecutor::new(&project_root, &workspace_root);
         let result = executor.execute_named(
@@ -1604,7 +1671,7 @@ fn leaks_secret() {
         )
         .unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
-        copy_project_tree(&project_root, &workspace_root, &project_root).unwrap();
+        repo::copy_filtered_repo_tree(&project_root, &workspace_root).unwrap();
 
         let prior = env::var("INCEPTION_API_KEY").ok();
         // SAFETY: the test holds ENV_LOCK for the full mutation window, serializing

@@ -51,6 +51,57 @@ These numbers apply only to the Tier 1 Rust beta lane and the exact run ids list
 | easy | 36 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=20, no_patch=16 |
 | medium | 4 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=2, no_patch=2 |
 
+## Tier Breakdown
+
+### Quality report
+
+| tier | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+
+### Agent-sweep report
+
+| tier | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+
+## Verifier-Class Breakdown
+
+### Quality report
+
+| verifier class | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+
+### Agent-sweep report
+
+| verifier class | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+
+## Candidate Lineage Breakdown
+
+### Quality report
+
+| candidate lineage | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 35 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=27, no_patch=8 |
+
+### Agent-sweep report
+
+| candidate lineage | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| unknown | 40 | 0 | 0 | 0 | 0.000 | 0.000 | 0.000 | fix_failed=22, no_patch=18 |
+
+## Candidate Lineage Attempts
+
+| candidate lineage | quality attempts | quality accepted steps | agent-sweep attempts | agent-sweep accepted steps |
+| --- | ---: | ---: | ---: | ---: |
+| apply_edit | 0 | 0 | 0 | 0 |
+| grounded_next_edit | 0 | 0 | 0 | 0 |
+| critique_retry | 0 | 0 | 0 | 0 |
+| exploratory_next_edit | 0 | 0 | 0 | 0 |
+
 ## Failure Attribution
 
 | failure attribution | quality count | agent-sweep count |

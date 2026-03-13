@@ -401,6 +401,63 @@ async fn same_file_steps_patch_from_latest_accepted_state() {
 }
 
 #[tokio::test]
+async fn rejected_same_file_retry_does_not_erase_earlier_accepted_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_root = temp.path();
+    let target_file = write_sample_file(project_root, "pub const A: i32 = 1;\n");
+
+    let plan = ExecutionPlan {
+        steps: vec![
+            PlanStep {
+                file_path: RepoRelativePath::new("sample.rs").unwrap(),
+                instruction: "REPLACE:pub const A: i32 = 2;\npub const B: i32 = 3;\n".to_string(),
+                priority: 1.0,
+                estimated_tokens: 64,
+            },
+            PlanStep {
+                file_path: RepoRelativePath::new("sample.rs").unwrap(),
+                instruction: "REPLACE:pub const A: i32 =\n".to_string(),
+                priority: 0.75,
+                estimated_tokens: 64,
+            },
+            PlanStep {
+                file_path: RepoRelativePath::new("sample.rs").unwrap(),
+                instruction: "APPEND:pub fn total() -> i32 { A + B }\n".to_string(),
+                priority: 0.5,
+                estimated_tokens: 64,
+            },
+        ],
+        constitutional_prompt: String::new(),
+        estimated_cost: 0.0,
+        estimated_tokens: None,
+    };
+
+    let db = mercury_cli::db::ThermalDb::in_memory().unwrap();
+    let patcher = Patcher::new(ScriptedEditApi);
+    let verifier = make_verifier();
+    let scheduler = make_scheduler();
+    let summary = execute_plan_steps(
+        &plan,
+        &patcher,
+        &verifier,
+        &scheduler,
+        &db,
+        project_root,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.accepted, 2);
+    assert!(summary.rejected >= 1);
+    let final_content = fs::read_to_string(target_file).unwrap();
+    assert!(final_content.contains("pub const A: i32 = 2;"));
+    assert!(final_content.contains("pub const B: i32 = 3;"));
+    assert!(final_content.contains("pub fn total() -> i32 { A + B }"));
+    assert!(!final_content.contains("pub const A: i32 =\n"));
+}
+
+#[tokio::test]
 async fn rejected_runs_never_dirty_the_user_worktree() {
     let temp = tempfile::tempdir().unwrap();
     let project_root = temp.path();

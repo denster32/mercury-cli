@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -15,6 +16,16 @@ QUALITY_REPORT_NAME = "rust-v0-quality.report.json"
 AGENT_SWEEP_REPORT_NAME = "rust-v0-agent-sweep.report.json"
 PENDING_STATUS = "pending first checked-in secret-backed Tier 1 Rust beta run."
 DIFFICULTY_ORDER = ["easy", "medium", "hard", "unknown"]
+TIER_ORDER = ["tier0", "tier1", "tier2", "unknown"]
+VERIFIER_CLASS_ORDER = ["cargo_test", "cargo_check", "cargo_clippy", "unknown"]
+CANDIDATE_LINEAGE_ORDER = [
+    "apply_edit",
+    "grounded_next_edit",
+    "critique_retry",
+    "exploratory_next_edit",
+    "mixed",
+    "unknown",
+]
 FAILURE_ATTRIBUTION_ORDER = [
     "baseline_not_reproduced",
     "missing_benchmark_run",
@@ -35,6 +46,21 @@ EXECUTION_DIAGNOSTIC_FIELDS = [
     "candidate_verification_failures",
     "final_bundle_failures",
 ]
+CANDIDATE_LINEAGE_FIELDS = {
+    "apply_edit": ("apply_edit_attempts", "apply_edit_accepted_steps"),
+    "grounded_next_edit": (
+        "grounded_next_edit_attempts",
+        "grounded_next_edit_accepted_steps",
+    ),
+    "critique_retry": ("critique_retry_attempts", "critique_retry_accepted_steps"),
+    "exploratory_next_edit": (
+        "exploratory_next_edit_attempts",
+        "exploratory_next_edit_accepted_steps",
+    ),
+}
+CANDIDATE_ATTEMPT_FIELDS = [fields[0] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
+CANDIDATE_ACCEPTED_FIELDS = [fields[1] for fields in CANDIDATE_LINEAGE_FIELDS.values()]
+TIER_PATTERN = re.compile(r"tier[\s:_-]*([012])", re.IGNORECASE)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -70,22 +96,173 @@ def repo_relative_path(value: Any) -> Any:
         return None
 
 
+def numeric_count(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def normalize_difficulty_label(value: Any) -> str:
+    if isinstance(value, str) and value in {"easy", "medium", "hard"}:
+        return value
+    return "unknown"
+
+
+def normalize_tier_label(value: Any) -> str:
+    if isinstance(value, (int, float)) and int(value) in {0, 1, 2}:
+        return f"tier{int(value)}"
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        compact = lowered.replace(" ", "").replace("-", "").replace("_", "")
+        if compact in {"tier0", "0"}:
+            return "tier0"
+        if compact in {"tier1", "1"}:
+            return "tier1"
+        if compact in {"tier2", "2"}:
+            return "tier2"
+        match = TIER_PATTERN.search(lowered)
+        if match:
+            return f"tier{match.group(1)}"
+    return "unknown"
+
+
 def normalized_execution_diagnostics(source: dict[str, Any]) -> dict[str, int]:
-    normalized: dict[str, int] = {}
-    for field in EXECUTION_DIAGNOSTIC_FIELDS:
-        value = source.get(field, 0)
-        normalized[field] = int(value) if isinstance(value, (int, float)) else 0
-    return normalized
+    return {field: numeric_count(source.get(field)) for field in EXECUTION_DIAGNOSTIC_FIELDS}
+
+
+def normalized_candidate_lineage_counts(source: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for attempt_field in CANDIDATE_ATTEMPT_FIELDS:
+        counts[attempt_field] = numeric_count(source.get(attempt_field))
+    for accepted_field in CANDIDATE_ACCEPTED_FIELDS:
+        counts[accepted_field] = numeric_count(source.get(accepted_field))
+    return counts
+
+
+def candidate_lineage_label(source: dict[str, Any]) -> str:
+    lineage_counts = normalized_candidate_lineage_counts(source)
+    accepted_sources = [
+        label
+        for label, (_, accepted_field) in CANDIDATE_LINEAGE_FIELDS.items()
+        if lineage_counts[accepted_field] > 0
+    ]
+    if len(accepted_sources) == 1:
+        return accepted_sources[0]
+    if len(accepted_sources) > 1:
+        return "mixed"
+
+    attempted_sources = [
+        label
+        for label, (attempt_field, _) in CANDIDATE_LINEAGE_FIELDS.items()
+        if lineage_counts[attempt_field] > 0
+    ]
+    if len(attempted_sources) == 1:
+        return attempted_sources[0]
+    if len(attempted_sources) > 1:
+        return "mixed"
+    return "unknown"
 
 
 def normalized_case_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(result)
-    accepted_patch_bytes = normalized.get("accepted_patch_bytes", 0)
-    normalized["accepted_patch_bytes"] = (
-        int(accepted_patch_bytes) if isinstance(accepted_patch_bytes, (int, float)) else 0
+    normalized["accepted_patch_bytes"] = numeric_count(normalized.get("accepted_patch_bytes"))
+    normalized["tier"] = normalize_tier_label(normalized.get("tier"))
+    verifier_class = normalized.get("verifier_class")
+    normalized["verifier_class"] = (
+        verifier_class
+        if isinstance(verifier_class, str) and verifier_class in VERIFIER_CLASS_ORDER
+        else "unknown"
     )
     normalized.update(normalized_execution_diagnostics(normalized))
+    normalized.update(normalized_candidate_lineage_counts(normalized))
+    normalized["candidate_lineage"] = candidate_lineage_label(normalized)
     return normalized
+
+
+def repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        outcome = result.get("outcome")
+        label = outcome if isinstance(outcome, str) and outcome else "unknown"
+        counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def failure_attribution_label(result: dict[str, Any]) -> Optional[str]:
+    if result.get("verified_repair"):
+        return None
+
+    explicit = result.get("failure_attribution")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+
+    outcome = result.get("outcome")
+    if outcome == "accepted_patch_unverified":
+        return "accepted_patch_failed_independent_rerun"
+    if outcome == "baseline_not_reproduced":
+        return "baseline_not_reproduced"
+    if outcome == "false_green":
+        return "mercury_verified_but_independent_rerun_failed"
+    if outcome == "missing_benchmark_run":
+        return "missing_benchmark_run"
+    if outcome == "no_patch":
+        return "no_patch_emitted"
+    if outcome == "runner_error":
+        return "runner_error"
+    if isinstance(outcome, str) and outcome:
+        return outcome
+    return "unknown_failure"
+
+
+def compute_failure_attribution(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        label = failure_attribution_label(result)
+        if label is None:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+
+    ordered = [label for label in FAILURE_ATTRIBUTION_ORDER if label in counts]
+    extras = sorted(label for label in counts if label not in FAILURE_ATTRIBUTION_ORDER)
+    return {label: counts[label] for label in ordered + extras}
+
+
+def bucket_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    attempted_cases = len(results)
+    verified_repairs = sum(1 for result in results if result.get("verified_repair"))
+    accepted_patches = sum(1 for result in results if result.get("accepted_patch"))
+    false_greens = sum(1 for result in results if result.get("false_green"))
+    return {
+        "attempted_cases": attempted_cases,
+        "verified_repairs": verified_repairs,
+        "accepted_patches": accepted_patches,
+        "false_greens": false_greens,
+        "verified_repair_rate": verified_repairs / attempted_cases if attempted_cases else 0.0,
+        "accepted_patch_rate": accepted_patches / attempted_cases if attempted_cases else 0.0,
+        "false_green_rate": false_greens / attempted_cases if attempted_cases else 0.0,
+        "repair_outcome_distribution": repair_outcome_distribution(results),
+    }
+
+
+def compute_breakdown_by_label(
+    results: list[dict[str, Any]],
+    label_fn,
+    order: list[str],
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        label = label_fn(result)
+        buckets.setdefault(label, []).append(result)
+
+    ordered = [label for label in order if label in buckets]
+    extras = sorted(label for label in buckets if label not in order)
+    return {label: bucket_metrics(buckets[label]) for label in ordered + extras}
+
+
+def compute_difficulty_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return compute_breakdown_by_label(
+        results,
+        lambda result: normalize_difficulty_label(result.get("difficulty")),
+        DIFFICULTY_ORDER,
+    )
 
 
 def compute_execution_diagnostics(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -95,6 +272,18 @@ def compute_execution_diagnostics(results: list[dict[str, Any]]) -> dict[str, in
         for field in EXECUTION_DIAGNOSTIC_FIELDS:
             counts[field] += diagnostics[field]
     return counts
+
+
+def compute_candidate_attempt_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    breakdown: dict[str, dict[str, int]] = {}
+    for label, (attempt_field, accepted_field) in CANDIDATE_LINEAGE_FIELDS.items():
+        breakdown[label] = {
+            "attempts": sum(numeric_count(result.get(attempt_field)) for result in results),
+            "accepted_steps": sum(
+                numeric_count(result.get(accepted_field)) for result in results
+            ),
+        }
+    return breakdown
 
 
 def sanitize_public_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -119,20 +308,35 @@ def sanitize_public_report(report: dict[str, Any]) -> dict[str, Any]:
         sanitized_results.append(public_result)
     sanitized["results"] = sanitized_results
     sanitized["repair_outcome_distribution"] = repair_outcome_distribution(sanitized_results)
-    sanitized["execution_diagnostics"] = (
-        normalized_execution_diagnostics(report["execution_diagnostics"])
-        if isinstance(report.get("execution_diagnostics"), dict)
-        else compute_execution_diagnostics(sanitized_results)
+    sanitized["execution_diagnostics"] = compute_execution_diagnostics(sanitized_results)
+    sanitized["difficulty_breakdown"] = compute_difficulty_breakdown(sanitized_results)
+    sanitized["tier_breakdown"] = compute_breakdown_by_label(
+        sanitized_results,
+        lambda result: normalize_tier_label(result.get("tier")),
+        TIER_ORDER,
     )
-    if "difficulty_breakdown" in report:
-        sanitized["difficulty_breakdown"] = compute_difficulty_breakdown(sanitized_results)
-    else:
-        sanitized.pop("difficulty_breakdown", None)
-    if "failure_attribution" in report:
-        sanitized["failure_attribution"] = compute_failure_attribution(sanitized_results)
-    else:
-        sanitized.pop("failure_attribution", None)
-
+    sanitized["verifier_class_breakdown"] = compute_breakdown_by_label(
+        sanitized_results,
+        lambda result: (
+            result.get("verifier_class")
+            if isinstance(result.get("verifier_class"), str)
+            else "unknown"
+        ),
+        VERIFIER_CLASS_ORDER,
+    )
+    sanitized["candidate_lineage_breakdown"] = compute_breakdown_by_label(
+        sanitized_results,
+        lambda result: (
+            result.get("candidate_lineage")
+            if isinstance(result.get("candidate_lineage"), str)
+            else "unknown"
+        ),
+        CANDIDATE_LINEAGE_ORDER,
+    )
+    sanitized["candidate_attempt_breakdown"] = compute_candidate_attempt_breakdown(
+        sanitized_results
+    )
+    sanitized["failure_attribution"] = compute_failure_attribution(sanitized_results)
     return sanitized
 
 
@@ -201,88 +405,6 @@ def render_curve_table(entries: list[dict[str, Any]], cost: bool) -> list[str]:
     return lines
 
 
-def repair_outcome_distribution(results: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for result in results:
-        outcome = result.get("outcome")
-        label = outcome if isinstance(outcome, str) and outcome else "unknown"
-        counts[label] = counts.get(label, 0) + 1
-    return dict(sorted(counts.items()))
-
-
-def normalize_difficulty_label(value: Any) -> str:
-    if isinstance(value, str) and value in {"easy", "medium", "hard"}:
-        return value
-    return "unknown"
-
-
-def failure_attribution_label(result: dict[str, Any]) -> Optional[str]:
-    if result.get("verified_repair"):
-        return None
-
-    explicit = result.get("failure_attribution")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-
-    outcome = result.get("outcome")
-    if outcome == "accepted_patch_unverified":
-        return "accepted_patch_failed_independent_rerun"
-    if outcome == "baseline_not_reproduced":
-        return "baseline_not_reproduced"
-    if outcome == "false_green":
-        return "mercury_verified_but_independent_rerun_failed"
-    if outcome == "missing_benchmark_run":
-        return "missing_benchmark_run"
-    if outcome == "no_patch":
-        return "no_patch_emitted"
-    if outcome == "runner_error":
-        return "runner_error"
-    if isinstance(outcome, str) and outcome:
-        return outcome
-    return "unknown_failure"
-
-
-def compute_failure_attribution(results: list[dict[str, Any]]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for result in results:
-        label = failure_attribution_label(result)
-        if label is None:
-            continue
-        counts[label] = counts.get(label, 0) + 1
-
-    ordered = [label for label in FAILURE_ATTRIBUTION_ORDER if label in counts]
-    extras = sorted(label for label in counts if label not in FAILURE_ATTRIBUTION_ORDER)
-    return {label: counts[label] for label in ordered + extras}
-
-
-def bucket_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    attempted_cases = len(results)
-    verified_repairs = sum(1 for result in results if result.get("verified_repair"))
-    accepted_patches = sum(1 for result in results if result.get("accepted_patch"))
-    false_greens = sum(1 for result in results if result.get("false_green"))
-    return {
-        "attempted_cases": attempted_cases,
-        "verified_repairs": verified_repairs,
-        "accepted_patches": accepted_patches,
-        "false_greens": false_greens,
-        "verified_repair_rate": verified_repairs / attempted_cases if attempted_cases else 0.0,
-        "accepted_patch_rate": accepted_patches / attempted_cases if attempted_cases else 0.0,
-        "false_green_rate": false_greens / attempted_cases if attempted_cases else 0.0,
-        "repair_outcome_distribution": repair_outcome_distribution(results),
-    }
-
-
-def compute_difficulty_breakdown(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    by_difficulty: dict[str, list[dict[str, Any]]] = {}
-    for result in results:
-        label = normalize_difficulty_label(result.get("difficulty"))
-        by_difficulty.setdefault(label, []).append(result)
-
-    ordered = [label for label in DIFFICULTY_ORDER if label in by_difficulty]
-    extras = sorted(label for label in by_difficulty if label not in DIFFICULTY_ORDER)
-    return {label: bucket_metrics(by_difficulty[label]) for label in ordered + extras}
-
-
 def render_outcome_table(quality: dict[str, Any], agent_sweep: dict[str, Any]) -> list[str]:
     quality_counts = quality["repair_outcome_distribution"]
     agent_counts = agent_sweep["repair_outcome_distribution"]
@@ -311,22 +433,28 @@ def ordered_labels(
     return ordered + extras
 
 
-def render_difficulty_table(title: str, report: dict[str, Any]) -> list[str]:
-    breakdown = report.get("difficulty_breakdown", {})
+def render_breakdown_table(
+    title: str,
+    report: dict[str, Any],
+    breakdown_key: str,
+    order: list[str],
+    label_title: str,
+) -> list[str]:
+    breakdown = report.get(breakdown_key, {})
     lines = [
         f"### {title}",
         "",
-        "| difficulty | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |",
+        f"| {label_title} | attempted | verified | accepted | false greens | verified rate | accepted rate | false-green rate | outcomes |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-    for label in ordered_labels(DIFFICULTY_ORDER, breakdown, {}):
+    for label in ordered_labels(order, breakdown, {}):
         bucket = breakdown[label]
         outcome_summary = ", ".join(
             f"{outcome}={count}" for outcome, count in bucket["repair_outcome_distribution"].items()
         )
         lines.append(
-            "| {difficulty} | {attempted} | {verified} | {accepted} | {false_greens} | {verified_rate} | {accepted_rate} | {false_green_rate} | {outcomes} |".format(
-                difficulty=label,
+            "| {label} | {attempted} | {verified} | {accepted} | {false_greens} | {verified_rate} | {accepted_rate} | {false_green_rate} | {outcomes} |".format(
+                label=label,
                 attempted=bucket["attempted_cases"],
                 verified=bucket["verified_repairs"],
                 accepted=bucket["accepted_patches"],
@@ -381,6 +509,30 @@ def render_execution_diagnostics_table(
     return lines
 
 
+def render_candidate_attempt_table(
+    quality: dict[str, Any], agent_sweep: dict[str, Any]
+) -> list[str]:
+    quality_counts = quality.get("candidate_attempt_breakdown", {})
+    agent_counts = agent_sweep.get("candidate_attempt_breakdown", {})
+    lines = [
+        "| candidate lineage | quality attempts | quality accepted steps | agent-sweep attempts | agent-sweep accepted steps |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for label in ordered_labels(CANDIDATE_LINEAGE_ORDER, quality_counts, agent_counts):
+        quality_bucket = quality_counts.get(label, {})
+        agent_bucket = agent_counts.get(label, {})
+        lines.append(
+            "| {label} | {quality_attempts} | {quality_accepted} | {agent_attempts} | {agent_accepted} |".format(
+                label=label,
+                quality_attempts=quality_bucket.get("attempts", 0),
+                quality_accepted=quality_bucket.get("accepted_steps", 0),
+                agent_attempts=agent_bucket.get("attempts", 0),
+                agent_accepted=agent_bucket.get("accepted_steps", 0),
+            )
+        )
+    return lines
+
+
 def render_pending_markdown() -> str:
     lines = [
         f"# {TRACK_TITLE}",
@@ -424,6 +576,10 @@ def render_pending_markdown() -> str:
         "- false-green rate",
         "- repair outcome distribution",
         "- difficulty-class breakdown",
+        "- tier breakdown",
+        "- verifier-class breakdown",
+        "- candidate-lineage breakdown",
+        "- candidate-lineage attempt and accepted-step totals",
         "- failure attribution",
         "- execution diagnostics for generation, safety, candidate verification, and final bundle failures",
         "- median time to first candidate",
@@ -481,61 +637,91 @@ def render_published_markdown(quality: dict[str, Any], agent_sweep: dict[str, An
         "",
     ]
     lines.extend(render_outcome_table(quality, agent_sweep))
-    if quality.get("difficulty_breakdown") or agent_sweep.get("difficulty_breakdown"):
-        lines.extend(
-            [
-                "",
-                "## Difficulty-Class Breakdown",
-                "",
-            ]
-        )
-        lines.extend(render_difficulty_table("Quality report", quality))
-        lines.extend(
-            [
-                "",
-            ]
-        )
-        lines.extend(render_difficulty_table("Agent-sweep report", agent_sweep))
-    if quality.get("failure_attribution") or agent_sweep.get("failure_attribution"):
-        lines.extend(
-            [
-                "",
-                "## Failure Attribution",
-                "",
-            ]
-        )
-        lines.extend(render_failure_attribution_table(quality, agent_sweep))
+    lines.extend(["", "## Difficulty-Class Breakdown", ""])
     lines.extend(
-        [
-            "",
-            "## Execution Diagnostics",
-            "",
-        ]
+        render_breakdown_table(
+            "Quality report",
+            quality,
+            "difficulty_breakdown",
+            DIFFICULTY_ORDER,
+            "difficulty",
+        )
     )
+    lines.extend([""])
+    lines.extend(
+        render_breakdown_table(
+            "Agent-sweep report",
+            agent_sweep,
+            "difficulty_breakdown",
+            DIFFICULTY_ORDER,
+            "difficulty",
+        )
+    )
+    lines.extend(["", "## Tier Breakdown", ""])
+    lines.extend(
+        render_breakdown_table("Quality report", quality, "tier_breakdown", TIER_ORDER, "tier")
+    )
+    lines.extend([""])
+    lines.extend(
+        render_breakdown_table(
+            "Agent-sweep report",
+            agent_sweep,
+            "tier_breakdown",
+            TIER_ORDER,
+            "tier",
+        )
+    )
+    lines.extend(["", "## Verifier-Class Breakdown", ""])
+    lines.extend(
+        render_breakdown_table(
+            "Quality report",
+            quality,
+            "verifier_class_breakdown",
+            VERIFIER_CLASS_ORDER,
+            "verifier class",
+        )
+    )
+    lines.extend([""])
+    lines.extend(
+        render_breakdown_table(
+            "Agent-sweep report",
+            agent_sweep,
+            "verifier_class_breakdown",
+            VERIFIER_CLASS_ORDER,
+            "verifier class",
+        )
+    )
+    lines.extend(["", "## Candidate Lineage Breakdown", ""])
+    lines.extend(
+        render_breakdown_table(
+            "Quality report",
+            quality,
+            "candidate_lineage_breakdown",
+            CANDIDATE_LINEAGE_ORDER,
+            "candidate lineage",
+        )
+    )
+    lines.extend([""])
+    lines.extend(
+        render_breakdown_table(
+            "Agent-sweep report",
+            agent_sweep,
+            "candidate_lineage_breakdown",
+            CANDIDATE_LINEAGE_ORDER,
+            "candidate lineage",
+        )
+    )
+    lines.extend(["", "## Candidate Lineage Attempts", ""])
+    lines.extend(render_candidate_attempt_table(quality, agent_sweep))
+    lines.extend(["", "## Failure Attribution", ""])
+    lines.extend(render_failure_attribution_table(quality, agent_sweep))
+    lines.extend(["", "## Execution Diagnostics", ""])
     lines.extend(render_execution_diagnostics_table(quality, agent_sweep))
-    lines.extend(
-        [
-            "",
-        "## `--max-agents` Speedup Curve",
-        "",
-        ]
-    )
+    lines.extend(["", "## `--max-agents` Speedup Curve", ""])
     lines.extend(render_curve_table(agent_sweep["speedup_curve"], cost=False))
-    lines.extend(
-        [
-            "",
-            "## `--max-agents` Cost Curve",
-            "",
-        ]
-    )
+    lines.extend(["", "## `--max-agents` Cost Curve", ""])
     lines.extend(render_curve_table(agent_sweep["cost_curve"], cost=True))
-    lines.extend(
-        [
-            "",
-            "## Corpus Selection",
-            "",
-        ]
-    )
+    lines.extend(["", "## Corpus Selection", ""])
     lines.extend(selection_summary(quality))
     lines.extend(
         [
