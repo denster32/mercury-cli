@@ -39,6 +39,8 @@ Official release archives are currently published only for macOS arm64 and Linux
 
 For upgrade notes and prerelease deltas, use [CHANGELOG.md](CHANGELOG.md).
 
+After install, start with [docs/operator-quickstart.md](docs/operator-quickstart.md). If you want a disposable first repair attempt before touching a real repo, use the checked-in starter repos in [starter-repos/README.md](starter-repos/README.md).
+
 ### API key
 
 `INCEPTION_API_KEY` is the preferred environment variable. `MERCURY_API_KEY` still works as a backward-compatible fallback.
@@ -81,14 +83,20 @@ Important limits:
 - non-allowlisted watch commands are rejected before execution and before any watch-cycle artifacts are created
 - `watch` without `--repair` is report-only for allowlisted verifier commands
 
-## Case Studies
+## Operator Docs
+
+Start here after install:
+
+- [Operator quickstart](docs/operator-quickstart.md)
+- [Starter repos](starter-repos/README.md)
+- [Supported Rust verifier classes](docs/supported-rust-verifier-classes.md)
+- [Known limitations](docs/known-limitations.md)
+- [Diligence pack](docs/diligence-pack.md)
 
 Reproducible repo-backed walkthroughs:
 
-- [Operator quickstart](docs/operator-quickstart.md)
 - [Local red -> green watch-repair flow](docs/case-studies/local-red-to-green.md)
 - [CI-oriented repair to draft PR flow](docs/case-studies/ci-draft-pr-flow.md)
-- [Starter repos](starter-repos/README.md)
 - [Local Rust watch-repair starter repo](starter-repos/local-rust-watch-repair/README.md)
 - [CI draft-PR repair starter repo](starter-repos/ci-draft-pr-repair/README.md)
 
@@ -102,8 +110,8 @@ Examples below assume you built from source in this repo, so command invocations
 | `./target/release/mercury-cli plan <goal>` | Available | Produces a structured repair plan and thermal assessments. |
 | `./target/release/mercury-cli ask <query>` | Available | Repo-aware Mercury 2 Q&A. |
 | `./target/release/mercury-cli status [--heatmap] [--agents] [--budget]` | Available | Reports thermal state and scheduler metadata. |
-| `./target/release/mercury-cli status --live [--interval-ms N]` | Available | Streams candidate, phase, and runtime events in a TTY dashboard and emits JSONL event records when piped, including winner/loss/suppression explanations from persisted candidate metadata. |
-| `./target/release/mercury-cli edit apply` | Available | Concrete Mercury Edit apply surface for replacement snippets or patch content. It is not an instruction-driven repair endpoint. |
+| `./target/release/mercury-cli status --live [--interval-ms N]` | Available | Streams candidate, phase, and runtime events in a TTY dashboard and emits JSONL event records when piped, including winner/loss/suppression explanations from persisted candidate metadata. `--interval-ms` must be at least `250`. |
+| `./target/release/mercury-cli edit apply` | Available | Concrete Mercury Edit apply surface for replacement snippets or patch content. It is not an instruction-driven repair endpoint, and `--dry-run` shows a unified diff without writing. |
 | `./target/release/mercury-cli edit complete` | Available | Completion-style Mercury Edit request for a file or cursor location. |
 | `./target/release/mercury-cli edit next` | Available | Next-edit prediction using current file state plus focused cursor and recent-snippet context. |
 | `./target/release/mercury-cli fix <description>` | Available | Repair flow with planning, candidate generation, isolated repo-copy/worktree verification, and artifacts for direct allowlisted Rust verifier commands aligned with the Tier 1 Rust beta lane in `docs/benchmarks/`. It also includes a frozen experimental TypeScript lane for selected direct verifier commands, but that lane is not parser-backed parity with Rust. |
@@ -180,6 +188,7 @@ For direct `./target/release/mercury-cli fix` runs, the run bundle also includes
 
 For the `Mercury CI Auto-Repair Draft PR` workflow, the uploaded evidence bundle includes:
 
+- `artifact-index.json` as the stable top-level CI artifact index and entrypoint into the bundle
 - `summary.md`, `decision.json`, `environment.json`, and `pr-body.md`
 - `summary.md` now includes the nested Mercury run headline, failure reason rollup, candidate lineage, and winning candidate summary when a nested repair bundle was captured
 - `decision.json` mirrors those nested Mercury run highlights under `mercury_run`
@@ -193,6 +202,7 @@ For the `Mercury CI Auto-Repair Draft PR` workflow, the uploaded evidence bundle
 
 Minimum required by workflow contract before summary publishing:
 
+- `artifact-index.json`
 - `summary.md`
 - `decision.json`
 - `environment.json`
@@ -252,7 +262,7 @@ What it does not mean yet:
 - official release archives for macOS arm64 and Linux x86_64
 - manual or workflow-driven promotion of a verified run into a draft PR
 - checked-in Rust benchmark evidence under `docs/benchmarks/` with scrubbed machine-readable aggregates, repair outcome distribution, tier and verifier-class breakdowns, candidate lineage slices, execution diagnostics, and published `--max-agents` curves for the current Tier 1 corpus
-- documented limits for incomplete surfaces
+- documented limits for incomplete surfaces in [docs/known-limitations.md](docs/known-limitations.md)
 
 ## Preview and Roadmap
 

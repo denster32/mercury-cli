@@ -254,7 +254,7 @@ fn write_minimal_rust_project(root: &Path) {
         root.join("Cargo.toml"),
         r#"[package]
 name = "allowlist-fixture"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [workspace]

@@ -20,7 +20,7 @@ Use the CI workflow when:
 
 If you are unsure, start local. Move to CI after you can reproduce the same direct verifier command reliably.
 
-If you want a disposable demo first, copy one of the checked-in starter repos under `starter-repos/` before pointing Mercury at a real codebase.
+If you want a disposable demo first, start with [starter-repos/README.md](../starter-repos/README.md). Those starter repos are the canonical onboarding path before you point Mercury at a real codebase.
 
 ## Local Watch-Repair
 
@@ -86,6 +86,7 @@ For local `watch --repair`, start with:
 
 For CI workflow runs, start with:
 
+- `artifact-index.json`: stable top-level index for the CI bundle, including the one-screen summary entrypoint and the required artifact contract
 - `summary.md`: human-readable run summary with the nested Mercury run headline, failure reason rollup, candidate lineage, and winning candidate summary when a nested repair bundle was captured
 - `decision.json`: machine-readable terminal decision, PR eligibility, and nested Mercury run highlights under `mercury_run`
 - `environment.json`: run metadata, refs, and workflow context
@@ -93,7 +94,7 @@ For CI workflow runs, start with:
 - `logs/`: baseline, repair, post-repair, setup, and init logs when those steps ran
 - `mercury-run/`: nested fix artifacts when the workflow captured the Mercury run directory
 
-If you only have time for one check, open `summary-index.json` for local runs or `summary.md` for CI runs first, then confirm the verifier rerun output and the diff.
+If you only have time for one check, open `summary-index.json` for local runs or `artifact-index.json` for CI runs first. From the CI index, jump to `summary.md`, then confirm the verifier rerun output and the diff.
 
 ## Interpret Statuses
 
@@ -127,6 +128,9 @@ Current limit: it now explains candidate outcomes from persisted runtime metadat
 - [Starter repos](../starter-repos/README.md)
 - [Local Rust watch-repair starter repo](../starter-repos/local-rust-watch-repair/README.md)
 - [CI draft-PR repair starter repo](../starter-repos/ci-draft-pr-repair/README.md)
+- [Supported Rust verifier classes](supported-rust-verifier-classes.md)
+- [Known limitations](known-limitations.md)
+- [Diligence pack](diligence-pack.md)
 - [Local red -> green watch-repair flow](case-studies/local-red-to-green.md)
 - [CI-oriented repair to draft PR flow](case-studies/ci-draft-pr-flow.md)
 - [Benchmarks overview](benchmarks/README.md)

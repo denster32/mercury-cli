@@ -185,6 +185,52 @@ jobs:
               except json.JSONDecodeError:
                   return {}
 
+          def build_artifact_index(
+              artifact_dir: Path,
+              artifact_name: str,
+              status: str,
+              repair_verified: bool,
+              baseline_reproduced: bool,
+          ) -> dict:
+              required_files = [
+                  "summary.md",
+                  "decision.json",
+                  "environment.json",
+                  "pr-body.md",
+                  "repair.diff",
+                  "repair.diffstat.txt",
+                  "logs/baseline.stdout.log",
+                  "logs/baseline.stderr.log",
+              ]
+              entrypoints = {
+                  "summary": "summary.md",
+                  "decision": "decision.json",
+                  "environment": "environment.json",
+                  "pr_body": "pr-body.md",
+                  "diff": "repair.diff",
+                  "diffstat": "repair.diffstat.txt",
+              }
+              files = []
+              for path in sorted(artifact_dir.rglob("*")):
+                  if not path.is_file() or path.name == "artifact-index.json":
+                      continue
+                  files.append(
+                      {
+                          "path": path.relative_to(artifact_dir).as_posix(),
+                          "size_bytes": path.stat().st_size,
+                      }
+                  )
+              return {
+                  "schema_version": "mercury-ci-artifact-index-v1",
+                  "artifact_name": artifact_name,
+                  "status": status,
+                  "repair_verified": repair_verified,
+                  "baseline_reproduced": baseline_reproduced,
+                  "required_files": required_files,
+                  "entrypoints": entrypoints,
+                  "files": files,
+              }
+
           def build_mercury_run_payload(summary: dict, metadata: dict, execution_summary: dict) -> dict | None:
               if not summary and not metadata and not execution_summary:
                   return None
@@ -655,6 +701,16 @@ jobs:
                       "This run did not produce a PR-ready patch, so the workflow did not reach the draft-PR mutation step. See the artifact bundle for details.\n",
                   )
           finally:
+              write_json(
+                  artifact_dir / "artifact-index.json",
+                  build_artifact_index(
+                      artifact_dir,
+                      artifact_name=artifact_name,
+                      status=status,
+                      repair_verified=repair_verified,
+                      baseline_reproduced=baseline_reproduced,
+                  ),
+              )
               append_output("artifact_dir", str(artifact_dir))
               append_output("artifact_name", artifact_name)
               append_output("repair_worktree", str(worktree_dir))
@@ -686,6 +742,7 @@ jobs:
           ARTIFACT_DIR: ${{ steps.orchestrate.outputs.artifact_dir }}
         run: |
           set -euo pipefail
+          test -f "$ARTIFACT_DIR/artifact-index.json"
           test -f "$ARTIFACT_DIR/summary.md"
           test -f "$ARTIFACT_DIR/decision.json"
           test -f "$ARTIFACT_DIR/environment.json"
@@ -694,6 +751,55 @@ jobs:
           test -f "$ARTIFACT_DIR/repair.diffstat.txt"
           test -f "$ARTIFACT_DIR/logs/baseline.stdout.log"
           test -f "$ARTIFACT_DIR/logs/baseline.stderr.log"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          artifact_dir = Path(os.environ["ARTIFACT_DIR"])
+          index_path = artifact_dir / "artifact-index.json"
+          payload = json.loads(index_path.read_text(encoding="utf-8"))
+          if payload.get("schema_version") != "mercury-ci-artifact-index-v1":
+              raise SystemExit("artifact-index.json missing expected schema_version")
+          required = payload.get("required_files")
+          if not isinstance(required, list) or not required:
+              raise SystemExit("artifact-index.json missing required_files list")
+          entrypoints = payload.get("entrypoints")
+          if not isinstance(entrypoints, dict) or not entrypoints:
+              raise SystemExit("artifact-index.json missing entrypoints map")
+          expected_entrypoints = {
+              "summary": "summary.md",
+              "decision": "decision.json",
+              "environment": "environment.json",
+              "pr_body": "pr-body.md",
+              "diff": "repair.diff",
+              "diffstat": "repair.diffstat.txt",
+          }
+          files = payload.get("files")
+          if not isinstance(files, list):
+              raise SystemExit("artifact-index.json missing files list")
+          indexed_paths = []
+          for entry in files:
+              if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                  raise SystemExit("artifact-index.json contains a malformed file entry")
+              indexed_paths.append(entry["path"])
+          if indexed_paths != sorted(indexed_paths):
+              raise SystemExit("artifact-index.json file entries must be sorted by path")
+          if len(indexed_paths) != len(set(indexed_paths)):
+              raise SystemExit("artifact-index.json file entries must be unique")
+          if entrypoints != expected_entrypoints:
+              raise SystemExit("artifact-index.json entrypoints do not match the stable CI contract")
+          for rel_path in required:
+              if rel_path not in indexed_paths:
+                  raise SystemExit(f"artifact-index.json missing required file entry {rel_path!r}")
+              if not (artifact_dir / rel_path).is_file():
+                  raise SystemExit(f"required artifact file {rel_path!r} is missing on disk")
+          for rel_path in entrypoints.values():
+              if not isinstance(rel_path, str):
+                  raise SystemExit("artifact-index.json entrypoints must map to string file paths")
+              if rel_path not in indexed_paths:
+                  raise SystemExit(f"artifact-index.json missing entrypoint file entry {rel_path!r}")
+          PY
 
       - name: Publish run summary
         if: always()

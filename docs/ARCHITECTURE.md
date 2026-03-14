@@ -29,7 +29,7 @@ Composed shell commands (`&&`, pipes, redirection, shell wrappers like `make tes
 
 ### Live Observability
 
-`mercury-cli status --live` provides candidate-level runtime observability with configurable refresh (`--interval-ms`).
+`mercury-cli status --live` provides candidate-level runtime observability with configurable refresh (`--interval-ms`, minimum `250`).
 
 - In a TTY it renders the existing heatmap/agent/budget dashboard and appends a rolling live-event pane for candidate launches, status changes, phase activation, and runtime-state updates.
 - When stdout is piped, it emits the same redacted runtime feed as JSONL so CI and local tooling can inspect candidate/phase/runtime events without scraping the terminal dashboard.

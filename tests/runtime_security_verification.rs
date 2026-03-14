@@ -342,7 +342,7 @@ fn write_passing_rust_project(project_root: &Path) {
         project_root.join("Cargo.toml"),
         r#"[package]
 name = "runtime-security-pass"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [workspace]

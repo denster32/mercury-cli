@@ -1,6 +1,6 @@
 # CI Draft-PR Repair Starter
 
-This starter repo is a copyable GitHub Actions demo for the current Mercury Rust beta lane.
+This starter repo is a copyable GitHub Actions demo for the current Mercury Rust beta lane. Read `docs/operator-quickstart.md` first, then use this repo when you want the canonical disposable CI onboarding path.
 
 What it gives you:
 
@@ -36,6 +36,7 @@ What happens:
 
 Start with the uploaded artifact bundle and open:
 
+- `artifact-index.json`
 - `summary.md`
 - `decision.json`
 - `repair.diff`

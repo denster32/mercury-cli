@@ -975,7 +975,7 @@ fn write_failing_rust_library(root: &Path) -> String {
         root.join("Cargo.toml"),
         r#"[package]
 name = "watch-artifacts-fixture"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [lib]
@@ -1025,7 +1025,7 @@ fn write_passing_rust_library(root: &Path) {
         root.join("Cargo.toml"),
         r#"[package]
 name = "watch-artifacts-passing-fixture"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [lib]

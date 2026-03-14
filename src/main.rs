@@ -10,6 +10,7 @@ use std::fs::OpenOptions;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -256,7 +257,7 @@ enum Commands {
         /// Stream live status in a TTY dashboard or JSONL event feed until Ctrl-C.
         #[arg(long)]
         live: bool,
-        /// Live refresh interval in milliseconds.
+        /// Live refresh interval in milliseconds (minimum 250 when --live is set).
         #[arg(long, default_value = "1500")]
         interval_ms: u64,
         /// Show active agents.
@@ -377,6 +378,8 @@ struct NextEditCliContext {
     cursor: String,
     recent_snippets: String,
 }
+
+const MIN_STATUS_LIVE_INTERVAL_MS: u64 = 250;
 
 const SUPPORTED_CONFIG_KEYS: &[(&str, ConfigValueKind)] = &[
     ("api.mercury2_endpoint", ConfigValueKind::String),
@@ -1241,7 +1244,13 @@ fn cmd_status(
     budget: bool,
 ) -> Result<()> {
     if live {
-        return cmd_status_live(db, heatmap, agents, budget, interval_ms.max(250));
+        return cmd_status_live(
+            db,
+            heatmap,
+            agents,
+            budget,
+            validate_live_interval_ms(interval_ms)?,
+        );
     }
 
     if heatmap || (!agents && !budget) {
@@ -3285,6 +3294,72 @@ fn atomic_write_string(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_live_interval_ms(interval_ms: u64) -> Result<u64> {
+    if interval_ms < MIN_STATUS_LIVE_INTERVAL_MS {
+        return Err(anyhow!(
+            "status --live requires --interval-ms >= {MIN_STATUS_LIVE_INTERVAL_MS}"
+        ));
+    }
+    Ok(interval_ms)
+}
+
+fn render_edit_apply_dry_run_diff(
+    relative_path: &RepoRelativePath,
+    original: &str,
+    patched: &str,
+) -> Result<String> {
+    let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let temp_root = env::temp_dir().join(format!(
+        "mercury-edit-diff-{}-{}",
+        std::process::id(),
+        nonce
+    ));
+    let before_relative = PathBuf::from("before").join(relative_path.as_str());
+    let after_relative = PathBuf::from("after").join(relative_path.as_str());
+    let before_path = temp_root.join(&before_relative);
+    let after_path = temp_root.join(&after_relative);
+
+    let render = (|| -> Result<String> {
+        if let Some(parent) = before_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = after_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&before_path, original)?;
+        std::fs::write(&after_path, patched)?;
+
+        let output = Command::new("git")
+            .arg("diff")
+            .arg("--no-index")
+            .arg("--no-color")
+            .arg("--")
+            .arg(&before_relative)
+            .arg(&after_relative)
+            .current_dir(&temp_root)
+            .output()
+            .context("failed to render git diff for edit apply dry run")?;
+
+        match output.status.code() {
+            Some(0) | Some(1) => {}
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!(
+                    "git diff --no-index failed while rendering edit apply dry run: {}",
+                    stderr.trim()
+                ));
+            }
+        }
+
+        let diff = String::from_utf8(output.stdout)
+            .context("git diff emitted non-UTF-8 output for edit apply dry run")?;
+        Ok(diff.replace("a/before/", "a/").replace("b/after/", "b/"))
+    })();
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+    render
+}
+
 fn supported_config_value_kind(key: &str) -> Option<ConfigValueKind> {
     SUPPORTED_CONFIG_KEYS
         .iter()
@@ -3607,8 +3682,17 @@ async fn main() -> Result<()> {
                     let content = std::fs::read_to_string(&file_path)?;
                     let (patched, usage) = patcher.patch(&content, &update_snippet).await?;
                     if dry_run {
+                        let diff =
+                            render_edit_apply_dry_run_diff(&relative_path, &content, &patched)?;
                         println!("--- Dry run (not written) ---");
-                        println!("{patched}");
+                        if diff.trim().is_empty() {
+                            println!("No changes.");
+                        } else {
+                            print!("{diff}");
+                            if !diff.ends_with('\n') {
+                                println!();
+                            }
+                        }
                     } else if force {
                         println!("WARNING: verification bypassed due to --force");
                         atomic_write_string(&file_path, &patched)?;
@@ -4301,6 +4385,28 @@ mod tests {
         assert_eq!(default_line, 1);
     }
 
+    #[test]
+    fn validate_live_interval_ms_rejects_values_below_contract_floor() {
+        let err = validate_live_interval_ms(249).expect_err("interval below floor should fail");
+        assert!(err
+            .to_string()
+            .contains("status --live requires --interval-ms >= 250"));
+        assert_eq!(validate_live_interval_ms(250).unwrap(), 250);
+    }
+
+    #[test]
+    fn render_edit_apply_dry_run_diff_returns_unified_diff_for_repo_relative_path() {
+        let relative = RepoRelativePath::new("src/lib.rs").unwrap();
+        let diff = render_edit_apply_dry_run_diff(&relative, "fn before() {}\n", "fn after() {}\n")
+            .expect("dry run diff should render");
+
+        assert!(diff.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(diff.contains("--- a/src/lib.rs"));
+        assert!(diff.contains("+++ b/src/lib.rs"));
+        assert!(diff.contains("-fn before() {}"));
+        assert!(diff.contains("+fn after() {}"));
+    }
+
     #[tokio::test]
     async fn verify_failure_does_not_mutate_user_worktree() {
         let temp = tempdir().unwrap();
@@ -4331,7 +4437,7 @@ mod tests {
         init_git_repo(&project_root);
         std::fs::write(
             project_root.join("Cargo.toml"),
-            "[package]\nname = \"cli-edit\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            "[package]\nname = \"cli-edit\"\nversion = \"1.0.0-beta.1\"\nedition = \"2021\"\n",
         )
         .unwrap();
         std::fs::write(project_root.join("lib.rs"), "pub fn ok() {}\n").unwrap();

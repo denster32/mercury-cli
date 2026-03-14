@@ -4,6 +4,8 @@ This walkthrough describes the CI-oriented repair flow supported by the current 
 
 The repo includes the `Mercury CI Auto-Repair Draft PR` workflow in `.github/workflows/repair.yml`. It reproduces a failing verifier command in isolation, runs Mercury repair, and uploads artifacts for every terminal state. It only attempts branch push and draft-PR mutation when the repair is verified, `dry_run=false`, and the workflow can push back to the same repository.
 
+If this is your first Mercury run, start with [Operator quickstart](../operator-quickstart.md) and the [CI draft-PR starter repo](../../starter-repos/ci-draft-pr-repair/README.md) before adapting the workflow to a production repository.
+
 ## Goal
 
 Reproduce failure in CI conditions, run isolated Mercury repair, verify locally, publish artifacts, and optionally let the workflow promote a verified patch into a draft PR carrying evidence.
@@ -84,6 +86,7 @@ Collect the run artifacts so reviewers can audit the decision path.
 
 For the workflow path, download the uploaded artifact bundle from the Actions run. The current workflow validates and uploads:
 
+- `artifact-index.json`
 - `summary.md`
 - `decision.json`
 - `environment.json`
@@ -101,6 +104,7 @@ When `mercury-run/` exists, it includes the normal `fix` evidence set (for examp
 
 Minimum contract that must exist in every run artifact:
 
+- `artifact-index.json`
 - `summary.md`
 - `decision.json`
 - `environment.json`

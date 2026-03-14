@@ -1,6 +1,6 @@
 # Local Rust Watch-Repair Starter
 
-This starter repo is the smallest local Mercury beta rehearsal: a single Rust crate with one intentionally failing unit test.
+This starter repo is the smallest local Mercury beta rehearsal: a single Rust crate with one intentionally failing unit test. Read `docs/operator-quickstart.md` first, then use this repo when you want the canonical disposable local onboarding path.
 
 Why it starts red:
 

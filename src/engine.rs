@@ -861,7 +861,28 @@ impl CandidateFailureStage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerificationSignal {
+    parse_ok: bool,
+    test_ok: bool,
+    lint_ok: bool,
+}
+
+impl VerificationSignal {
+    fn from_verify(result: &VerifyResult) -> Self {
+        Self {
+            parse_ok: result.parse_ok,
+            test_ok: result.test_ok,
+            lint_ok: result.lint_ok,
+        }
+    }
+
+    fn is_ok(self) -> bool {
+        self.parse_ok && self.test_ok && self.lint_ok
+    }
+}
+
+#[derive(Debug, Clone)]
 struct CandidateOutcome {
     agent_id: String,
     log_id: i64,
@@ -871,11 +892,34 @@ struct CandidateOutcome {
     retry_attempts: usize,
     total_tokens: i64,
     total_cost: f64,
+    verification_signal: Option<VerificationSignal>,
     verification_errors: Vec<String>,
     state_hash: Option<String>,
     change_footprint: ChangeFootprint,
     failure_stage: Option<CandidateFailureStage>,
     reason: Option<String>,
+}
+
+impl CandidateOutcome {
+    fn is_verified_candidate(&self) -> bool {
+        self.candidate.is_some()
+            && self
+                .verification_signal
+                .is_some_and(VerificationSignal::is_ok)
+    }
+
+    fn verification_preference_key(&self) -> (bool, bool, bool, bool, bool) {
+        match self.verification_signal {
+            Some(signal) => (
+                false,
+                !signal.is_ok(),
+                !signal.parse_ok,
+                !signal.test_ok,
+                !signal.lint_ok,
+            ),
+            None => (true, true, true, true, true),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1282,28 +1326,15 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
     .collect::<Vec<_>>()
     .await;
 
-    let mut verified_candidates = Vec::new();
+    let mut ranked_candidates = Vec::new();
     for outcome in outcomes {
         let outcome = outcome?;
         summary.retry_attempts += outcome.retry_attempts;
         summary.record_candidate_attempt(outcome.source);
         if outcome.candidate.is_some() {
-            verified_candidates.push(outcome);
+            ranked_candidates.push(outcome);
         } else {
-            summary.rejected += 1;
-            match outcome.failure_stage {
-                Some(CandidateFailureStage::Generation) => {
-                    summary.generation_failures += 1;
-                }
-                Some(CandidateFailureStage::Safety) => {
-                    summary.safety_failures += 1;
-                }
-                Some(CandidateFailureStage::Verification) => {
-                    summary.verification_failures += 1;
-                    summary.candidate_verification_failures += 1;
-                }
-                None => {}
-            }
+            record_rejected_outcome(&mut summary, &outcome);
             let metadata = serde_json::json!({
                 "outcome":"rejected",
                 "reason": outcome.reason,
@@ -1312,6 +1343,10 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "failure_stage": outcome.failure_stage.map(CandidateFailureStage::as_str),
                 "retry_attempts": outcome.retry_attempts,
                 "phase": work_item.phase.to_string(),
+                "parse_ok": outcome.verification_signal.map(|signal| signal.parse_ok),
+                "test_ok": outcome.verification_signal.map(|signal| signal.test_ok),
+                "lint_ok": outcome.verification_signal.map(|signal| signal.lint_ok),
+                "verification_error_count": outcome.verification_errors.len(),
             });
             context.db.update_agent_status(
                 outcome.log_id,
@@ -1323,14 +1358,14 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
         }
     }
 
-    let mut ranked_candidates = Vec::new();
-    for mut outcome in verified_candidates {
+    let mut eligible_candidates = Vec::new();
+    for mut outcome in ranked_candidates {
         if outcome
             .state_hash
             .as_ref()
             .is_some_and(|hash| work_item.seen_hashes.contains(hash))
         {
-            summary.rejected += 1;
+            record_rejected_outcome(&mut summary, &outcome);
             outcome.reason = Some(
                 "oscillation suppressed: candidate matches a previously accepted file state"
                     .to_string(),
@@ -1342,6 +1377,10 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "candidate_source": outcome.source.as_str(),
                 "retry_attempts": outcome.retry_attempts,
                 "phase": work_item.phase.to_string(),
+                "parse_ok": outcome.verification_signal.map(|signal| signal.parse_ok),
+                "test_ok": outcome.verification_signal.map(|signal| signal.test_ok),
+                "lint_ok": outcome.verification_signal.map(|signal| signal.lint_ok),
+                "verification_error_count": outcome.verification_errors.len(),
             });
             context.db.update_agent_status(
                 outcome.log_id,
@@ -1351,16 +1390,17 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 Some(&metadata.to_string()),
             )?;
         } else {
-            ranked_candidates.push(outcome);
+            eligible_candidates.push(outcome);
         }
     }
 
+    let mut ranked_candidates = eligible_candidates;
     rank_candidate_outcomes(&mut ranked_candidates);
-    let (ranked_candidates, duplicate_candidates) =
+    let (mut ranked_candidates, duplicate_candidates) =
         split_duplicate_state_candidates(ranked_candidates);
     let suppressed_duplicate_candidates = duplicate_candidates.len();
     for duplicate in duplicate_candidates {
-        summary.rejected += 1;
+        record_rejected_outcome(&mut summary, &duplicate);
         let metadata = serde_json::json!({
             "outcome":"rejected",
             "reason": duplicate_suppression_reason(),
@@ -1372,6 +1412,10 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             "temperature": phase_temperature,
             "touched_lines": duplicate.change_footprint.touched_lines,
             "byte_delta": duplicate.change_footprint.byte_delta,
+            "parse_ok": duplicate.verification_signal.map(|signal| signal.parse_ok),
+            "test_ok": duplicate.verification_signal.map(|signal| signal.test_ok),
+            "lint_ok": duplicate.verification_signal.map(|signal| signal.lint_ok),
+            "verification_error_count": duplicate.verification_errors.len(),
         });
         context.db.update_agent_status(
             duplicate.log_id,
@@ -1382,9 +1426,15 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
         )?;
     }
 
-    let mut ranked_iter = ranked_candidates.into_iter();
-    let winner = if let Some(winner) = ranked_iter.next() {
-        let competing_verified_candidates = ranked_iter.len();
+    let winner_index = ranked_candidates
+        .iter()
+        .position(CandidateOutcome::is_verified_candidate);
+    let winner = if let Some(winner_index) = winner_index {
+        let winner = ranked_candidates.remove(winner_index);
+        let competing_verified_candidates = ranked_candidates
+            .iter()
+            .filter(|candidate| candidate.is_verified_candidate())
+            .count();
         let winner_reason = winner_selection_reason(
             competing_verified_candidates,
             suppressed_duplicate_candidates,
@@ -1412,6 +1462,10 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             "temperature": phase_temperature,
             "touched_lines": winner.change_footprint.touched_lines,
             "byte_delta": winner.change_footprint.byte_delta,
+            "parse_ok": winner.verification_signal.map(|signal| signal.parse_ok),
+            "test_ok": winner.verification_signal.map(|signal| signal.test_ok),
+            "lint_ok": winner.verification_signal.map(|signal| signal.lint_ok),
+            "verification_error_count": winner.verification_errors.len(),
         });
         context.db.update_agent_status(
             winner.log_id,
@@ -1421,11 +1475,19 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
             Some(&winner_metadata.to_string()),
         )?;
 
-        for loser in ranked_iter {
-            summary.rejected += 1;
+        for loser in ranked_candidates {
+            record_rejected_outcome(&mut summary, &loser);
+            let reason = if loser.is_verified_candidate() {
+                losing_selection_reason(&winner)
+            } else {
+                loser
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "candidate failed verification".to_string())
+            };
             let metadata = serde_json::json!({
                 "outcome":"rejected",
-                "reason": losing_selection_reason(&winner),
+                "reason": reason,
                 "sandbox_root": loser.sandbox_root.display().to_string(),
                 "candidate_source": loser.source.as_str(),
                 "retry_attempts": loser.retry_attempts,
@@ -1434,6 +1496,11 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 "temperature": phase_temperature,
                 "touched_lines": loser.change_footprint.touched_lines,
                 "byte_delta": loser.change_footprint.byte_delta,
+                "failure_stage": loser.failure_stage.map(CandidateFailureStage::as_str),
+                "parse_ok": loser.verification_signal.map(|signal| signal.parse_ok),
+                "test_ok": loser.verification_signal.map(|signal| signal.test_ok),
+                "lint_ok": loser.verification_signal.map(|signal| signal.lint_ok),
+                "verification_error_count": loser.verification_errors.len(),
             });
             context.db.update_agent_status(
                 loser.log_id,
@@ -1454,6 +1521,45 @@ async fn execute_dispatch_work_item<E: MercuryEditApi, A: Mercury2Api>(
                 .expect("accepted winner must carry a state hash"),
         })
     } else {
+        if let Some(closest_miss) = ranked_candidates.first().cloned() {
+            let competing_failed_candidates = ranked_candidates.len().saturating_sub(1);
+            for (index, candidate) in ranked_candidates.into_iter().enumerate() {
+                record_rejected_outcome(&mut summary, &candidate);
+                let is_closest_miss = index == 0;
+                let reason = if is_closest_miss {
+                    closest_miss_selection_reason(
+                        competing_failed_candidates,
+                        suppressed_duplicate_candidates,
+                    )
+                } else {
+                    losing_failed_selection_reason(&closest_miss)
+                };
+                let metadata = serde_json::json!({
+                    "outcome": if is_closest_miss { "closest_miss" } else { "rejected" },
+                    "reason": reason,
+                    "sandbox_root": candidate.sandbox_root.display().to_string(),
+                    "candidate_source": candidate.source.as_str(),
+                    "retry_attempts": candidate.retry_attempts,
+                    "phase": work_item.phase.to_string(),
+                    "fanout": work_item.fanout,
+                    "temperature": phase_temperature,
+                    "touched_lines": candidate.change_footprint.touched_lines,
+                    "byte_delta": candidate.change_footprint.byte_delta,
+                    "failure_stage": candidate.failure_stage.map(CandidateFailureStage::as_str),
+                    "parse_ok": candidate.verification_signal.map(|signal| signal.parse_ok),
+                    "test_ok": candidate.verification_signal.map(|signal| signal.test_ok),
+                    "lint_ok": candidate.verification_signal.map(|signal| signal.lint_ok),
+                    "verification_error_count": candidate.verification_errors.len(),
+                });
+                context.db.update_agent_status(
+                    candidate.log_id,
+                    "failed",
+                    candidate.total_tokens,
+                    candidate.total_cost,
+                    Some(&metadata.to_string()),
+                )?;
+            }
+        }
         context.telemetry.sync(
             context.db,
             context.scheduler,
@@ -1589,6 +1695,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                     retry_attempts: 0,
                     total_tokens,
                     total_cost,
+                    verification_signal: None,
                     verification_errors: Vec::new(),
                     state_hash: None,
                     change_footprint: ChangeFootprint {
@@ -1622,6 +1729,7 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                 retry_attempts: 0,
                 total_tokens,
                 total_cost,
+                verification_signal: None,
                 verification_errors: Vec::new(),
                 state_hash: None,
                 change_footprint: change_footprint(latest_state, &candidate),
@@ -1644,25 +1752,34 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
             .await?;
 
         if verify.is_ok() {
-            return Ok(CandidateOutcome {
+            return Ok(verification_candidate_outcome(
                 agent_id,
                 log_id,
-                sandbox_root: attempt_one_root,
-                source: primary_source,
-                candidate: Some(candidate.clone()),
-                retry_attempts: 0,
+                attempt_one_root,
+                primary_source,
+                candidate,
+                0,
                 total_tokens,
                 total_cost,
-                verification_errors: verify.errors,
-                state_hash: Some(content_hash(&candidate)),
-                change_footprint: change_footprint(latest_state, &candidate),
-                failure_stage: None,
-                reason: None,
-            });
+                &verify,
+                latest_state,
+            ));
         }
 
         if candidate_index == 0 {
             if let Some(critique) = verify.critique.as_deref() {
+                let mut initial_failure_outcome = verification_candidate_outcome(
+                    agent_id.clone(),
+                    log_id,
+                    attempt_one_root.clone(),
+                    primary_source,
+                    candidate.clone(),
+                    0,
+                    total_tokens,
+                    total_cost,
+                    &verify,
+                    latest_state,
+                );
                 let retry_failures =
                     select_verification_failures_for_step(&indexed_step.step.file_path, &verify)
                         .or(step_failures.clone());
@@ -1723,24 +1840,16 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
 
                         if let Some(reason) = unsafe_candidate_reason(&candidate, &retry_candidate)
                         {
-                            return Ok(CandidateOutcome {
-                                agent_id,
-                                log_id,
-                                sandbox_root: sandbox_root.join("attempt-2"),
-                                source: candidate_source(candidate_index, true, false),
-                                candidate: None,
-                                retry_attempts: 1,
-                                total_tokens,
-                                total_cost,
-                                verification_errors: Vec::new(),
-                                state_hash: None,
-                                change_footprint: change_footprint(latest_state, &retry_candidate),
-                                failure_stage: Some(CandidateFailureStage::Safety),
-                                reason: Some(format!(
-                                    "{} candidate rejected: {reason}",
-                                    candidate_source(candidate_index, true, false).as_str()
-                                )),
-                            });
+                            initial_failure_outcome.retry_attempts = 1;
+                            let mut combined_reason =
+                                initial_failure_outcome.reason.take().unwrap_or_else(|| {
+                                    "verification failed without structured errors".to_string()
+                                });
+                            combined_reason.push_str(&format!(
+                                "\ncritique retry candidate rejected: {reason}"
+                            ));
+                            initial_failure_outcome.reason = Some(combined_reason);
+                            return Ok(initial_failure_outcome);
                         }
 
                         let attempt_two_root = sandbox_root.join("attempt-2");
@@ -1759,84 +1868,67 @@ async fn execute_candidate_variant<E: MercuryEditApi, A: Mercury2Api>(
                             .await?;
 
                         if retry_verify.is_ok() {
-                            return Ok(CandidateOutcome {
+                            return Ok(verification_candidate_outcome(
                                 agent_id,
                                 log_id,
-                                sandbox_root: attempt_two_root,
-                                source: candidate_source(candidate_index, true, false),
-                                candidate: Some(retry_candidate.clone()),
-                                retry_attempts: 1,
+                                attempt_two_root,
+                                candidate_source(candidate_index, true, false),
+                                retry_candidate,
+                                1,
                                 total_tokens,
                                 total_cost,
-                                verification_errors: retry_verify.errors,
-                                state_hash: Some(content_hash(&retry_candidate)),
-                                change_footprint: change_footprint(latest_state, &retry_candidate),
-                                failure_stage: None,
-                                reason: None,
-                            });
+                                &retry_verify,
+                                latest_state,
+                            ));
                         }
 
-                        return Ok(CandidateOutcome {
-                            agent_id,
-                            log_id,
-                            sandbox_root: attempt_two_root,
-                            source: candidate_source(candidate_index, true, false),
-                            candidate: None,
-                            retry_attempts: 1,
-                            total_tokens,
-                            total_cost,
-                            verification_errors: retry_verify.errors.clone(),
-                            state_hash: None,
-                            change_footprint: ChangeFootprint {
-                                touched_lines: 0,
-                                byte_delta: 0,
-                            },
-                            failure_stage: Some(CandidateFailureStage::Verification),
-                            reason: Some(join_verification_errors(&retry_verify.errors)),
-                        });
+                        let mut failed_candidates = vec![
+                            initial_failure_outcome,
+                            verification_candidate_outcome(
+                                agent_id,
+                                log_id,
+                                attempt_two_root,
+                                candidate_source(candidate_index, true, false),
+                                retry_candidate,
+                                1,
+                                total_tokens,
+                                total_cost,
+                                &retry_verify,
+                                latest_state,
+                            ),
+                        ];
+                        rank_candidate_outcomes(&mut failed_candidates);
+                        return Ok(failed_candidates
+                            .into_iter()
+                            .next()
+                            .expect("failed verification candidates should be present"));
                     }
                     Err(err) => {
-                        return Ok(CandidateOutcome {
-                            agent_id,
-                            log_id,
-                            sandbox_root: attempt_one_root,
-                            source: candidate_source(candidate_index, true, false),
-                            candidate: None,
-                            retry_attempts: 1,
-                            total_tokens,
-                            total_cost,
-                            verification_errors: verify.errors.clone(),
-                            state_hash: None,
-                            change_footprint: ChangeFootprint {
-                                touched_lines: 0,
-                                byte_delta: 0,
-                            },
-                            failure_stage: Some(CandidateFailureStage::Generation),
-                            reason: Some(format!("retry generation failed: {err}")),
-                        });
+                        initial_failure_outcome.retry_attempts = 1;
+                        let mut combined_reason =
+                            initial_failure_outcome.reason.take().unwrap_or_else(|| {
+                                "verification failed without structured errors".to_string()
+                            });
+                        combined_reason.push_str(&format!("\nretry generation failed: {err}"));
+                        initial_failure_outcome.reason = Some(combined_reason);
+                        return Ok(initial_failure_outcome);
                     }
                 }
             }
         }
 
-        Ok(CandidateOutcome {
+        Ok(verification_candidate_outcome(
             agent_id,
             log_id,
-            sandbox_root: attempt_one_root,
-            source: primary_source,
-            candidate: None,
-            retry_attempts: 0,
+            attempt_one_root,
+            primary_source,
+            candidate,
+            0,
             total_tokens,
             total_cost,
-            verification_errors: verify.errors.clone(),
-            state_hash: None,
-            change_footprint: ChangeFootprint {
-                touched_lines: 0,
-                byte_delta: 0,
-            },
-            failure_stage: Some(CandidateFailureStage::Verification),
-            reason: Some(join_verification_errors(&verify.errors)),
-        })
+            &verify,
+            latest_state,
+        ))
     }
     .await;
 
@@ -2234,15 +2326,16 @@ fn join_line_window(lines: &[&str], start_line: usize, end_line: usize) -> Strin
 
 fn rank_candidate_outcomes(candidates: &mut [CandidateOutcome]) {
     candidates.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then_with(|| left.retry_attempts.cmp(&right.retry_attempts))
-            .then_with(|| left.change_footprint.cmp(&right.change_footprint))
+        left.verification_preference_key()
+            .cmp(&right.verification_preference_key())
+            .then_with(|| left.source.cmp(&right.source))
             .then_with(|| {
                 left.verification_errors
                     .len()
                     .cmp(&right.verification_errors.len())
             })
+            .then_with(|| left.retry_attempts.cmp(&right.retry_attempts))
+            .then_with(|| left.change_footprint.cmp(&right.change_footprint))
             .then_with(|| {
                 left.total_cost
                     .partial_cmp(&right.total_cost)
@@ -2300,12 +2393,45 @@ fn winner_selection_reason(
 }
 
 fn duplicate_suppression_reason() -> &'static str {
-    "duplicate verified candidate output; identical verified state already kept from a higher-ranked candidate"
+    "duplicate candidate output; identical state already kept from a higher-ranked candidate"
 }
 
 fn losing_selection_reason(winner: &CandidateOutcome) -> String {
     format!(
         "lost selection to higher-ranked verified candidate {} from {}",
+        winner.agent_id,
+        winner.source.as_str()
+    )
+}
+
+fn closest_miss_selection_reason(
+    competing_failed_candidates: usize,
+    suppressed_duplicate_candidates: usize,
+) -> String {
+    let mut reason = if competing_failed_candidates == 0 {
+        "highest-ranked failed candidate after structured verifier ranking".to_string()
+    } else {
+        format!(
+            "highest-ranked failed candidate after structured verifier ranking over {competing_failed_candidates} competing failed candidate{}",
+            if competing_failed_candidates == 1 { "" } else { "s" }
+        )
+    };
+    if suppressed_duplicate_candidates > 0 {
+        reason.push_str(&format!(
+            "; suppressed {suppressed_duplicate_candidates} duplicate candidate output{}",
+            if suppressed_duplicate_candidates == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    reason
+}
+
+fn losing_failed_selection_reason(winner: &CandidateOutcome) -> String {
+    format!(
+        "lower-ranked failed candidate behind closest miss {} from {}",
         winner.agent_id,
         winner.source.as_str()
     )
@@ -2420,6 +2546,55 @@ fn join_verification_errors(errors: &[String]) -> String {
     }
 
     errors.join("\n")
+}
+
+fn verification_candidate_outcome(
+    agent_id: String,
+    log_id: i64,
+    sandbox_root: PathBuf,
+    source: CandidateSource,
+    candidate: String,
+    retry_attempts: usize,
+    total_tokens: i64,
+    total_cost: f64,
+    verify: &VerifyResult,
+    baseline: &str,
+) -> CandidateOutcome {
+    let verification_signal = VerificationSignal::from_verify(verify);
+    let verified = verification_signal.is_ok();
+    CandidateOutcome {
+        agent_id,
+        log_id,
+        sandbox_root,
+        source,
+        candidate: Some(candidate.clone()),
+        retry_attempts,
+        total_tokens,
+        total_cost,
+        verification_signal: Some(verification_signal),
+        verification_errors: verify.errors.clone(),
+        state_hash: Some(content_hash(&candidate)),
+        change_footprint: change_footprint(baseline, &candidate),
+        failure_stage: (!verified).then_some(CandidateFailureStage::Verification),
+        reason: (!verified).then(|| join_verification_errors(&verify.errors)),
+    }
+}
+
+fn record_rejected_outcome(summary: &mut StepExecutionSummary, outcome: &CandidateOutcome) {
+    summary.rejected += 1;
+    match outcome.failure_stage {
+        Some(CandidateFailureStage::Generation) => {
+            summary.generation_failures += 1;
+        }
+        Some(CandidateFailureStage::Safety) => {
+            summary.safety_failures += 1;
+        }
+        Some(CandidateFailureStage::Verification) => {
+            summary.verification_failures += 1;
+            summary.candidate_verification_failures += 1;
+        }
+        None => {}
+    }
 }
 
 struct SchedulerPermit<'a> {
@@ -2627,11 +2802,42 @@ mod tests {
             total_tokens: 0,
             total_cost,
             verification_errors: Vec::new(),
+            verification_signal: Some(VerificationSignal {
+                parse_ok: true,
+                test_ok: true,
+                lint_ok: true,
+            }),
             state_hash: state_hash.map(ToString::to_string),
             change_footprint,
             failure_stage: None,
             reason: None,
         }
+    }
+
+    fn candidate_outcome_with_signal(
+        agent_id: &str,
+        source: CandidateSource,
+        total_cost: f64,
+        signal: VerificationSignal,
+    ) -> CandidateOutcome {
+        let mut outcome = candidate_outcome(
+            agent_id,
+            source,
+            0,
+            total_cost,
+            Some(agent_id),
+            ChangeFootprint {
+                touched_lines: 3,
+                byte_delta: 4,
+            },
+        );
+        outcome.verification_signal = Some(signal);
+        if !signal.is_ok() {
+            outcome.failure_stage = Some(CandidateFailureStage::Verification);
+            outcome.reason = Some("candidate did not fully satisfy verifier gates".to_string());
+            outcome.verification_errors = vec!["verification failed".to_string()];
+        }
+        outcome
     }
 
     impl crate::api::Mercury2Api for MockPlannerApi {
@@ -2957,6 +3163,68 @@ mod tests {
 
         assert_eq!(candidates[0].agent_id, "agent-apply");
         assert_eq!(candidates[1].agent_id, "agent-explore");
+    }
+
+    #[test]
+    fn test_rank_candidate_outcomes_prefers_verified_candidate_over_failed_better_lineage() {
+        let mut candidates = vec![
+            candidate_outcome_with_signal(
+                "agent-failed-apply",
+                CandidateSource::ApplyEdit,
+                0.001,
+                VerificationSignal {
+                    parse_ok: true,
+                    test_ok: false,
+                    lint_ok: true,
+                },
+            ),
+            candidate_outcome_with_signal(
+                "agent-verified-explore",
+                CandidateSource::ExploratoryNextEdit,
+                0.01,
+                VerificationSignal {
+                    parse_ok: true,
+                    test_ok: true,
+                    lint_ok: true,
+                },
+            ),
+        ];
+
+        rank_candidate_outcomes(&mut candidates);
+
+        assert_eq!(candidates[0].agent_id, "agent-verified-explore");
+        assert_eq!(candidates[1].agent_id, "agent-failed-apply");
+    }
+
+    #[test]
+    fn test_rank_candidate_outcomes_prefers_stronger_verifier_signal_before_lineage() {
+        let mut candidates = vec![
+            candidate_outcome_with_signal(
+                "agent-parse-failed",
+                CandidateSource::ApplyEdit,
+                0.001,
+                VerificationSignal {
+                    parse_ok: false,
+                    test_ok: false,
+                    lint_ok: false,
+                },
+            ),
+            candidate_outcome_with_signal(
+                "agent-test-failed",
+                CandidateSource::ExploratoryNextEdit,
+                0.01,
+                VerificationSignal {
+                    parse_ok: true,
+                    test_ok: false,
+                    lint_ok: false,
+                },
+            ),
+        ];
+
+        rank_candidate_outcomes(&mut candidates);
+
+        assert_eq!(candidates[0].agent_id, "agent-test-failed");
+        assert_eq!(candidates[1].agent_id, "agent-parse-failed");
     }
 
     #[test]

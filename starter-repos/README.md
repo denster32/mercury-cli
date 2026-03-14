@@ -1,6 +1,6 @@
 # Mercury Starter Repos
 
-These starter repos are copyable, intentionally small examples for the current Rust beta surface.
+Start with `docs/operator-quickstart.md` after install, then copy one of these starter repos when you want the canonical disposable onboarding path for the current Rust beta surface.
 
 - `local-rust-watch-repair/`: local `watch --repair` starter around a direct `cargo test` failure
 - `ci-draft-pr-repair/`: GitHub Actions starter that pins the reusable Mercury draft-PR repair workflow at `v1.0.0-beta.1`

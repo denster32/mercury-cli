@@ -33,7 +33,9 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 ### Changed
 
 - tagged release archives now ship both `mercury-cli` and a `mercury` compatibility alias to reduce command-name friction between source builds and release installs
-- README install guidance now separates prerelease and future stable install paths, points operators at the changelog for upgrade notes, and makes the current Windows source-build-only status explicit
+- README install guidance now separates prerelease and future stable install paths, points operators first to the quickstart plus starter repos, and makes the current Windows source-build-only status explicit
+- CI repair artifact bundles now publish a stable top-level `artifact-index.json`, and the public docs link the bounded verifier-class, limitations, and diligence pages instead of relying on broad narrative copy
+- the checked-in Tier 1 Rust benchmark truth for this prerelease remains `0.0` verified repair rate, `0.0` accepted patch rate, and `0.0` false-green rate in run ids `20260313-quality` and `20260313-agent-sweep`; release gating now treats those checked-in benchmark deltas as the prerelease truth and blocks future regressions once an earlier tagged Tier 1 baseline exists
 
 ### Upgrade Notes
 
@@ -42,7 +44,7 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - official tagged binaries remain limited to macOS arm64 and Linux x86_64; Windows users should continue with source builds until an official Windows release archive exists
 - release assets now include a separate benchmark publication bundle so reviewers can download the public Tier 1 Rust report set without cloning the repo
 
-## [0.1.0]
+## [Initial public crate scaffolding]
 
 ### Added
 

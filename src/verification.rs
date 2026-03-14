@@ -1607,7 +1607,7 @@ mod tests {
             project_root.join("Cargo.toml"),
             r#"[package]
 name = "tool-runner"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [workspace]
@@ -1645,7 +1645,7 @@ members = []
             project_root.join("Cargo.toml"),
             r#"[package]
 name = "tool-runner-redaction"
-version = "0.1.0"
+version = "1.0.0-beta.1"
 edition = "2021"
 
 [workspace]

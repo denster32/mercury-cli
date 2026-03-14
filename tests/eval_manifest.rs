@@ -2144,11 +2144,20 @@ fn repair_benchmark_publish_script_backfills_legacy_metadata_from_manifest_and_b
         "evals/v0/tier1-manifest.json"
     );
     assert_eq!(copied_quality["results"][0]["tier"], "tier1");
-    assert_eq!(copied_quality["results"][0]["verifier_class"], "cargo_check");
-    assert_eq!(copied_quality["results"][0]["candidate_lineage"], "critique_retry");
+    assert_eq!(
+        copied_quality["results"][0]["verifier_class"],
+        "cargo_check"
+    );
+    assert_eq!(
+        copied_quality["results"][0]["candidate_lineage"],
+        "critique_retry"
+    );
     assert_eq!(copied_quality["results"][0]["accepted_patch_bytes"], 72);
     assert_eq!(copied_quality["results"][0]["safety_failures"], 1);
-    assert_eq!(copied_quality["results"][0]["candidate_verification_failures"], 2);
+    assert_eq!(
+        copied_quality["results"][0]["candidate_verification_failures"],
+        2
+    );
     assert_eq!(
         copied_quality["candidate_lineage_breakdown"]["critique_retry"]["attempted_cases"],
         1
@@ -2163,8 +2172,14 @@ fn repair_benchmark_publish_script_backfills_legacy_metadata_from_manifest_and_b
     );
 
     assert_eq!(copied_agent_sweep["results"][0]["tier"], "tier1");
-    assert_eq!(copied_agent_sweep["results"][0]["verifier_class"], "cargo_check");
-    assert_eq!(copied_agent_sweep["results"][0]["candidate_lineage"], "unknown");
+    assert_eq!(
+        copied_agent_sweep["results"][0]["verifier_class"],
+        "cargo_check"
+    );
+    assert_eq!(
+        copied_agent_sweep["results"][0]["candidate_lineage"],
+        "unknown"
+    );
     assert_eq!(
         copied_agent_sweep["candidate_lineage_breakdown"]["unknown"]["attempted_cases"],
         1
@@ -2446,7 +2461,10 @@ fn repair_benchmark_publish_script_backfills_canonical_manifest_tier_and_lineage
     );
     assert_eq!(copied_quality["results"][0]["tier"], "tier0");
     assert_eq!(copied_quality["results"][0]["verifier_class"], "cargo_test");
-    assert_eq!(copied_quality["results"][0]["candidate_lineage"], "apply_edit");
+    assert_eq!(
+        copied_quality["results"][0]["candidate_lineage"],
+        "apply_edit"
+    );
     assert_eq!(copied_quality["results"][0]["accepted_patch_bytes"], 48);
     assert_eq!(
         copied_quality["candidate_lineage_breakdown"]["apply_edit"]["attempted_cases"],
@@ -2474,8 +2492,14 @@ fn repair_benchmark_publish_script_backfills_canonical_manifest_tier_and_lineage
         "evals/v0/manifest.json"
     );
     assert_eq!(copied_agent_sweep["results"][0]["tier"], "tier0");
-    assert_eq!(copied_agent_sweep["results"][0]["verifier_class"], "cargo_test");
-    assert_eq!(copied_agent_sweep["results"][0]["candidate_lineage"], "unknown");
+    assert_eq!(
+        copied_agent_sweep["results"][0]["verifier_class"],
+        "cargo_test"
+    );
+    assert_eq!(
+        copied_agent_sweep["results"][0]["candidate_lineage"],
+        "unknown"
+    );
     assert_eq!(
         copied_agent_sweep["candidate_lineage_breakdown"]["unknown"]["attempted_cases"],
         1

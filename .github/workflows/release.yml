@@ -25,21 +25,16 @@ env:
   PACKAGE_BINARY_ALIAS: mercury
 
 jobs:
-  build-and-release:
-    name: Build and release (${{ matrix.label }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            label: linux-x86_64
-            archive_target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            label: macos-arm64
-            archive_target: aarch64-apple-darwin
+  tier1-release-gate:
+    name: Tier 1 release gate
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve release version
         id: version
@@ -47,12 +42,12 @@ jobs:
         run: |
           set -euo pipefail
           MANIFEST_VERSION="$(python3 - <<'PY'
-import tomllib
-from pathlib import Path
-manifest = Path("Cargo.toml").read_bytes()
-print(tomllib.loads(manifest.decode("utf-8"))["package"]["version"])
-PY
-)"
+          import tomllib
+          from pathlib import Path
+          manifest = Path("Cargo.toml").read_bytes()
+          print(tomllib.loads(manifest.decode("utf-8"))["package"]["version"])
+          PY
+          )"
 
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
@@ -78,9 +73,37 @@ PY
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
+      - name: Validate checked-in Tier 1 benchmark gate
+        run: python3 scripts/check_tier1_gate.py --current-version "${{ steps.version.outputs.version }}"
+
+  build-and-release:
+    name: Build and release (${{ matrix.label }})
+    needs: tier1-release-gate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            archive_target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            label: macos-arm64
+            archive_target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Render benchmark-tied release notes
+        run: |
+          python3 scripts/check_tier1_gate.py \
+            --current-version "${{ needs.tier1-release-gate.outputs.version }}" \
+            --release-notes-out release-notes.md
 
       - name: Build release binary
         run: cargo build --release --locked --bin mercury-cli
@@ -90,7 +113,7 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.tier1-release-gate.outputs.version }}"
           PACKAGE_ROOT="mercury-${VERSION}-${{ matrix.archive_target }}"
           ARCHIVE="${PACKAGE_ROOT}.tar.gz"
 
@@ -117,7 +140,7 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.tier1-release-gate.outputs.version }}"
           PACKAGE_ROOT="mercury-benchmarks-${VERSION}"
           ARCHIVE="${PACKAGE_ROOT}.tar.gz"
 
@@ -163,19 +186,19 @@ PY
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          tag_name: v${{ needs.tier1-release-gate.outputs.version }}
+          prerelease: ${{ needs.tier1-release-gate.outputs.prerelease == 'true' }}
+          body_path: release-notes.md
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
-          generate_release_notes: true
 
       - name: Publish benchmark release asset
         if: steps.benchmark_bundle.outputs.archive != ''
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          tag_name: v${{ needs.tier1-release-gate.outputs.version }}
+          prerelease: ${{ needs.tier1-release-gate.outputs.prerelease == 'true' }}
           files: |
             ${{ steps.benchmark_bundle.outputs.archive }}
             ${{ steps.benchmark_bundle.outputs.archive }}.sha256

@@ -4,6 +4,8 @@ This document describes what quality automation exists in the repository today.
 
 It is intentionally scope-limited to current workflows and test surfaces. It does not claim zero defects or complete coverage beyond the implemented `1.0.0-beta.1` pre-release runtime scope.
 
+Use this alongside `docs/known-limitations.md`, `docs/supported-rust-verifier-classes.md`, and `docs/diligence-pack.md` when you need the bounded public contract instead of a roadmap interpretation.
+
 ## Current CI Gates
 
 `Mercury CLI CI` (`.github/workflows/ci.yml`) runs on pushes/PRs to `main` and currently enforces:
@@ -28,7 +30,7 @@ What it enforces today:
 - isolated repair run in a detached git worktree
 - baseline failure reproduction before repair attempt
 - repair attempt only when baseline is red and API key is present
-- artifact bundle validation for a minimum evidence contract
+- artifact bundle validation for a minimum evidence contract, including a stable top-level `artifact-index.json`
 - branch push + draft PR mutation only when repair is verified, diff is non-empty, and `dry_run=false`
 - verified reruns targeting the same base ref and failure command reuse the same repair branch/PR head instead of creating a new branch name per run
 
@@ -36,6 +38,17 @@ Terminal status behavior:
 
 - non-blocking terminal states: `verified_patch_ready`, `repair_not_verified`
 - blocking terminal states (workflow fails after artifact upload): `baseline_not_reproduced`, `missing_api_key`, `setup_failed`, `internal_error`
+
+## Tier 1 Release Gate
+
+`Release` (`.github/workflows/release.yml`) now runs `python3 scripts/check_tier1_gate.py` before packaging release artifacts.
+
+What it enforces today:
+
+- the checked-in quality report at `docs/benchmarks/rust-v0-quality.report.json` must be present and schema-valid for `evals/v0/tier1-manifest.json`
+- `verified_repair_rate`, `accepted_patch_rate`, and `false_green_rate` must be present in the checked-in Tier 1 metrics
+- prerelease publication fails on regression when an earlier tag in git history also contains a checked-in Tier 1 quality report
+- if no earlier tagged Tier 1 baseline exists yet, the gate passes with a clear message instead of inventing a comparison
 
 ## Automated Test Inventory
 
